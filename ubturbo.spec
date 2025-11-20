@@ -802,5 +802,5 @@ remove_log_directory
 main "$@"
 
 %changelog
-* Thur Nov 20 2025 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0
+* Thur Nov 20 2025 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-1
 - Package init
