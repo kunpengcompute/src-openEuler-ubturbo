@@ -24,7 +24,7 @@ BuildRequires: libboundscheck
 BuildRequires: rapidjson
 BuildRequires: ninja-build
 Requires:      kernel >= 5.10.0-136.12.0.86
-buildArch     : aarch64 x86_64
+buildArch     : aarch64
 ExclusiveArch : aarch64
 
 %description
@@ -800,3 +800,7 @@ remove_log_directory
 
 # 执行主流程
 main "$@"
+
+%changelog
+* Thur Nov 20 2025 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-B018
+- Package init
