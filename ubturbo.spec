@@ -80,7 +80,7 @@ make olddefconfig
 sed -i -e '/bzip2 -9 --keep vmlinux/,+1d' scripts/package/mkspec
 INSTALL_MOD_STRIP=1 make rpm-pkg -j 64 -s
 cd %{_builddir}
-rpm2cpio /home/lkp/rpmbuild/BUILD/kernel/rpmbuild/RPMS/aarch64/kernel-devel-6.6.0+-1.oe2403sp3.aarch64.rpm | cpio -div
+rpm2cpio /home/lkp/rpmbuild/BUILD/kernel/rpmbuild/RPMS/aarch64/kernel-devel*.rpm | cpio -div
 cd %{_builddir}/ubturbo/plugins/smap/src/drivers && make -j`nproc` -C %{_builddir}/usr/src/kernels/6.6.0+ M=%{_builddir}/ubturbo/plugins/smap/src/drivers modules
 cp %{_builddir}/ubturbo/plugins/smap/src/drivers/Module.symvers %{_builddir}/ubturbo/plugins/smap/src/tiering/depends
 rm -rf %{_builddir}/ubturbo/plugins/smap/src/tiering/depends/hisi.symvers
