@@ -5,25 +5,25 @@
 Name:          ubturbo
 Version:       %{version}
 Release:       %{release_version}
-Summary:       Huawei ubturbo
-License:       GPLv2
-URL:           https://support.huawei.com
+Summary:       ubturbo
+License:       MulanPSL2
+URL:           https://gitee.com/openeuler/ubturbo.git
 Source0:       ubturbo.tar.gz
 Provides:      %{name}
-Vendor:        Huawei Technologies Co., Ltd.
 BuildRoot:     %{buildroot}
 ExclusiveArch: %arm64
 BuildRequires: kernel-devel >= 5.10.0-136.12.0.86 make >= 4.3 gcc >= 10.3.1 cmake libvirt libvirt-devel
 BuildRequires: libboundscheck
 BuildRequires: make
 BuildRequires: gcc flex bison elfutils-libelf-devel openssl openssl-devel ncurses-devel dwarves 
-BuildRequires: cmake
+BuildRequires: cmake coreutils
 BuildRequires: chrpath
 BuildRequires: patchelf
 BuildRequires: libboundscheck
 BuildRequires: rapidjson
 BuildRequires: ninja-build
 Requires:      kernel >= 5.10.0-136.12.0.86
+Requires:      coreutils
 buildArch     : aarch64
 ExclusiveArch : aarch64
 
@@ -36,7 +36,7 @@ ubturbo
 %define ucache_dir /lib/modules/ucache
 %define smap_libsmap_dir /usr/lib64
 %define udev_rules_dir %{_sysconfdir}/udev/rules.d
-%define kernel_devel_version 6.6.0+
+%define kernel_devel_version 6.6.0
 
 #define rmrs
 %define debug_package %{nil}
@@ -50,13 +50,13 @@ ubturbo
 Summary: smap
 
 %description smap
-This package contains the Huawei SMAP Driver
+This package contains the SMAP Driver
 
 %package rmrs
 Summary: rmrs
 
 %description rmrs
-This package contains the Huawei os_turbo Driver
+This package contains the rmrs Driver
 
 %prep
 %setup -q -T -b 0 -c -n ubturbo
@@ -72,20 +72,10 @@ pwd
 tar -zxvf v1.11.0.tar.gz
 
 cd %{_builddir}
-git clone -b OLK-6.6 https://gitee.com/openeuler/kernel.git
-cd kernel
-make openeuler_defconfig
-sed -i 's/CONFIG_MODULE_SIG_KEY=.*$/CONFIG_MODULE_SIG_KEY="certs\/signing_key.pem"/g' .config
-make olddefconfig
-sed -i -e '/bzip2 -9 --keep vmlinux/,+1d' scripts/package/mkspec
-INSTALL_MOD_STRIP=1 make rpm-pkg -j 64 -s
-cd %{_builddir}
-rpm2cpio /home/lkp/rpmbuild/BUILD/kernel/rpmbuild/RPMS/aarch64/kernel-devel*.rpm | cpio -div
-cd %{_builddir}/ubturbo/plugins/smap/src/drivers && make -j`nproc` -C %{_builddir}/usr/src/kernels/6.6.0+ M=%{_builddir}/ubturbo/plugins/smap/src/drivers modules
+cd %{_builddir}/ubturbo/plugins/smap/src/drivers && make -j`nproc` -C /lib/modules/6.6.0*/build M=%{_builddir}/ubturbo/plugins/smap/src/drivers modules
 cp %{_builddir}/ubturbo/plugins/smap/src/drivers/Module.symvers %{_builddir}/ubturbo/plugins/smap/src/tiering/depends
-rm -rf %{_builddir}/ubturbo/plugins/smap/src/tiering/depends/hisi.symvers
-cd %{_builddir}/ubturbo/plugins/smap/src/tiering && make -j`nproc` -C %{_builddir}/usr/src/kernels/6.6.0+ M=%{_builddir}/ubturbo/plugins/smap/src/tiering modules
-cd %{_builddir}/ubturbo/plugins/smap/src/ucache && make -j`nproc` -C %{_builddir}/usr/src/kernels/6.6.0+ M=%{_builddir}/ubturbo/plugins/smap/src/ucache modules
+cd %{_builddir}/ubturbo/plugins/smap/src/tiering && make -j`nproc` -C /lib/modules/6.6.0*/build M=%{_builddir}/ubturbo/plugins/smap/src/tiering modules
+cd %{_builddir}/ubturbo/plugins/smap/src/ucache && make -j`nproc` -C /lib/modules/6.6.0*/build M=%{_builddir}/ubturbo/plugins/smap/src/ucache modules
 
 rm -rf %{_builddir}/ubturbo/plugins/smap/3rdparty/spdlog
 mv %{_builddir}/spdlog-1.11.0 %{_builddir}/spdlog
@@ -288,19 +278,23 @@ remove_file_if_exists() {
 
 # 主流程
 main() {
-# 脚本开始执行
-log_message "INFO" "======================"
-log_message "INFO" "pre_install.sh started"
-log_message "INFO" "======================"
+if command -v mkdir >/dev/null 2>&1; then
+    # 脚本开始执行
+    log_message "INFO" "======================"
+    log_message "INFO" "pre_install.sh started"
+    log_message "INFO" "======================"
 
-# 停止并禁用服务
-stop_and_disable_service "ubturbo.service"
-rm -f /tmp/ubturbo_ipc
+    # 停止并禁用服务
+    stop_and_disable_service "ubturbo.service"
+    rm -f /tmp/ubturbo_ipc
 
-# 脚本结束执行
-log_message "INFO" "======================"
-log_message "INFO" "pre_install.sh ended"
-log_message "INFO" "======================"
+    # 脚本结束执行
+    log_message "INFO" "======================"
+    log_message "INFO" "pre_install.sh ended"
+    log_message "INFO" "======================"
+else
+    echo "环境无mkdir命令，无coreutils包"
+fi
 }
 
 # 执行主流程
@@ -506,28 +500,32 @@ reload_systemd() {
 
 # 主流程
 main() {
-    log_message "INFO" "======================"
-    log_message "INFO" "post_install.sh started"
-    log_message "INFO" "======================"
+    if command -v mkdir >/dev/null 2>&1; then
+        log_message "INFO" "======================"
+        log_message "INFO" "post_install.sh started"
+        log_message "INFO" "======================"
 
-    create_group
-    create_user
-    copy_service_file
-    copy_client_so
-    reload_systemd
-    # 确保日志和程序目录的属主正确
-    ensure_directory_owner "$LOG_DIR" true
-    ensure_directory_owner "$PROGRAM_DIR" true
-    # 权限控制
-    ensure_permission
-    chmod_cat_sh
+        create_group
+        create_user
+        copy_service_file
+        copy_client_so
+        reload_systemd
+        # 确保日志和程序目录的属主正确
+        ensure_directory_owner "$LOG_DIR" true
+        ensure_directory_owner "$PROGRAM_DIR" true
+        # 权限控制
+        ensure_permission
+        chmod_cat_sh
 
-    # 将程序设为开机自启动
-    systemctl enable ubturbo.service
-    
-    log_message "INFO" "======================"
-    log_message "INFO" "post_install.sh ended"
-    log_message "INFO" "======================"
+        # 将程序设为开机自启动
+        systemctl enable ubturbo.service
+
+        log_message "INFO" "======================"
+        log_message "INFO" "post_install.sh ended"
+        log_message "INFO" "======================"
+    else
+        echo "环境无mkdir命令，无coreutils包"
+    fi
 }
 
 # 执行主流程
@@ -642,29 +640,33 @@ uninstall_service() {
 
 # 主流程
 main() {
-# 检查是否是卸载操作
-if [ "$1" -ne 0 ]; then
-    log_message "INFO"  "Not an uninstall operation."
-    chown "ubturbo:ubturbo" "/var/log/ubturbo/ubturbo-uninstall.log"
-    exit 0
+if command -v mkdir >/dev/null 2>&1; then
+    # 检查是否是卸载操作
+    if [ "$1" -ne 0 ]; then
+        log_message "INFO"  "Not an uninstall operation."
+        chown "ubturbo:ubturbo" "/var/log/ubturbo/ubturbo-uninstall.log"
+        exit 0
+    else
+        log_message "INFO"  "Uninstalling the package pre..."
+    fi
+
+    log_message "$RPM_INSTALL"
+    log_message "INFO" "======================"
+    log_message "INFO" "pre_uninstall.sh started"
+    log_message "INFO" "======================"
+
+    # 停止并禁用服务
+    stop_and_disable_service "ubturbo.service"
+
+    # 卸载服务文件
+    uninstall_service
+
+    log_message "INFO" "======================"
+    log_message "INFO" "pre_uninstall.sh ended"
+    log_message "INFO" "======================"
 else
-    log_message "INFO"  "Uninstalling the package pre..."
+    echo "环境无mkdir命令，无coreutils包"
 fi
-
-log_message "$RPM_INSTALL"
-log_message "INFO" "======================"
-log_message "INFO" "pre_uninstall.sh started"
-log_message "INFO" "======================"
-
-# 停止并禁用服务
-stop_and_disable_service "ubturbo.service"
-
-# 卸载服务文件
-uninstall_service
-
-log_message "INFO" "======================"
-log_message "INFO" "pre_uninstall.sh ended"
-log_message "INFO" "======================"
 }
 
 # 执行主流程
@@ -776,31 +778,36 @@ trim_spaces() {
 
 # 主流程
 main() {
-# 检查是否是卸载操作
-if [ "$1" -ne 0 ]; then
-    log_message "INFO"  "Not an uninstall operation."
-    chown "ubturbo:ubturbo" "/var/log/ubturbo/ubturbo-uninstall.log"
-    exit 0
+if command -v mkdir >/dev/null 2>&1; then
+    # 检查是否是卸载操作
+    if [ "$1" -ne 0 ]; then
+        log_message "INFO"  "Not an uninstall operation."
+        chown "ubturbo:ubturbo" "/var/log/ubturbo/ubturbo-uninstall.log"
+        exit 0
+    else
+        log_message "INFO"  "Uninstalling the package post..."
+    fi
+
+    log_message "INFO" "======================"
+    log_message "INFO" "post_uninstall.sh started"
+    log_message "INFO" "======================"
+
+    # 删除用户组
+    remove_user_and_group
+
+    log_message "INFO" "======================"
+    log_message "INFO" "post_uninstall.sh ended"
+    log_message "INFO" "======================"
+    # 删除日志目录
+    remove_log_directory
 else
-    log_message "INFO"  "Uninstalling the package post..."
+    echo "环境无mkdir命令，无coreutils包"
 fi
-log_message "INFO" "======================"
-log_message "INFO" "post_uninstall.sh started"
-log_message "INFO" "======================"
-
-# 删除用户组
-remove_user_and_group
-
-log_message "INFO" "======================"
-log_message "INFO" "post_uninstall.sh ended"
-log_message "INFO" "======================"
-# 删除日志目录
-remove_log_directory
 }
 
 # 执行主流程
 main "$@"
 
 %changelog
-* Thur Nov 20 2025 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-1
+* Fri Nov 21 2025 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-1
 - Package init
