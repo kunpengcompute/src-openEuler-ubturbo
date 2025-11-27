@@ -466,12 +466,6 @@ copy_client_so() {
 
     chmod 550 "$installed_so_file" || handle_error "Failed to set permissions for $installed_so_file"
     chown "$SYSTEM_USER:$SYSTEM_GROUP" "$installed_so_file" || handle_error "Failed to set ownership for directory $installed_so_file"
-
-    # 删除源文件
-    if [ -f "$source_so_file" ]; then
-        rm -f "$source_so_file" || handle_error "Failed to remove source $source_so_file"
-        log_message "INFO" "Removed source $source_so_file"
-    fi
 }
 
 # 控制cat.sh脚本的权限
@@ -481,12 +475,6 @@ chmod_cat_sh() {
  
     cp "$source_sh_file" "$installed_sh_file" || handle_error "Failed to copy so file"
     log_message "INFO" "Smap so file copied to $installed_sh_file"
- 
-    # 删除源文件
-    if [ -f "$source_sh_file" ]; then
-        rm -f "$source_sh_file" || handle_error "Failed to remove source $source_sh_file"
-        log_message "INFO" "Removed source $source_sh_file"
-    fi
 
     chmod 500 "$installed_sh_file" || handle_error "Failed to set permissions for $installed_sh_file"
     chown "$ROOT_USER:$ROOT_GROUP" "$installed_sh_file" || handle_error "Failed to set ownership for directory $installed_sh_file"
