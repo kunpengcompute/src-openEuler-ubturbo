@@ -8,7 +8,7 @@ Release:       %{release_version}
 Summary:       ubturbo
 License:       MulanPSL2
 URL:           https://gitee.com/openeuler/ubturbo.git
-Source0:       ubturbo.tar.gz
+Source0:       ubturbo-1.0.0.tar.gz
 Provides:      %{name}
 BuildRoot:     %{buildroot}
 ExclusiveArch: %arm64
@@ -797,5 +797,5 @@ fi
 main "$@"
 
 %changelog
-* Fri Nov 21 2025 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-1
+* Wed Dec 3 2025 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-1
 - Package init
