@@ -141,7 +141,7 @@ ls %{_builddir}/ubturbo/src/sdk/include
 %{__install} -b -m 0644 %{_builddir}/ubturbo/include/turbo_conf.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
 %{__install} -b -m 0644 %{_builddir}/ubturbo/include/turbo_def.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
 %{__install} -b -m 0644 %{_builddir}/ubturbo/include/turbo_ipc_client.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
-%{__install} -b -m 0644 %{_builddir}/ubturbo/include/turbo_server.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
+%{__install} -b -m 0644 %{_builddir}/ubturbo/include/turbo_ipc_server.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
 %{__install} -b -m 0644 %{_builddir}/ubturbo/include/turbo_logger.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
 %{__install} -b -m 0644 %{_builddir}/ubturbo/src/sdk/include/turbo_serialize.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
 
