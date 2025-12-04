@@ -46,6 +46,10 @@ ubturbo
 %define ubturbo_conf_dir /opt/ubturbo/conf
 %define ubturbo_scripts_dir /opt/ubturbo/scripts
 
+#define devel
+%define debug_package %{nil}
+%define ubturbo_include_dir /usr/include/ubturbo
+
 %package smap
 Summary: smap
 
@@ -56,7 +60,13 @@ This package contains the SMAP Driver
 Summary: rmrs
 
 %description rmrs
-This package contains the rmrs Driver
+This package contains the ubturbo framework
+
+%package devel
+Summary: devel
+
+%description devel
+This package contains the ubturbo framework developmemt kit
 
 %prep
 %setup -q -T -b 0 -c -n ubturbo
@@ -127,6 +137,17 @@ patchelf --set-rpath '$ORIGIN/../lib' ${RPM_BUILD_ROOT}/%{ubturbo_bin_dir}/ub_tu
 %clean
 rm -rf ${RPM_BUILD_ROOT}
 
+#install devel
+mkdir -p -m755 ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
+ls %{_builddir}/ubturbo/include
+ls %{_builddir}/ubturbo/src/sdk/include
+%{__install} -b -m 0644 %{_builddir}/ubturbo/include/turbo_conf.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
+%{__install} -b -m 0644 %{_builddir}/ubturbo/include/turbo_def.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
+%{__install} -b -m 0644 %{_builddir}/ubturbo/include/turbo_ipc_client.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
+%{__install} -b -m 0644 %{_builddir}/ubturbo/include/turbo_server.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
+%{__install} -b -m 0644 %{_builddir}/ubturbo/include/turbo_logger.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
+%{__install} -b -m 0644 %{_builddir}/ubturbo/src/sdk/include/turbo_serialize.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
+
 %files smap
 %defattr(-,ubturbo,ubturbo)
 %{smap_dir}/smap_tracking_core.ko
@@ -149,6 +170,16 @@ rm -rf ${RPM_BUILD_ROOT}
 %dir %{ubturbo_bin_dir}
 %{ubturbo_bin_dir}/ub_turbo_exec
 %{ubturbo_bin_dir}/cat.sh
+
+%file devel
+%defattr(-,ubturbo,ubturbo)
+%dir %{ubturbo_include_dir}
+%{ubturbo_include_dir}/turbo_conf.h
+%{ubturbo_include_dir}/turbo_def.h
+%{ubturbo_include_dir}/turbo_ipc_client.h
+%{ubturbo_include_dir}/turbo_server.h
+%{ubturbo_include_dir}/turbo_logger.h
+%{ubturbo_include_dir}/turbo_serialize.h
 
 %pre smap
 
