@@ -134,9 +134,6 @@ ls %{_builddir}/ubturbo/dist/release/bin
 find ${RPM_BUILD_ROOT}/%{ubturbo_lib_dir} -name "*.so" -exec patchelf --set-rpath '$ORIGIN/../lib' {} \;
 patchelf --set-rpath '$ORIGIN/../lib' ${RPM_BUILD_ROOT}/%{ubturbo_bin_dir}/ub_turbo_exec
 
-%clean
-rm -rf ${RPM_BUILD_ROOT}
-
 #install devel
 mkdir -p -m755 ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
 ls %{_builddir}/ubturbo/include
@@ -147,6 +144,9 @@ ls %{_builddir}/ubturbo/src/sdk/include
 %{__install} -b -m 0644 %{_builddir}/ubturbo/include/turbo_server.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
 %{__install} -b -m 0644 %{_builddir}/ubturbo/include/turbo_logger.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
 %{__install} -b -m 0644 %{_builddir}/ubturbo/src/sdk/include/turbo_serialize.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
+
+%clean
+rm -rf ${RPM_BUILD_ROOT}
 
 %files smap
 %defattr(-,ubturbo,ubturbo)
