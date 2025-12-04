@@ -177,7 +177,7 @@ rm -rf ${RPM_BUILD_ROOT}
 %{ubturbo_include_dir}/turbo_conf.h
 %{ubturbo_include_dir}/turbo_def.h
 %{ubturbo_include_dir}/turbo_ipc_client.h
-%{ubturbo_include_dir}/turbo_server.h
+%{ubturbo_include_dir}/turbo_ipc_server.h
 %{ubturbo_include_dir}/turbo_logger.h
 %{ubturbo_include_dir}/turbo_serialize.h
 
