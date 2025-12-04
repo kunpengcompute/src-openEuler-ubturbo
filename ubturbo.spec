@@ -171,7 +171,7 @@ rm -rf ${RPM_BUILD_ROOT}
 %{ubturbo_bin_dir}/ub_turbo_exec
 %{ubturbo_bin_dir}/cat.sh
 
-%file devel
+%files devel
 %defattr(-,ubturbo,ubturbo)
 %dir %{ubturbo_include_dir}
 %{ubturbo_include_dir}/turbo_conf.h
