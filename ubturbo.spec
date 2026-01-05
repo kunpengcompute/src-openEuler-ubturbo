@@ -1,5 +1,5 @@
 %global version    1.0.0
-%global release_version 1
+%global release_version 2
 %global __strip /bin/true
 
 Name:          ubturbo
@@ -830,5 +830,7 @@ fi
 main "$@"
 
 %changelog
+* Wed Dec 24 2025 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-2
+- fix: 4k scene statistic feature
 * Wed Dec 3 2025 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-1
 - Package init
