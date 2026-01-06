@@ -145,6 +145,7 @@ ls %{_builddir}/ubturbo/src/sdk/include
 %{__install} -b -m 0644 %{_builddir}/ubturbo/include/turbo_logger.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
 %{__install} -b -m 0644 %{_builddir}/ubturbo/src/sdk/include/turbo_serialize.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
 %{__install} -b -m 0644 %{_builddir}/ubturbo/src/sdk/turbo_rmrs_interface.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
+%{__install} -b -m 0644 %{_builddir}/ubturbo/src/smap/smap_interface.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
 
 %clean
 rm -rf ${RPM_BUILD_ROOT}
@@ -182,6 +183,7 @@ rm -rf ${RPM_BUILD_ROOT}
 %{ubturbo_include_dir}/turbo_logger.h
 %{ubturbo_include_dir}/turbo_serialize.h
 %{ubturbo_include_dir}/turbo_rmrs_interface.h
+%{ubturbo_include_dir}/smap_interface.h
 
 %pre smap
 
