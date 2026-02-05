@@ -62,6 +62,14 @@ Summary: rmrs
 %description rmrs
 This package contains the ubturbo framework
 
+%package ucache
+Summary: ucache
+Requires: ubturbo-rmrs
+Requires: ubturbo-smap
+
+%description ucache
+This package contains the Huawei UCache Driver
+
 %package devel
 Summary: devel
 
@@ -97,6 +105,9 @@ make -j`nproc` install
 #build rmrs
 cd %{_builddir}/ubturbo && bash -x build.sh -c
 
+#build ucache
+cd %{_builddir}/ubturbo/plugins/ucache && bash -x build.sh -c
+
 %install
 #install smap
 echo "########RPM_BUILD_ROOT=${RPM_BUILD_ROOT}"
@@ -131,6 +142,10 @@ ls %{_builddir}/ubturbo/dist/release/bin
 %{__install} -b -m 0644 %{_builddir}/ubturbo/dist/release/conf/ubturbo.conf ${RPM_BUILD_ROOT}/%{ubturbo_conf_dir}
 %{__install} -b -m 0644 %{_builddir}/ubturbo/dist/release/conf/plugin_rmrs.conf ${RPM_BUILD_ROOT}/%{ubturbo_conf_dir}
 
+#install ucache
+%{__install} -b -m 0644 %{_builddir}/ubturbo/plugins/ucache/cmake-build-release/lib/libucache_os_turbo_plugin.so ${RPM_BUILD_ROOT}/%{ubturbo_lib_dir}
+%{__install} -b -m 0644 %{_builddir}/ubturbo/plugins/ucache/cmake-build-release/conf/plugin_turbo_ucache.conf ${RPM_BUILD_ROOT}/%{ubturbo_conf_dir}
+
 find ${RPM_BUILD_ROOT}/%{ubturbo_lib_dir} -name "*.so" -exec patchelf --set-rpath '$ORIGIN/../lib' {} \;
 patchelf --set-rpath '$ORIGIN/../lib' ${RPM_BUILD_ROOT}/%{ubturbo_bin_dir}/ub_turbo_exec
 
@@ -145,6 +160,7 @@ ls %{_builddir}/ubturbo/src/sdk/include
 %{__install} -b -m 0644 %{_builddir}/ubturbo/include/turbo_logger.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
 %{__install} -b -m 0644 %{_builddir}/ubturbo/src/sdk/include/turbo_serialize.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
 %{__install} -b -m 0644 %{_builddir}/ubturbo/src/sdk/turbo_rmrs_interface.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
+%{__install} -b -m 0644 %{_builddir}/ubturbo/src/sdk/turbo_ucache_interface.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
 %{__install} -b -m 0644 %{_builddir}/ubturbo/src/smap/smap_interface.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
 
 %clean
@@ -173,6 +189,11 @@ rm -rf ${RPM_BUILD_ROOT}
 %{ubturbo_bin_dir}/ub_turbo_exec
 %{ubturbo_bin_dir}/cat.sh
 
+%files ucache
+%defattr(-,root,root)
+%{ubturbo_lib_dir}/libucache_os_turbo_plugin.so
+%{ubturbo_conf_dir}/plugin_turbo_ucache.conf
+
 %files devel
 %defattr(-,ubturbo,ubturbo)
 %dir %{ubturbo_include_dir}
@@ -183,6 +204,7 @@ rm -rf ${RPM_BUILD_ROOT}
 %{ubturbo_include_dir}/turbo_logger.h
 %{ubturbo_include_dir}/turbo_serialize.h
 %{ubturbo_include_dir}/turbo_rmrs_interface.h
+%{ubturbo_include_dir}/turbo_ucache_interface.h
 %{ubturbo_include_dir}/smap_interface.h
 
 %pre smap
@@ -212,6 +234,12 @@ if [ "$1" = "0" ]; then
     rm -f %{udev_rules_dir}/99-smap.rules
 fi
 depmod -a
+
+%post ucache
+chomod 500 %{ubturbo_lib_dir}/libucache_os_turbo_plugin.so
+chown ubturbo:ubturbo %{ubturbo_lib_dir}/libucache_os_turbo_plugin.so
+chomod 600 %{ubturbo_conf_dir}/plugin_turbo_ucache.conf
+chown ubturbo:ubturbo %{ubturbo_conf_dir}/plugin_turbo_ucache.conf
 
 %pre rmrs
 #!/bin/bash
