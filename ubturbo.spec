@@ -236,9 +236,9 @@ fi
 depmod -a
 
 %post ucache
-chomod 500 %{ubturbo_lib_dir}/libucache_os_turbo_plugin.so
+chmod 500 %{ubturbo_lib_dir}/libucache_os_turbo_plugin.so
 chown ubturbo:ubturbo %{ubturbo_lib_dir}/libucache_os_turbo_plugin.so
-chomod 600 %{ubturbo_conf_dir}/plugin_turbo_ucache.conf
+chmod 600 %{ubturbo_conf_dir}/plugin_turbo_ucache.conf
 chown ubturbo:ubturbo %{ubturbo_conf_dir}/plugin_turbo_ucache.conf
 
 %pre rmrs
