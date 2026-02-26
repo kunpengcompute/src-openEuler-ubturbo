@@ -30,6 +30,10 @@ ExclusiveArch : aarch64
 %description
 ubturbo
 
+#define ubdma
+%define debug_package %{nil}
+%define ub_dma_dir /lib/modules/ub_dma
+
 #define smap
 %define debug_package %{nil}
 %define smap_dir /lib/modules/smap
@@ -49,6 +53,12 @@ ubturbo
 #define devel
 %define debug_package %{nil}
 %define ubturbo_include_dir /usr/include/ubturbo
+
+%package ubdma
+Summary: ubdma
+
+%description ubdma
+This package contains the UB-DMA Driver
 
 %package smap
 Summary: smap
@@ -80,6 +90,9 @@ This package contains the ubturbo framework developmemt kit
 %setup -q -T -b 0 -c -n ubturbo
 
 %build
+#build ubdma
+cd %{_builddir}/ubturbo/plugins/ubdma/src && make -j`nproc` -C /lib/modules/6.6.0*/build M=%{_builddir}/ubturbo/plugins/ubdma/src modules
+
 #build smap
 cd %{_builddir}
 git clone https://gitee.com/src-openeuler/spdlog.git
@@ -109,9 +122,13 @@ cd %{_builddir}/ubturbo && bash -x build.sh -c
 cd %{_builddir}/ubturbo/plugins/ucache && bash -x build.sh -c
 
 %install
-#install smap
+#install ubdma
 echo "########RPM_BUILD_ROOT=${RPM_BUILD_ROOT}"
 rm -rf ${RPM_BUILD_ROOT}
+mkdir -p -m755 ${RPM_BUILD_ROOT}/%{ub_dma_dir}
+%{__install} -b -m 0500 %{_builddir}/ubturbo/plugins/ubdma/src/ub_dma.ko ${RPM_BUILD_ROOT}/%{ub_dma_dir}
+
+#install smap
 mkdir -p -m755 ${RPM_BUILD_ROOT}/%{smap_dir}
 mkdir -p -m755 ${RPM_BUILD_ROOT}/%{ucache_dir}
 mkdir -p -m755 ${RPM_BUILD_ROOT}/%{smap_libsmap_dir}
@@ -166,6 +183,9 @@ ls %{_builddir}/ubturbo/src/sdk/include
 %clean
 rm -rf ${RPM_BUILD_ROOT}
 
+%files ubdma
+%{ub_dma_dir}/ub_dma.ko
+
 %files smap
 %defattr(-,ubturbo,ubturbo)
 %{smap_dir}/smap_tracking_core.ko
@@ -216,6 +236,11 @@ echo "external 6.6.0-* %{smap_dir}" > /etc/depmod.d/smap.conf
 echo "external 6.6.0-* %{ucache_dir}" > /etc/depmod.d/ucache.conf
 depmod -a
 
+%preun ubdma
+if [ "$1" = "0" ]; then
+    modprobe -r ub_dma
+fi
+
 %preun smap
 if [ "$1" = "0" ]; then
     modprobe -r smap_tiering
@@ -223,6 +248,11 @@ if [ "$1" = "0" ]; then
     modprobe -r smap_access_tracking
     modprobe -r smap_tracking_core
     modprobe -r ucache
+fi
+
+%postun ubdma
+if [ "$1" = "0" ]; then
+    rm -rf %{ub_dma_dir}
 fi
 
 %postun smap
