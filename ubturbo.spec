@@ -518,7 +518,7 @@ ensure_permission() {
     chmod 700 "$PROGRAM_LOG_DIR" || handle_error "Failed to set permissions for $PROGRAM_LOG_DIR"
 
     # 文件权限控制
-    chmod 600 "$PROGRAM_CONF_DIR"/* || handle_error "Failed to set permissions for conf files in $PROGRAM_CONF_DIR"
+    chmod 600 "$PROGRAM_CONF_DIR"/*.conf || handle_error "Failed to set permissions for conf files in $PROGRAM_CONF_DIR"
     chmod 600 "$PROGRAM_LOG_DIR"/* || handle_error "Failed to set permissions for log files in $PROGRAM_LOG_DIR"
     chmod 500 "$PROGRAM_BIN_DIR"/* || handle_error "Failed to set permissions for exec files in $PROGRAM_BIN_DIR"
     chmod 500 "$PROGRAM_LIB_DIR"/* || handle_error "Failed to set permissions for exec files in $PROGRAM_LIB_DIR"
