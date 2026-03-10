@@ -571,6 +571,10 @@ chmod_cat_sh() {
 
     chmod 500 "$installed_sh_file" || handle_error "Failed to set permissions for $installed_sh_file"
     chown "$ROOT_USER:$ROOT_GROUP" "$installed_sh_file" || handle_error "Failed to set ownership for directory $installed_sh_file"
+
+    log_message "INFO" "Configure passwordless login for the script ${installed_sh_file}."
+    touch /etc/sudoers.d/ubturbo
+    echo "ubturbo ALL=(root) NOPASSWD:${installed_sh_file}" > /etc/sudoers.d/ubturbo
 }
 
 # 重新加载 systemd，这里只是让 systemd 重刷文件，不会影响运行的服务
