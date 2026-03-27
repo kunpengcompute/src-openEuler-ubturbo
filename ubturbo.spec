@@ -236,11 +236,6 @@ echo "external 6.6.0-* %{smap_dir}" > /etc/depmod.d/smap.conf
 echo "external 6.6.0-* %{ucache_dir}" > /etc/depmod.d/ucache.conf
 depmod -a
 
-%preun ubdma
-if [ "$1" = "0" ]; then
-    modprobe -r ub_dma
-fi
-
 %preun smap
 if [ "$1" = "0" ]; then
     modprobe -r smap_tiering
