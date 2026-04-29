@@ -1,34 +1,38 @@
 %global version    1.0.0
-%global release_version 1
+%global release_version 2
 %global __strip /bin/true
 
 Name:          ubturbo
 Version:       %{version}
 Release:       %{release_version}
-Summary:       Huawei ubturbo
-License:       GPLv2
-URL:           https://support.huawei.com
-Source0:       ubturbo.tar.gz
+Summary:       ubturbo
+License:       MulanPSL2
+URL:           https://gitee.com/openeuler/ubturbo.git
+Source0:       ubturbo-1.0.0.tar.gz
 Provides:      %{name}
-Vendor:        Huawei Technologies Co., Ltd.
 BuildRoot:     %{buildroot}
 ExclusiveArch: %arm64
 BuildRequires: kernel-devel >= 5.10.0-136.12.0.86 make >= 4.3 gcc >= 10.3.1 cmake libvirt libvirt-devel
 BuildRequires: libboundscheck
 BuildRequires: make
 BuildRequires: gcc flex bison elfutils-libelf-devel openssl openssl-devel ncurses-devel dwarves 
-BuildRequires: cmake
+BuildRequires: cmake coreutils
 BuildRequires: chrpath
 BuildRequires: patchelf
 BuildRequires: libboundscheck
 BuildRequires: rapidjson
 BuildRequires: ninja-build
 Requires:      kernel >= 5.10.0-136.12.0.86
+Requires:      coreutils
 buildArch     : aarch64
 ExclusiveArch : aarch64
 
 %description
 ubturbo
+
+#define ubdma
+%define debug_package %{nil}
+%define ub_dma_dir /lib/modules/ub_dma
 
 #define smap
 %define debug_package %{nil}
@@ -36,7 +40,7 @@ ubturbo
 %define ucache_dir /lib/modules/ucache
 %define smap_libsmap_dir /usr/lib64
 %define udev_rules_dir %{_sysconfdir}/udev/rules.d
-%define kernel_devel_version 6.6.0+
+%define kernel_devel_version 6.6.0
 
 #define rmrs
 %define debug_package %{nil}
@@ -46,22 +50,49 @@ ubturbo
 %define ubturbo_conf_dir /opt/ubturbo/conf
 %define ubturbo_scripts_dir /opt/ubturbo/scripts
 
+#define devel
+%define debug_package %{nil}
+%define ubturbo_include_dir /usr/include/ubturbo
+
+%package ubdma
+Summary: ubdma
+
+%description ubdma
+This package contains the UB-DMA Driver
+
 %package smap
 Summary: smap
 
 %description smap
-This package contains the Huawei SMAP Driver
+This package contains the SMAP Driver
 
 %package rmrs
 Summary: rmrs
 
 %description rmrs
-This package contains the Huawei os_turbo Driver
+This package contains the ubturbo framework
+
+%package ucache
+Summary: ucache
+Requires: ubturbo-rmrs
+Requires: ubturbo-smap
+
+%description ucache
+This package contains the Huawei UCache Driver
+
+%package devel
+Summary: devel
+
+%description devel
+This package contains the ubturbo framework developmemt kit
 
 %prep
 %setup -q -T -b 0 -c -n ubturbo
 
 %build
+#build ubdma
+cd %{_builddir}/ubturbo/plugins/ubdma/src && make -j`nproc` -C /lib/modules/6.6.0*/build M=%{_builddir}/ubturbo/plugins/ubdma/src modules
+
 #build smap
 cd %{_builddir}
 git clone https://gitee.com/src-openeuler/spdlog.git
@@ -72,20 +103,10 @@ pwd
 tar -zxvf v1.11.0.tar.gz
 
 cd %{_builddir}
-git clone -b OLK-6.6 https://gitee.com/openeuler/kernel.git
-cd kernel
-make openeuler_defconfig
-sed -i 's/CONFIG_MODULE_SIG_KEY=.*$/CONFIG_MODULE_SIG_KEY="certs\/signing_key.pem"/g' .config
-make olddefconfig
-sed -i -e '/bzip2 -9 --keep vmlinux/,+1d' scripts/package/mkspec
-INSTALL_MOD_STRIP=1 make rpm-pkg -j 64 -s
-cd %{_builddir}
-rpm2cpio /home/lkp/rpmbuild/BUILD/kernel/rpmbuild/RPMS/aarch64/kernel-devel*.rpm | cpio -div
-cd %{_builddir}/ubturbo/plugins/smap/src/drivers && make -j`nproc` -C %{_builddir}/usr/src/kernels/6.6.0+ M=%{_builddir}/ubturbo/plugins/smap/src/drivers modules
+cd %{_builddir}/ubturbo/plugins/smap/src/drivers && make -j`nproc` -C /lib/modules/6.6.0*/build M=%{_builddir}/ubturbo/plugins/smap/src/drivers modules
 cp %{_builddir}/ubturbo/plugins/smap/src/drivers/Module.symvers %{_builddir}/ubturbo/plugins/smap/src/tiering/depends
-rm -rf %{_builddir}/ubturbo/plugins/smap/src/tiering/depends/hisi.symvers
-cd %{_builddir}/ubturbo/plugins/smap/src/tiering && make -j`nproc` -C %{_builddir}/usr/src/kernels/6.6.0+ M=%{_builddir}/ubturbo/plugins/smap/src/tiering modules
-cd %{_builddir}/ubturbo/plugins/smap/src/ucache && make -j`nproc` -C %{_builddir}/usr/src/kernels/6.6.0+ M=%{_builddir}/ubturbo/plugins/smap/src/ucache modules
+cd %{_builddir}/ubturbo/plugins/smap/src/tiering && make -j`nproc` -C /lib/modules/6.6.0*/build M=%{_builddir}/ubturbo/plugins/smap/src/tiering modules
+cd %{_builddir}/ubturbo/plugins/smap/src/ucache && make -j`nproc` -C /lib/modules/6.6.0*/build M=%{_builddir}/ubturbo/plugins/smap/src/ucache modules
 
 rm -rf %{_builddir}/ubturbo/plugins/smap/3rdparty/spdlog
 mv %{_builddir}/spdlog-1.11.0 %{_builddir}/spdlog
@@ -97,10 +118,17 @@ make -j`nproc` install
 #build rmrs
 cd %{_builddir}/ubturbo && bash -x build.sh -c
 
+#build ucache
+cd %{_builddir}/ubturbo/plugins/ucache && bash -x build.sh -c
+
 %install
-#install smap
+#install ubdma
 echo "########RPM_BUILD_ROOT=${RPM_BUILD_ROOT}"
 rm -rf ${RPM_BUILD_ROOT}
+mkdir -p -m755 ${RPM_BUILD_ROOT}/%{ub_dma_dir}
+%{__install} -b -m 0500 %{_builddir}/ubturbo/plugins/ubdma/src/ub_dma.ko ${RPM_BUILD_ROOT}/%{ub_dma_dir}
+
+#install smap
 mkdir -p -m755 ${RPM_BUILD_ROOT}/%{smap_dir}
 mkdir -p -m755 ${RPM_BUILD_ROOT}/%{ucache_dir}
 mkdir -p -m755 ${RPM_BUILD_ROOT}/%{smap_libsmap_dir}
@@ -131,11 +159,32 @@ ls %{_builddir}/ubturbo/dist/release/bin
 %{__install} -b -m 0644 %{_builddir}/ubturbo/dist/release/conf/ubturbo.conf ${RPM_BUILD_ROOT}/%{ubturbo_conf_dir}
 %{__install} -b -m 0644 %{_builddir}/ubturbo/dist/release/conf/plugin_rmrs.conf ${RPM_BUILD_ROOT}/%{ubturbo_conf_dir}
 
+#install ucache
+%{__install} -b -m 0644 %{_builddir}/ubturbo/plugins/ucache/cmake-build-release/lib/libucache_os_turbo_plugin.so ${RPM_BUILD_ROOT}/%{ubturbo_lib_dir}
+%{__install} -b -m 0644 %{_builddir}/ubturbo/plugins/ucache/cmake-build-release/conf/plugin_turbo_ucache.conf ${RPM_BUILD_ROOT}/%{ubturbo_conf_dir}
+
 find ${RPM_BUILD_ROOT}/%{ubturbo_lib_dir} -name "*.so" -exec patchelf --set-rpath '$ORIGIN/../lib' {} \;
 patchelf --set-rpath '$ORIGIN/../lib' ${RPM_BUILD_ROOT}/%{ubturbo_bin_dir}/ub_turbo_exec
 
+#install devel
+mkdir -p -m755 ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
+ls %{_builddir}/ubturbo/include
+ls %{_builddir}/ubturbo/src/sdk/include
+%{__install} -b -m 0644 %{_builddir}/ubturbo/include/turbo_conf.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
+%{__install} -b -m 0644 %{_builddir}/ubturbo/include/turbo_def.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
+%{__install} -b -m 0644 %{_builddir}/ubturbo/include/turbo_ipc_client.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
+%{__install} -b -m 0644 %{_builddir}/ubturbo/include/turbo_ipc_server.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
+%{__install} -b -m 0644 %{_builddir}/ubturbo/include/turbo_logger.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
+%{__install} -b -m 0644 %{_builddir}/ubturbo/src/sdk/include/turbo_serialize.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
+%{__install} -b -m 0644 %{_builddir}/ubturbo/src/sdk/turbo_rmrs_interface.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
+%{__install} -b -m 0644 %{_builddir}/ubturbo/src/sdk/turbo_ucache_interface.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
+%{__install} -b -m 0644 %{_builddir}/ubturbo/src/smap/smap_interface.h ${RPM_BUILD_ROOT}/%{ubturbo_include_dir}
+
 %clean
 rm -rf ${RPM_BUILD_ROOT}
+
+%files ubdma
+%{ub_dma_dir}/ub_dma.ko
 
 %files smap
 %defattr(-,ubturbo,ubturbo)
@@ -160,6 +209,24 @@ rm -rf ${RPM_BUILD_ROOT}
 %{ubturbo_bin_dir}/ub_turbo_exec
 %{ubturbo_bin_dir}/cat.sh
 
+%files ucache
+%defattr(-,root,root)
+%{ubturbo_lib_dir}/libucache_os_turbo_plugin.so
+%{ubturbo_conf_dir}/plugin_turbo_ucache.conf
+
+%files devel
+%defattr(-,ubturbo,ubturbo)
+%dir %{ubturbo_include_dir}
+%{ubturbo_include_dir}/turbo_conf.h
+%{ubturbo_include_dir}/turbo_def.h
+%{ubturbo_include_dir}/turbo_ipc_client.h
+%{ubturbo_include_dir}/turbo_ipc_server.h
+%{ubturbo_include_dir}/turbo_logger.h
+%{ubturbo_include_dir}/turbo_serialize.h
+%{ubturbo_include_dir}/turbo_rmrs_interface.h
+%{ubturbo_include_dir}/turbo_ucache_interface.h
+%{ubturbo_include_dir}/smap_interface.h
+
 %pre smap
 
 %post smap
@@ -178,6 +245,11 @@ if [ "$1" = "0" ]; then
     modprobe -r ucache
 fi
 
+%postun ubdma
+if [ "$1" = "0" ]; then
+    rm -rf %{ub_dma_dir}
+fi
+
 %postun smap
 if [ "$1" = "0" ]; then
     rm -rf %{smap_dir}
@@ -187,6 +259,12 @@ if [ "$1" = "0" ]; then
     rm -f %{udev_rules_dir}/99-smap.rules
 fi
 depmod -a
+
+%post ucache
+chmod 500 %{ubturbo_lib_dir}/libucache_os_turbo_plugin.so
+chown ubturbo:ubturbo %{ubturbo_lib_dir}/libucache_os_turbo_plugin.so
+chmod 600 %{ubturbo_conf_dir}/plugin_turbo_ucache.conf
+chown ubturbo:ubturbo %{ubturbo_conf_dir}/plugin_turbo_ucache.conf
 
 %pre rmrs
 #!/bin/bash
@@ -288,19 +366,23 @@ remove_file_if_exists() {
 
 # 主流程
 main() {
-# 脚本开始执行
-log_message "INFO" "======================"
-log_message "INFO" "pre_install.sh started"
-log_message "INFO" "======================"
+if command -v mkdir >/dev/null 2>&1; then
+    # 脚本开始执行
+    log_message "INFO" "======================"
+    log_message "INFO" "pre_install.sh started"
+    log_message "INFO" "======================"
 
-# 停止并禁用服务
-stop_and_disable_service "ubturbo.service"
-rm -f /tmp/ubturbo_ipc
+    # 停止并禁用服务
+    stop_and_disable_service "ubturbo.service"
+    rm -f /tmp/ubturbo_ipc
 
-# 脚本结束执行
-log_message "INFO" "======================"
-log_message "INFO" "pre_install.sh ended"
-log_message "INFO" "======================"
+    # 脚本结束执行
+    log_message "INFO" "======================"
+    log_message "INFO" "pre_install.sh ended"
+    log_message "INFO" "======================"
+else
+    echo "环境无mkdir命令，无coreutils包"
+fi
 }
 
 # 执行主流程
@@ -431,7 +513,7 @@ ensure_permission() {
     chmod 700 "$PROGRAM_LOG_DIR" || handle_error "Failed to set permissions for $PROGRAM_LOG_DIR"
 
     # 文件权限控制
-    chmod 600 "$PROGRAM_CONF_DIR"/* || handle_error "Failed to set permissions for conf files in $PROGRAM_CONF_DIR"
+    chmod 600 "$PROGRAM_CONF_DIR"/*.conf || handle_error "Failed to set permissions for conf files in $PROGRAM_CONF_DIR"
     chmod 600 "$PROGRAM_LOG_DIR"/* || handle_error "Failed to set permissions for log files in $PROGRAM_LOG_DIR"
     chmod 500 "$PROGRAM_BIN_DIR"/* || handle_error "Failed to set permissions for exec files in $PROGRAM_BIN_DIR"
     chmod 500 "$PROGRAM_LIB_DIR"/* || handle_error "Failed to set permissions for exec files in $PROGRAM_LIB_DIR"
@@ -472,12 +554,6 @@ copy_client_so() {
 
     chmod 550 "$installed_so_file" || handle_error "Failed to set permissions for $installed_so_file"
     chown "$SYSTEM_USER:$SYSTEM_GROUP" "$installed_so_file" || handle_error "Failed to set ownership for directory $installed_so_file"
-
-    # 删除源文件
-    if [ -f "$source_so_file" ]; then
-        rm -f "$source_so_file" || handle_error "Failed to remove source $source_so_file"
-        log_message "INFO" "Removed source $source_so_file"
-    fi
 }
 
 # 控制cat.sh脚本的权限
@@ -487,15 +563,13 @@ chmod_cat_sh() {
  
     cp "$source_sh_file" "$installed_sh_file" || handle_error "Failed to copy so file"
     log_message "INFO" "Smap so file copied to $installed_sh_file"
- 
-    # 删除源文件
-    if [ -f "$source_sh_file" ]; then
-        rm -f "$source_sh_file" || handle_error "Failed to remove source $source_sh_file"
-        log_message "INFO" "Removed source $source_sh_file"
-    fi
 
     chmod 500 "$installed_sh_file" || handle_error "Failed to set permissions for $installed_sh_file"
     chown "$ROOT_USER:$ROOT_GROUP" "$installed_sh_file" || handle_error "Failed to set ownership for directory $installed_sh_file"
+
+    log_message "INFO" "Configure passwordless login for the script ${installed_sh_file}."
+    touch /etc/sudoers.d/ubturbo
+    echo "ubturbo ALL=(root) NOPASSWD:${installed_sh_file}" > /etc/sudoers.d/ubturbo
 }
 
 # 重新加载 systemd，这里只是让 systemd 重刷文件，不会影响运行的服务
@@ -506,28 +580,32 @@ reload_systemd() {
 
 # 主流程
 main() {
-    log_message "INFO" "======================"
-    log_message "INFO" "post_install.sh started"
-    log_message "INFO" "======================"
+    if command -v mkdir >/dev/null 2>&1; then
+        log_message "INFO" "======================"
+        log_message "INFO" "post_install.sh started"
+        log_message "INFO" "======================"
 
-    create_group
-    create_user
-    copy_service_file
-    copy_client_so
-    reload_systemd
-    # 确保日志和程序目录的属主正确
-    ensure_directory_owner "$LOG_DIR" true
-    ensure_directory_owner "$PROGRAM_DIR" true
-    # 权限控制
-    ensure_permission
-    chmod_cat_sh
+        create_group
+        create_user
+        copy_service_file
+        copy_client_so
+        reload_systemd
+        # 确保日志和程序目录的属主正确
+        ensure_directory_owner "$LOG_DIR" true
+        ensure_directory_owner "$PROGRAM_DIR" true
+        # 权限控制
+        ensure_permission
+        chmod_cat_sh
 
-    # 将程序设为开机自启动
-    systemctl enable ubturbo.service
-    
-    log_message "INFO" "======================"
-    log_message "INFO" "post_install.sh ended"
-    log_message "INFO" "======================"
+        # 将程序设为开机自启动
+        systemctl enable ubturbo.service
+
+        log_message "INFO" "======================"
+        log_message "INFO" "post_install.sh ended"
+        log_message "INFO" "======================"
+    else
+        echo "环境无mkdir命令，无coreutils包"
+    fi
 }
 
 # 执行主流程
@@ -642,29 +720,33 @@ uninstall_service() {
 
 # 主流程
 main() {
-# 检查是否是卸载操作
-if [ "$1" -ne 0 ]; then
-    log_message "INFO"  "Not an uninstall operation."
-    chown "ubturbo:ubturbo" "/var/log/ubturbo/ubturbo-uninstall.log"
-    exit 0
+if command -v mkdir >/dev/null 2>&1; then
+    # 检查是否是卸载操作
+    if [ "$1" -ne 0 ]; then
+        log_message "INFO"  "Not an uninstall operation."
+        chown "ubturbo:ubturbo" "/var/log/ubturbo/ubturbo-uninstall.log"
+        exit 0
+    else
+        log_message "INFO"  "Uninstalling the package pre..."
+    fi
+
+    log_message "$RPM_INSTALL"
+    log_message "INFO" "======================"
+    log_message "INFO" "pre_uninstall.sh started"
+    log_message "INFO" "======================"
+
+    # 停止并禁用服务
+    stop_and_disable_service "ubturbo.service"
+
+    # 卸载服务文件
+    uninstall_service
+
+    log_message "INFO" "======================"
+    log_message "INFO" "pre_uninstall.sh ended"
+    log_message "INFO" "======================"
 else
-    log_message "INFO"  "Uninstalling the package pre..."
+    echo "环境无mkdir命令，无coreutils包"
 fi
-
-log_message "$RPM_INSTALL"
-log_message "INFO" "======================"
-log_message "INFO" "pre_uninstall.sh started"
-log_message "INFO" "======================"
-
-# 停止并禁用服务
-stop_and_disable_service "ubturbo.service"
-
-# 卸载服务文件
-uninstall_service
-
-log_message "INFO" "======================"
-log_message "INFO" "pre_uninstall.sh ended"
-log_message "INFO" "======================"
 }
 
 # 执行主流程
@@ -776,31 +858,38 @@ trim_spaces() {
 
 # 主流程
 main() {
-# 检查是否是卸载操作
-if [ "$1" -ne 0 ]; then
-    log_message "INFO"  "Not an uninstall operation."
-    chown "ubturbo:ubturbo" "/var/log/ubturbo/ubturbo-uninstall.log"
-    exit 0
+if command -v mkdir >/dev/null 2>&1; then
+    # 检查是否是卸载操作
+    if [ "$1" -ne 0 ]; then
+        log_message "INFO"  "Not an uninstall operation."
+        chown "ubturbo:ubturbo" "/var/log/ubturbo/ubturbo-uninstall.log"
+        exit 0
+    else
+        log_message "INFO"  "Uninstalling the package post..."
+    fi
+
+    log_message "INFO" "======================"
+    log_message "INFO" "post_uninstall.sh started"
+    log_message "INFO" "======================"
+
+    # 删除用户组
+    remove_user_and_group
+
+    log_message "INFO" "======================"
+    log_message "INFO" "post_uninstall.sh ended"
+    log_message "INFO" "======================"
+    # 删除日志目录
+    remove_log_directory
 else
-    log_message "INFO"  "Uninstalling the package post..."
+    echo "环境无mkdir命令，无coreutils包"
 fi
-log_message "INFO" "======================"
-log_message "INFO" "post_uninstall.sh started"
-log_message "INFO" "======================"
-
-# 删除用户组
-remove_user_and_group
-
-log_message "INFO" "======================"
-log_message "INFO" "post_uninstall.sh ended"
-log_message "INFO" "======================"
-# 删除日志目录
-remove_log_directory
 }
 
 # 执行主流程
 main "$@"
 
 %changelog
-* Thur Nov 20 2025 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-1
+* Wed Dec 24 2025 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-2
+- fix: 4k scene statistic feature
+* Wed Dec 3 2025 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-1
 - Package init
