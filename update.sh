@@ -2,7 +2,7 @@
 
 set -e
 
-git clone -b br_430 https://gitcode.com/jamesricado/ubturbo.git
+git clone https://atomgit.com/openeuler/ubturbo.git
 cd ubturbo
 git log -2
 cd ..
