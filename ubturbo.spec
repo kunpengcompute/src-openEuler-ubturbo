@@ -1,5 +1,5 @@
 %global version    1.0.0
-%global release_version 3
+%global release_version 4
 %global __strip /bin/true
 
 Name:          ubturbo
@@ -889,6 +889,8 @@ fi
 main "$@"
 
 %changelog
+* Sun May 17 2026 Liu Jiangqi <liujiangqi1@huawei.com> - 1.0.0-4
+- update: update version for sp4
 * Wed Apr 29 2026 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-3
 - update: update version for sp4
 * Wed Dec 24 2025 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-2
