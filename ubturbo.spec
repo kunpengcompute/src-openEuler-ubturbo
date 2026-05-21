@@ -1,5 +1,5 @@
 %global version    1.0.0
-%global release_version 4
+%global release_version 5
 %global __strip /bin/true
 
 Name:          ubturbo
@@ -8,7 +8,7 @@ Release:       %{release_version}
 Summary:       ubturbo
 License:       MulanPSL2
 URL:           https://gitee.com/openeuler/ubturbo.git
-Source0:       ubturbo-1.0.0.tar.gz
+Source0:       %{name}-%{version}.tar.gz
 Provides:      %{name}
 BuildRoot:     %{buildroot}
 ExclusiveArch: %arm64
@@ -24,6 +24,9 @@ BuildRequires: rapidjson
 BuildRequires: ninja-build
 Requires:      kernel >= 5.10.0-136.12.0.86
 Requires:      coreutils
+Requires:      ubturbo-smap = %{version}-%{release}
+Requires:      ubturbo-rmrs = %{version}-%{release}
+Requires:      ubturbo-ubdma = %{version}-%{release}
 buildArch     : aarch64
 ExclusiveArch : aarch64
 
@@ -182,6 +185,8 @@ ls %{_builddir}/ubturbo/src/sdk/include
 
 %clean
 rm -rf ${RPM_BUILD_ROOT}
+
+%files
 
 %files ubdma
 %{ub_dma_dir}/ub_dma.ko
@@ -889,6 +894,8 @@ fi
 main "$@"
 
 %changelog
+* Thu May 21 2026 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-5
+- update: add ubturbo.rpm
 * Sun May 17 2026 Liu Jiangqi <liujiangqi1@huawei.com> - 1.0.0-4
 - update: update version for sp4
 * Wed Apr 29 2026 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-3
