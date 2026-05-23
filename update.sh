@@ -4,6 +4,7 @@ set -e
 
 git clone https://atomgit.com/openeuler/ubturbo.git
 cd ubturbo
+git checkout openEuler-24.03-LTS-SP3
 git log -2
 cd ..
 
