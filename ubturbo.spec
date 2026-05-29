@@ -1,5 +1,5 @@
 %global version    1.0.0
-%global release_version 4
+%global release_version 5
 %global __strip /bin/true
 
 Name:          ubturbo
@@ -894,6 +894,8 @@ fi
 main "$@"
 
 %changelog
+* Fri May 29 2026 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-5
+- fix：Add pre-migration remote available numa detection 
 * Thu May 21 2026 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-4
 - update: add ubturbo.rpm
 * Sun May 17 2026 Liu Jiangqi <liujiangqi1@huawei.com> - 1.0.0-3
