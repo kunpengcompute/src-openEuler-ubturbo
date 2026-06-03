@@ -6,7 +6,7 @@ Build-Depends: debhelper-compat (= 13),
                make (>= 4.3),
                gcc (>= 10.3.1),
                cmake (>= 3.22),
-               libvirt-dev,
+               libvirt-devel,
                rapidjson-dev,
                ninja-build,
                patchelf,
@@ -30,3 +30,10 @@ Depends: ${misc:Depends}
 Description: Development headers for UB Turbo framework
  This package contains C headers for integrating with the
  UB Turbo SDK (turbo_conf.h, turbo_def.h, turbo_ipc_*.h, etc.).
+
+Package: ubturbo-smap
+Architecture: arm64
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Description: SMAP plugin for UB Turbo framework
+ This package contains libsmap.so and kernel modules for
+ storage monitoring and tiering functionality.

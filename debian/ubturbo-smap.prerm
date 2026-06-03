@@ -1,0 +1,41 @@
+#!/bin/bash
+set -e
+
+# ubturbo-smap prerm — unload smap kernel modules before removal
+
+KERNEL_MODULES_DIR="/lib/modules/smap"
+
+log_message() {
+    echo "[$(date)] [$1] $2" >> /var/log/ubturbo-smap-uninstall.log 2>/dev/null || true
+}
+
+if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ]; then
+    log_message "INFO" "ubturbo-smap prerm started"
+
+    # Unload modules in reverse order
+    if lsmod | grep -q smap_tiering; then
+        rmmod smap_tiering 2>/dev/null || log_message "WARNING" "Failed to unload smap_tiering"
+        log_message "INFO" "smap_tiering unloaded"
+    fi
+    
+    if lsmod | grep -q smap_access_tracking; then
+        rmmod smap_access_tracking 2>/dev/null || log_message "WARNING" "Failed to unload smap_access_tracking"
+        log_message "INFO" "smap_access_tracking unloaded"
+    fi
+    
+    if lsmod | grep -q smap_histogram_tracking; then
+        rmmod smap_histogram_tracking 2>/dev/null || log_message "WARNING" "Failed to unload smap_histogram_tracking"
+        log_message "INFO" "smap_histogram_tracking unloaded"
+    fi
+    
+    if lsmod | grep -q smap_tracking_core; then
+        rmmod smap_tracking_core 2>/dev/null || log_message "WARNING" "Failed to unload smap_tracking_core"
+        log_message "INFO" "smap_tracking_core unloaded"
+    fi
+
+    log_message "INFO" "ubturbo-smap prerm completed"
+fi
+
+#DEBHELPER#
+
+exit 0

@@ -1,0 +1,20 @@
+#!/bin/bash
+set -e
+
+# ubturbo-smap postrm — cleanup on purge
+
+if [ "$1" = "purge" ]; then
+    # Remove module directory
+    rm -rf /lib/modules/smap 2>/dev/null || true
+    
+    # Remove library
+    rm -f /usr/lib64/libsmap.so 2>/dev/null || true
+    
+    # Remove files
+    rm -f /dev/shm/smap_config 2>/dev/null || true
+    rm -f /opt/ubturbo/conf/smap/period.config 2>/dev/null || true
+fi
+
+#DEBHELPER#
+
+exit 0
