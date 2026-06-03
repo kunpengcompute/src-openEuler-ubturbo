@@ -40,3 +40,6 @@ fi
 
 echo "开始构建 deb 包"
 dpkg-buildpackage -rfakeroot -us -uc -b
+mv ../*.deb ../../
+mv ../*.buildinfo ../../
+mv ../*.changes ../../
