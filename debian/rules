@@ -1,6 +1,8 @@
 #!/usr/bin/make -f
 
 export DH_VERBOSE = 1
+export DEB_CFLAGS_MAINT_APPEND = -Wno-format-security
+export DEB_CXXFLAGS_MAINT_APPEND = -Wno-format-security
 
 %:
 	dh $@
@@ -8,8 +10,18 @@ export DH_VERBOSE = 1
 override_dh_auto_build:
 	# Apply quilt patches (needed when source is extracted + debian/ copied manually)
 	if [ -f $(CURDIR)/debian/patches/remove-openEuler-release-dependency.patch ]; then \
-		cd $(CURDIR) && patch -p1 --forward --dry-run < debian/patches/remove-openEuler-release-dependency.patch > /dev/null 2>&1 && \
-		patch -p1 --forward < debian/patches/remove-openEuler-release-dependency.patch || \
+		cd $(CURDIR) && patch -p1 -l --forward --dry-run < debian/patches/remove-openEuler-release-dependency.patch > /dev/null 2>&1 && \
+		patch -p1 -l --forward < debian/patches/remove-openEuler-release-dependency.patch || \
+		echo "Patch already applied or not needed" ; \
+	fi
+	if [ -f $(CURDIR)/debian/patches/0001-smap-feat-adapt-to-different-kernels.patch ]; then \
+		cd $(CURDIR) && patch -p1 -l --forward --dry-run < debian/patches/0001-smap-feat-adapt-to-different-kernels.patch > /dev/null 2>&1 && \
+		patch -p1 -l --forward < debian/patches/0001-smap-feat-adapt-to-different-kernels.patch || \
+		echo "Patch already applied or not needed" ; \
+	fi
+	if [ -f $(CURDIR)/debian/patches/0002-smap-chore-increase-MAX_2M_PROCESSES_CNT-from-100-to-500.patch ]; then \
+		cd $(CURDIR) && patch -p1 -l --forward --dry-run < debian/patches/0002-smap-chore-increase-MAX_2M_PROCESSES_CNT-from-100-to-500.patch > /dev/null 2>&1 && \
+		patch -p1 -l --forward < debian/patches/0002-smap-chore-increase-MAX_2M_PROCESSES_CNT-from-100-to-500.patch || \
 		echo "Patch already applied or not needed" ; \
 	fi
 
@@ -24,6 +36,29 @@ override_dh_auto_build:
 	# 2. rmrs — main ubturbo framework (build.sh wraps cmake)
 	# ============================================================
 	cd $(CURDIR) && bash -x build.sh -c
+
+	# ============================================================
+	# 3. smap — build libsmap.so and kernel modules
+	# ============================================================
+	# Build libsmap.so
+	if [ -d $(CURDIR)/plugins/smap ]; then \
+		cd $(CURDIR)/plugins/smap && bash -x build.sh; \
+	fi
+	
+	# Build drivers ko (smap_tracking_core.ko, smap_histogram_tracking.ko, smap_access_tracking.ko)
+	if [ -d $(CURDIR)/plugins/smap/src/drivers ]; then \
+		cd $(CURDIR)/plugins/smap/src/drivers && make KERNEL_VERSION=velinux; \
+	fi
+	
+	# Copy Module.symvers from drivers to tiering directory
+	if [ -f $(CURDIR)/plugins/smap/src/drivers/Module.symvers ] && [ -d $(CURDIR)/plugins/smap/src/tiering/depends ]; then \
+		cp $(CURDIR)/plugins/smap/src/drivers/Module.symvers $(CURDIR)/plugins/smap/src/tiering/depends/; \
+	fi
+	
+	# Build tiering ko (smap_tiering.ko)
+	if [ -d $(CURDIR)/plugins/smap/src/tiering ]; then \
+		cd $(CURDIR)/plugins/smap/src/tiering && make KERNEL_VERSION=velinux; \
+	fi
 
 override_dh_auto_install:
 	# ---- rmrs ----
@@ -58,6 +93,30 @@ override_dh_auto_install:
 		$(CURDIR)/debian/ubturbo-devel/usr/include/ubturbo/
 	install -m 0644 $(CURDIR)/src/smap/smap_interface.h \
 		$(CURDIR)/debian/ubturbo-devel/usr/include/ubturbo/
+
+	# ---- smap ----
+	# Install libsmap.so to /usr/lib64
+	install -D -m 0755 $(CURDIR)/plugins/smap/output/smap/lib/libsmap.so \
+		$(CURDIR)/debian/ubturbo-smap/usr/lib64/libsmap.so
+	
+	# Install kernel modules to /lib/modules/smap
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-smap/lib/modules/smap
+	if [ -f $(CURDIR)/plugins/smap/src/drivers/smap_tracking_core.ko ]; then \
+		install -m 0644 $(CURDIR)/plugins/smap/src/drivers/smap_tracking_core.ko \
+			$(CURDIR)/debian/ubturbo-smap/lib/modules/smap/; \
+	fi
+	if [ -f $(CURDIR)/plugins/smap/src/drivers/smap_histogram_tracking.ko ]; then \
+		install -m 0644 $(CURDIR)/plugins/smap/src/drivers/smap_histogram_tracking.ko \
+			$(CURDIR)/debian/ubturbo-smap/lib/modules/smap/; \
+	fi
+	if [ -f $(CURDIR)/plugins/smap/src/drivers/smap_access_tracking.ko ]; then \
+		install -m 0644 $(CURDIR)/plugins/smap/src/drivers/smap_access_tracking.ko \
+			$(CURDIR)/debian/ubturbo-smap/lib/modules/smap/; \
+	fi
+	if [ -f $(CURDIR)/plugins/smap/src/tiering/smap_tiering.ko ]; then \
+		install -m 0644 $(CURDIR)/plugins/smap/src/tiering/smap_tiering.ko \
+			$(CURDIR)/debian/ubturbo-smap/lib/modules/smap/; \
+	fi
 
 	# ---- patchelf: set rpath for rmrs binaries/libs ----
 	find $(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/lib -name '*.so' \

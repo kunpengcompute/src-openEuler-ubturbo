@@ -1,0 +1,282 @@
+From 70bd8c4a7549cb77c5a091e955069ec00ec6f2be Mon Sep 17 00:00:00 2001
+From: lucas <1358497393@qq.com>
+Date: Wed, 3 Jun 2026 16:34:07 +0800
+Subject: [PATCH 1/2] feat: adapt to different kernels
+
+---
+ plugins/smap/smap.spec                            |  5 +++--
+ plugins/smap/src/drivers/Makefile                 |  8 ++++++++
+ .../smap/src/drivers/access_tracking_wrapper.c    |  8 ++++++++
+ plugins/smap/src/drivers/accessed_bit.c           | 11 ++++++++++-
+ plugins/smap/src/drivers/kvm_pgtable.c            |  8 ++++++++
+ plugins/smap/src/tiering/Makefile                 | 15 ++++++++++++++-
+ plugins/smap/src/tiering/basic.c                  |  8 ++++++++
+ plugins/smap/src/tiering/mig_init.c               |  1 -
+ plugins/smap/src/tiering/smap_migrate_pages.c     |  6 ++++++
+ plugins/smap/src/tiering/tracking_manage.c        |  8 ++++++++
+ 10 files changed, 73 insertions(+), 5 deletions(-)
+
+diff --git a/plugins/smap/smap.spec b/plugins/smap/smap.spec
+index f2cab1a..c8cba77 100644
+--- a/plugins/smap/smap.spec
++++ b/plugins/smap/smap.spec
+@@ -29,9 +29,10 @@ This package contains the Huawei SMAP Driver
+ %setup -q -T -b 0 -c -n smap
+ 
+ %build
+-cd %{_builddir}/smap/src/drivers && make -j`nproc`
++%{!?KERNEL_VERSION:%global KERNEL_VERSION openeuler}
++cd %{_builddir}/smap/src/drivers && make KERNEL_VERSION=%{KERNEL_VERSION} -j`nproc`
+ cp %{_builddir}/smap/src/drivers/Module.symvers %{_builddir}/smap/src/tiering/depends
+-cd %{_builddir}/smap/src/tiering && make -j`nproc`
++cd %{_builddir}/smap/src/tiering && make KERNEL_VERSION=%{KERNEL_VERSION} -j`nproc`
+ cd %{_builddir}/smap/src/ucache && make -j`nproc`
+ cd %{_builddir}/smap && cmake -DCMAKE_BUILD_TYPE=Release %{_builddir}/smap
+ make -j`nproc` install
+diff --git a/plugins/smap/src/drivers/Makefile b/plugins/smap/src/drivers/Makefile
+index 2701e14..deaac22 100644
+--- a/plugins/smap/src/drivers/Makefile
++++ b/plugins/smap/src/drivers/Makefile
+@@ -12,6 +12,14 @@ smap_histogram_tracking-objs := ub_hist.o
+ 
+ ccflags-y += -DACPI_NOT_READY
+ 
++ifeq ($(KERNEL_VERSION), ocos)
++    ccflags-y += -DKERNEL_OCOS
++else ifeq ($(KERNEL_VERSION), velinux)
++    ccflags-y += -DKERNEL_VELINUX
++else
++    ccflags-y += -DKERNEL_OPENEULER
++endif
++
+ .PHONY: modules clean
+ .default: modules
+ 
+diff --git a/plugins/smap/src/drivers/access_tracking_wrapper.c b/plugins/smap/src/drivers/access_tracking_wrapper.c
+index 67bdeec..59677cd 100644
+--- a/plugins/smap/src/drivers/access_tracking_wrapper.c
++++ b/plugins/smap/src/drivers/access_tracking_wrapper.c
+@@ -161,13 +161,21 @@ pte_t smap_huge_ptep_get(pte_t *ptep)
+ {
+ 	int ncontig, i;
+ 	size_t pgsize;
++#ifdef KERNEL_VELINUX
++	pte_t orig_pte = ptep_get(ptep);
++#else
+ 	pte_t orig_pte = __ptep_get(ptep);
++#endif
+ 	if (!pte_present(orig_pte) || !pte_cont(orig_pte))
+ 		return orig_pte;
+ 
+ 	ncontig = num_contig_ptes(page_size(pte_page(orig_pte)), &pgsize);
+ 	for (i = 0; i < ncontig; i++, ptep++) {
++#ifdef KERNEL_VELINUX
++		pte_t pte = ptep_get(ptep);
++#else
+ 		pte_t pte = __ptep_get(ptep);
++#endif
+ 		if (pte_dirty(pte))
+ 			orig_pte = pte_mkdirty(orig_pte);
+ 		if (pte_young(pte))
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index 2119c66..b6e857c 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -1333,8 +1333,13 @@ static int check_pte_young(pte_t *pte, unsigned long addr, unsigned long next,
+ 		if (pte_walk->type == STATISTIC_SCAN)
+ 			pte_walk->statistic_vaddr[pte_walk->statistic_cnt++] =
+ 				addr;
+-		if (!is_file_or_shared_page(page))
++		if (!is_file_or_shared_page(page)) {
++#ifdef KERNEL_VELINUX
++			__ptep_test_and_clear_young(pte);
++#else
+ 			__ptep_test_and_clear_young(NULL, 0, pte);
++#endif
++		}
+ 		pte_walk->flag = true;
+ 	}
+ 
+@@ -1600,7 +1605,11 @@ static int pte_pure_clear(pte_t *pte, unsigned long addr, unsigned long next,
+ 
+ 	if (pte_young(*pte)) {
+ 		pte_walk->flag = true;
++#ifdef KERNEL_VELINUX
++		__ptep_test_and_clear_young(pte);
++#else
+ 		__ptep_test_and_clear_young(NULL, 0, pte);
++#endif
+ 	}
+ 
+ 	return 0;
+diff --git a/plugins/smap/src/drivers/kvm_pgtable.c b/plugins/smap/src/drivers/kvm_pgtable.c
+index df3223d..1c4b11f 100644
+--- a/plugins/smap/src/drivers/kvm_pgtable.c
++++ b/plugins/smap/src/drivers/kvm_pgtable.c
+@@ -49,7 +49,11 @@ static u32 kvm_pgtable_idx(struct kvm_pgtable_walk_data *data, u32 level)
+ 
+ static bool kvm_pte_table(kvm_pte_t pte, u32 level)
+ {
++#ifdef KERNEL_VELINUX
++	if (level == KVM_PGTABLE_LAST_LEVEL || !kvm_pte_valid(pte))
++#else
+ 	if (level == KVM_PGTABLE_MAX_LEVELS - 1 || !kvm_pte_valid(pte))
++#endif
+ 		return false;
+ 
+ 	return FIELD_GET(KVM_PTE_TYPE, pte) == KVM_PTE_TYPE_TABLE;
+@@ -167,7 +171,11 @@ static int __kvm_pgtable_walk(struct kvm_pgtable_walk_data *data,
+ 	u32 idx;
+ 	int ret = 0;
+ 
++#ifdef KERNEL_VELINUX
++	if (WARN_ON_ONCE(level < KVM_PGTABLE_FIRST_LEVEL || level > KVM_PGTABLE_LAST_LEVEL))
++#else
+ 	if (WARN_ON_ONCE(level >= KVM_PGTABLE_MAX_LEVELS))
++#endif
+ 		return -EINVAL;
+ 
+ 	for (idx = kvm_pgtable_idx(data, level); idx < PTRS_PER_PTE; ++idx) {
+diff --git a/plugins/smap/src/tiering/Makefile b/plugins/smap/src/tiering/Makefile
+index 6451164..1824106 100644
+--- a/plugins/smap/src/tiering/Makefile
++++ b/plugins/smap/src/tiering/Makefile
+@@ -1,5 +1,9 @@
+ MODULE_NAME = smap_tiering
+-$(MODULE_NAME)-objs := rmap.o ksm.o smap_migrate_wrapper.o smap_migrate_pages.o migrate_task.o pid_ioctl.o migrate_back_debugfs.o work.o numa.o acpi_helper.o acpi_mem.o mig_init.o tracking_manage.o smap_debugfs.o  dump_info.o iomem.o ham_migration.o basic.o coherence_maintain.o ham_tasks_mgr.o
++$(MODULE_NAME)-objs := rmap.o ksm.o smap_migrate_wrapper.o smap_migrate_pages.o migrate_task.o pid_ioctl.o migrate_back_debugfs.o work.o numa.o acpi_helper.o acpi_mem.o mig_init.o tracking_manage.o smap_debugfs.o  dump_info.o iomem.o
++
++ifeq ($(filter $(KERNEL_VERSION), ocos velinux),)
++$(MODULE_NAME)-objs += ham_migration.o basic.o coherence_maintain.o ham_tasks_mgr.o
++endif
+ 
+ obj-m   := $(MODULE_NAME).o
+ 
+@@ -7,6 +11,15 @@ KERNELDIR ?= /lib/modules/$(shell uname -r)/build
+ PWD       := $(shell pwd)
+ KBUILD_EXTRA_SYMBOLS = $(src)/depends/Module.symvers
+ 
++ifeq ($(KERNEL_VERSION), ocos)
++    ccflags-y += -DKERNEL_OCOS
++else ifeq ($(KERNEL_VERSION), velinux)
++    ccflags-y += -DKERNEL_VELINUX
++else
++    ccflags-y += -DHAM_ENABLED
++    ccflags-y += -DKERNEL_OPENEULER
++endif
++
+ .PHONY: modules
+ default: modules
+ 
+diff --git a/plugins/smap/src/tiering/basic.c b/plugins/smap/src/tiering/basic.c
+index 9f46517..113e6e5 100644
+--- a/plugins/smap/src/tiering/basic.c
++++ b/plugins/smap/src/tiering/basic.c
+@@ -43,14 +43,22 @@ pte_t kernel_huge_ptep_get(pte_t *ptep)
+ {
+ 	int ncontig, i;
+ 	size_t pgsize;
++#ifdef KERNEL_VELINUX
++	pte_t orig_pte = ptep_get(ptep);
++#else
+ 	pte_t orig_pte = __ptep_get(ptep);
++#endif
+ 	if (!pte_present(orig_pte) || !pte_cont(orig_pte))
+ 		return orig_pte;
+ 
+ 	ncontig =
+ 		kernel_num_contig_ptes(page_size(pte_page(orig_pte)), &pgsize);
+ 	for (i = 0; i < ncontig; i++, ptep++) {
++#ifdef KERNEL_VELINUX
++		pte_t pte = ptep_get(ptep);
++#else
+ 		pte_t pte = __ptep_get(ptep);
++#endif
+ 		if (pte_dirty(pte))
+ 			orig_pte = pte_mkdirty(orig_pte);
+ 
+diff --git a/plugins/smap/src/tiering/mig_init.c b/plugins/smap/src/tiering/mig_init.c
+index b4f4c4b..b85c9ae 100644
+--- a/plugins/smap/src/tiering/mig_init.c
++++ b/plugins/smap/src/tiering/mig_init.c
+@@ -19,7 +19,6 @@
+ #include "common.h"
+ #include "acpi_mem.h"
+ #include "iomem.h"
+-#include "ham_migration.h"
+ #include "smap_migrate_pages.h"
+ #include "mig_init.h"
+ 
+diff --git a/plugins/smap/src/tiering/smap_migrate_pages.c b/plugins/smap/src/tiering/smap_migrate_pages.c
+index f544d29..cfe5975 100644
+--- a/plugins/smap/src/tiering/smap_migrate_pages.c
++++ b/plugins/smap/src/tiering/smap_migrate_pages.c
+@@ -68,6 +68,7 @@ static struct migrate_node {
+ 	unsigned long nr[SMAP_MAX_NUMNODES];
+ } migrate_node;
+ 
++#ifdef CONFIG_MIGRATE_PAGES_DMA_OFFLOADING
+ void set_remote_migrate_mode(unsigned int mode)
+ {
+ 	if (mode) {
+@@ -75,6 +76,11 @@ void set_remote_migrate_mode(unsigned int mode)
+ 	}
+ 	pr_info("set remote migrate mode: %u\n", remote_migrate_mode);
+ }
++#else
++void set_remote_migrate_mode(unsigned int mode)
++{
++}
++#endif
+ 
+ static int smap_check_huge_page_for_migration(struct page *page, pid_t pid)
+ {
+diff --git a/plugins/smap/src/tiering/tracking_manage.c b/plugins/smap/src/tiering/tracking_manage.c
+index d4f8b5b..2003010 100644
+--- a/plugins/smap/src/tiering/tracking_manage.c
++++ b/plugins/smap/src/tiering/tracking_manage.c
+@@ -26,7 +26,9 @@
+ #include "dump_info.h"
+ #include "acpi_mem.h"
+ #include "iomem.h"
++#ifdef HAM_ENABLED
+ #include "ham_migration.h"
++#endif
+ #include "pid_ioctl.h"
+ #include "tracking_manage.h"
+ 
+@@ -88,7 +90,9 @@ static void resource(void)
+ 	exit_migrate();
+ 	smap_dev_exit();
+ 	smap_debugfs_mod_exit();
++#ifdef HAM_ENABLED
+ 	ham_exit();
++#endif
+ }
+ 
+ static int is_qemu_name_valid(void)
+@@ -235,17 +239,21 @@ static int __init tracking_init(void)
+ 		pr_err("failed to init migrate, ret: %d\n", ret);
+ 		goto out_dev_int;
+ 	}
++#ifdef HAM_ENABLED
+ 	ret = ham_init();
+ 	if (ret < 0) {
+ 		pr_err("failed to init HAM, ret: %d\n", ret);
+ 		goto out_migrate_int;
+ 	}
++#endif
+ 	queue_delayed_work(migrate_back_wq, &migrate_back_work,
+ 			   msecs_to_jiffies(MB_INTV));
+ 	pr_info("SMAP init successfully\n");
+ 	return 0;
++#ifdef HAM_ENABLED
+ out_migrate_int:
+ 	exit_migrate();
++#endif
+ out_dev_int:
+ 	smap_dev_exit();
+ out_debugfs:
+-- 
+2.54.0.windows.1
+

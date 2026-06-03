@@ -1,1 +1,3 @@
 remove-openEuler-release-dependency.patch
+0001-smap-feat-adapt-to-different-kernels.patch
+0002-smap-chore-increase-MAX_2M_PROCESSES_CNT-from-100-to-500.patch
