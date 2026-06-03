@@ -1,0 +1,92 @@
+#!/bin/bash
+set -e
+
+# ubturbo-rmrs postinst — create user/group, install service, set permissions
+# Translated from RPM spec %post rmrs
+
+LOG_DIR="/var/log/ubturbo"
+LOG_FILE="$LOG_DIR/ubturbo-install.log"
+PROGRAM_DIR="/opt/ubturbo"
+PROGRAM_CONF_DIR="/opt/ubturbo/conf"
+PROGRAM_LIB_DIR="/opt/ubturbo/lib"
+PROGRAM_BIN_DIR="/opt/ubturbo/bin"
+PROGRAM_LOG_DIR="/var/log/ubturbo"
+SYSTEM_USER="ubturbo"
+SYSTEM_GROUP="ubturbo"
+
+log_message() {
+    local log_type="$1"
+    local message="$2"
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+    echo "[$(date)] [$log_type] $message" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+if [ "$1" = "configure" ]; then
+    log_message "INFO" "post_install.sh started"
+
+    # Create system group
+    if ! getent group "$SYSTEM_GROUP" > /dev/null 2>&1; then
+        groupadd -r "$SYSTEM_GROUP" || log_message "ERROR" "Failed to create group $SYSTEM_GROUP"
+        log_message "INFO" "Group $SYSTEM_GROUP created"
+    fi
+
+    # Create system user
+    if ! getent passwd "$SYSTEM_USER" > /dev/null 2>&1; then
+        useradd -r -g "$SYSTEM_GROUP" -s /sbin/nologin "$SYSTEM_USER" || log_message "ERROR" "Failed to create user $SYSTEM_USER"
+        log_message "INFO" "User $SYSTEM_USER created"
+    fi
+
+    # Copy service file to systemd directory
+    if [ -f "$PROGRAM_DIR/scripts/ubturbo.service" ]; then
+        cp "$PROGRAM_DIR/scripts/ubturbo.service" /etc/systemd/system/ubturbo.service
+        chmod 644 /etc/systemd/system/ubturbo.service
+        rm -f "$PROGRAM_DIR/scripts/ubturbo.service"
+        rmdir "$PROGRAM_DIR/scripts" 2>/dev/null || true
+    fi
+
+    # Copy client library to system lib path
+    if [ -f "$PROGRAM_LIB_DIR/libubturbo_client.so" ]; then
+        cp "$PROGRAM_LIB_DIR/libubturbo_client.so" /usr/lib64/libubturbo_client.so 2>/dev/null || \
+        cp "$PROGRAM_LIB_DIR/libubturbo_client.so" /usr/lib/aarch64-linux-gnu/libubturbo_client.so 2>/dev/null || true
+        chmod 550 /usr/lib64/libubturbo_client.so 2>/dev/null || \
+        chmod 550 /usr/lib/aarch64-linux-gnu/libubturbo_client.so 2>/dev/null || true
+        chown "$SYSTEM_USER:$SYSTEM_GROUP" /usr/lib64/libubturbo_client.so 2>/dev/null || \
+        chown "$SYSTEM_USER:$SYSTEM_GROUP" /usr/lib/aarch64-linux-gnu/libubturbo_client.so 2>/dev/null || true
+    fi
+
+    # Copy cat.sh to /usr/local/bin with sudoers
+    if [ -f "$PROGRAM_BIN_DIR/cat.sh" ]; then
+        mkdir -p /usr/local/bin
+        cp "$PROGRAM_BIN_DIR/cat.sh" /usr/local/bin/cat.sh
+        chmod 500 /usr/local/bin/cat.sh
+        chown root:root /usr/local/bin/cat.sh
+        mkdir -p /etc/sudoers.d
+        echo "ubturbo ALL=(root) NOPASSWD:/usr/local/bin/cat.sh" > /etc/sudoers.d/ubturbo
+    fi
+
+    # Reload systemd
+    systemctl daemon-reload || true
+
+    # Set directory ownership
+    chown -R "$SYSTEM_USER:$SYSTEM_GROUP" "$PROGRAM_LOG_DIR" 2>/dev/null || true
+    chown -R "$SYSTEM_USER:$SYSTEM_GROUP" "$PROGRAM_DIR" 2>/dev/null || true
+
+    # Set permissions
+    chmod 750 "$PROGRAM_DIR" 2>/dev/null || true
+    chmod 700 "$PROGRAM_CONF_DIR" 2>/dev/null || true
+    chmod 500 "$PROGRAM_LIB_DIR" 2>/dev/null || true
+    chmod 500 "$PROGRAM_BIN_DIR" 2>/dev/null || true
+    chmod 700 "$PROGRAM_LOG_DIR" 2>/dev/null || true
+    chmod 600 "$PROGRAM_CONF_DIR"/*.conf 2>/dev/null || true
+    chmod 500 "$PROGRAM_BIN_DIR"/* 2>/dev/null || true
+    chmod 500 "$PROGRAM_LIB_DIR"/* 2>/dev/null || true
+
+    # Enable service
+    systemctl enable ubturbo.service 2>/dev/null || true
+
+    log_message "INFO" "post_install.sh ended"
+fi
+
+#DEBHELPER#
+
+exit 0

@@ -1,0 +1,34 @@
+#!/bin/bash
+set -e
+
+# ubturbo-rmrs preinst — stop service before upgrade/install
+# Translated from RPM spec %pre rmrs
+
+LOG_DIR="/var/log/ubturbo"
+LOG_FILE="$LOG_DIR/ubturbo-install.log"
+
+log_message() {
+    local log_type="$1"
+    local message="$2"
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+    chmod 700 "$LOG_DIR" 2>/dev/null || true
+    echo "[$(date)] [$log_type] $message" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+if [ "$1" = "install" ] || [ "$1" = "upgrade" ]; then
+    log_message "INFO" "pre_install.sh started"
+
+    # Stop and disable existing service if present
+    if systemctl list-units --type=service --all 2>/dev/null | grep -q "ubturbo.service"; then
+        systemctl stop ubturbo.service 2>/dev/null || true
+        systemctl disable ubturbo.service 2>/dev/null || true
+    fi
+
+    rm -f /tmp/ubturbo_ipc
+
+    log_message "INFO" "pre_install.sh ended"
+fi
+
+#DEBHELPER#
+
+exit 0
