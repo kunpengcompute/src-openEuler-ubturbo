@@ -1,0 +1,73 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE = 1
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	# Apply quilt patches (needed when source is extracted + debian/ copied manually)
+	if [ -f $(CURDIR)/debian/patches/remove-openEuler-release-dependency.patch ]; then \
+		cd $(CURDIR) && patch -p1 --forward --dry-run < debian/patches/remove-openEuler-release-dependency.patch > /dev/null 2>&1 && \
+		patch -p1 --forward < debian/patches/remove-openEuler-release-dependency.patch || \
+		echo "Patch already applied or not needed" ; \
+	fi
+
+	# ============================================================
+	# 1. libboundscheck — Debian installs to multiarch path,
+	#    but cmake hardcodes /usr/lib64/. Create symlink.
+	# ============================================================
+	mkdir -p /usr/lib64
+	ln -sf /usr/lib/aarch64-linux-gnu/libboundscheck.so /usr/lib64/libboundscheck.so
+
+	# ============================================================
+	# 2. rmrs — main ubturbo framework (build.sh wraps cmake)
+	# ============================================================
+	cd $(CURDIR) && bash -x build.sh -c
+
+override_dh_auto_install:
+	# ---- rmrs ----
+	install -D -m 0755 $(CURDIR)/dist/release/bin/ub_turbo_exec \
+		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/bin/ub_turbo_exec
+	install -D -m 0755 $(CURDIR)/build/rpm/cat.sh \
+		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/bin/cat.sh
+	install -D -m 0644 $(CURDIR)/dist/release/lib/libubturbo_client.so \
+		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/lib/libubturbo_client.so
+	install -D -m 0644 $(CURDIR)/dist/release/lib/librmrs_ubturbo_plugin.so \
+		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/lib/librmrs_ubturbo_plugin.so
+	install -D -m 0644 $(CURDIR)/dist/release/conf/ubturbo_plugin_admission.conf \
+		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/conf/ubturbo_plugin_admission.conf
+	install -D -m 0644 $(CURDIR)/dist/release/conf/ubturbo.conf \
+		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/conf/ubturbo.conf
+	install -D -m 0644 $(CURDIR)/dist/release/conf/plugin_rmrs.conf \
+		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/conf/plugin_rmrs.conf
+	install -D -m 0644 $(CURDIR)/build/rpm/ubturbo.service \
+		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/scripts/ubturbo.service
+
+	# ---- devel ----
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-devel/usr/include/ubturbo
+	for h in turbo_conf.h turbo_def.h turbo_ipc_client.h turbo_ipc_server.h turbo_logger.h; do \
+		install -m 0644 $(CURDIR)/include/$$h \
+			$(CURDIR)/debian/ubturbo-devel/usr/include/ubturbo/ ; \
+	done
+	install -m 0644 $(CURDIR)/src/sdk/include/turbo_serialize.h \
+		$(CURDIR)/debian/ubturbo-devel/usr/include/ubturbo/
+	install -m 0644 $(CURDIR)/src/sdk/turbo_rmrs_interface.h \
+		$(CURDIR)/debian/ubturbo-devel/usr/include/ubturbo/
+	install -m 0644 $(CURDIR)/src/sdk/turbo_ucache_interface.h \
+		$(CURDIR)/debian/ubturbo-devel/usr/include/ubturbo/
+	install -m 0644 $(CURDIR)/src/smap/smap_interface.h \
+		$(CURDIR)/debian/ubturbo-devel/usr/include/ubturbo/
+
+	# ---- patchelf: set rpath for rmrs binaries/libs ----
+	find $(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/lib -name '*.so' \
+		-exec patchelf --set-rpath '$$ORIGIN/../lib' {} \;
+	patchelf --set-rpath '$$ORIGIN/../lib' \
+		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/bin/ub_turbo_exec
+
+override_dh_auto_test:
+	# No test suite configured for package build
+
+override_dh_strip:
+	# Match RPM spec: %global __strip /bin/true (no stripping)
+	# Do nothing — skip binary stripping entirely
