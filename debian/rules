@@ -24,6 +24,11 @@ override_dh_auto_build:
 		patch -p1 -l --forward < debian/patches/0002-smap-chore-increase-MAX_2M_PROCESSES_CNT-from-100-to-500.patch || \
 		echo "Patch already applied or not needed" ; \
 	fi
+	if [ -f $(CURDIR)/debian/patches/0003-smap-fix-compile.patch ]; then \
+		cd $(CURDIR) && patch -p1 -l --forward --dry-run < debian/patches/0003-smap-fix-compile.patch > /dev/null 2>&1 && \
+		patch -p1 -l --forward < debian/patches/0003-smap-fix-compile.patch || \
+		echo "Patch already applied or not needed" ; \
+	fi
 
 	# ============================================================
 	# 1. libboundscheck — Debian installs to multiarch path,
