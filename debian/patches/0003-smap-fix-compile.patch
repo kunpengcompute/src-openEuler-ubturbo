@@ -1,0 +1,36 @@
+From e94afa0b565e498b29b221120f3c31978a29f0d6 Mon Sep 17 00:00:00 2001
+From: lucas <1358497393@qq.com>
+Date: Wed, 3 Jun 2026 17:38:55 +0800
+Subject: [PATCH] fix: compile
+
+---
+ plugins/smap/src/drivers/Makefile | 2 +-
+ plugins/smap/src/tiering/Makefile | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/Makefile b/plugins/smap/src/drivers/Makefile
+index deaac22..fbbe947 100644
+--- a/plugins/smap/src/drivers/Makefile
++++ b/plugins/smap/src/drivers/Makefile
+@@ -1,4 +1,4 @@
+-KERNELDIR ?= /lib/modules/$(shell uname -r)/build
++KERNELDIR ?= /lib/modules/6.6.9520260603+/build
+ PWD       := $(shell pwd)
+ 
+ obj-m := smap_tracking_core.o
+diff --git a/plugins/smap/src/tiering/Makefile b/plugins/smap/src/tiering/Makefile
+index 1824106..ef8b112 100644
+--- a/plugins/smap/src/tiering/Makefile
++++ b/plugins/smap/src/tiering/Makefile
+@@ -7,7 +7,7 @@ endif
+ 
+ obj-m   := $(MODULE_NAME).o
+ 
+-KERNELDIR ?= /lib/modules/$(shell uname -r)/build
++KERNELDIR ?= /lib/modules/6.6.9520260603+/build
+ PWD       := $(shell pwd)
+ KBUILD_EXTRA_SYMBOLS = $(src)/depends/Module.symvers
+ 
+-- 
+2.54.0.windows.1
+
