@@ -91,7 +91,7 @@ This package contains the ubturbo framework developmemt kit
 
 %build
 #build ubdma
-cd %{_builddir}/ubturbo/plugins/ubdma/src && make -j`nproc` -C /lib/modules/6.6.0*/build M=%{_builddir}/ubturbo/plugins/ubdma/src modules
+cd %{_builddir}/ubturbo/plugins/ubdma/src && make -j`nproc` -C /lib/modules/6.6*/build M=%{_builddir}/ubturbo/plugins/ubdma/src modules
 
 #build smap
 cd %{_builddir}
@@ -103,10 +103,10 @@ pwd
 tar -zxvf v1.11.0.tar.gz
 
 cd %{_builddir}
-cd %{_builddir}/ubturbo/plugins/smap/src/drivers && make -j`nproc` -C /lib/modules/6.6.0*/build M=%{_builddir}/ubturbo/plugins/smap/src/drivers modules
+cd %{_builddir}/ubturbo/plugins/smap/src/drivers && make -j`nproc` -C /lib/modules/6.6*/build M=%{_builddir}/ubturbo/plugins/smap/src/drivers modules
 cp %{_builddir}/ubturbo/plugins/smap/src/drivers/Module.symvers %{_builddir}/ubturbo/plugins/smap/src/tiering/depends
-cd %{_builddir}/ubturbo/plugins/smap/src/tiering && make -j`nproc` -C /lib/modules/6.6.0*/build M=%{_builddir}/ubturbo/plugins/smap/src/tiering modules
-cd %{_builddir}/ubturbo/plugins/smap/src/ucache && make -j`nproc` -C /lib/modules/6.6.0*/build M=%{_builddir}/ubturbo/plugins/smap/src/ucache modules
+cd %{_builddir}/ubturbo/plugins/smap/src/tiering && make -j`nproc` -C /lib/modules/6.6*/build M=%{_builddir}/ubturbo/plugins/smap/src/tiering modules
+cd %{_builddir}/ubturbo/plugins/smap/src/ucache && make -j`nproc` -C /lib/modules/6.6*/build M=%{_builddir}/ubturbo/plugins/smap/src/ucache modules
 
 rm -rf %{_builddir}/ubturbo/plugins/smap/3rdparty/spdlog
 mv %{_builddir}/spdlog-1.11.0 %{_builddir}/spdlog
@@ -232,8 +232,8 @@ rm -rf ${RPM_BUILD_ROOT}
 %post smap
 cd %{smap_dir}
 depmod -a
-echo "external 6.6.0-* %{smap_dir}" > /etc/depmod.d/smap.conf
-echo "external 6.6.0-* %{ucache_dir}" > /etc/depmod.d/ucache.conf
+echo "external 6.6* %{smap_dir}" > /etc/depmod.d/smap.conf
+echo "external 6.6* %{ucache_dir}" > /etc/depmod.d/ucache.conf
 depmod -a
 
 %preun smap
