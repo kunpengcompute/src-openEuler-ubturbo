@@ -894,7 +894,7 @@ fi
 main "$@"
 
 %changelog
-* Sat June 27 2026 Huang Dewei <huangdewei@huawei.com> - 1.0.0-6
+* Sat Jun 27 2026 Huang Dewei <huangdewei@huawei.com> - 1.0.0-6
 - update: update ubturbo for anolis with 630 sp4
 * Thu May 21 2026 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-5
 - update: add ubturbo.rpm
