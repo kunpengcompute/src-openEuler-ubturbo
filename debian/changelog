@@ -1,6 +1,27 @@
+ubturbo (1.0.0-2) unstable; urgency=medium
+
+  * Add 68 new patches (0004-0071): bugfix, refactor, feat, smap, DT/UT
+  * Refactor debian/rules patch application: replace per-patch if/fi
+    blocks with a while-read loop over debian/patches/series
+  * Key changes in new patches:
+    - fix: rmrs pidInfos numa_map, memsize calculation, 4k bug, pid,
+      CPU tracking, page_flags bugfix, DMA/LD-ST switching, swap bugs
+    - refactor: rename CalcRemoteBorrowPages→MBToPage,
+      CalTmpBorrowPage→CalAvailPage, multiple function refactor+log
+    - feat: exclude MIG_MEMSIZE_MODE processes, calibration mechanism,
+      zero-local-freq trigger, queue_delayed_work_on CPU,
+      auto-remove migrated-back processes, SMAP migration period
+    - smap: restrict grouped strategy to swap, compensate swap imbalance,
+      tighten grouped swap trigger, protect sync migrate-out,
+      supplement DT tests for iomem/accessed_bit/migrate_pages
+    - ubdma: support local memory pages, page-pin bugfix, DT tests
+    - doc: update speccpu-gcc-best.cfg, performance testing guide
+
+ -- dszhu <2549951418@qq.com>  Sat, 04 Jul 2026 15:27:02 +0800
+
 ubturbo (1.0.0-1) unstable; urgency=medium
 
   * Initial Debian packaging based on RPM spec 1.0.0-5
   * Add pre-migration remote available numa detection
 
- -- Liu Jiangqi <liujiangqi1@huawei.com>  Mon, 1 Jun 2026 12:00:00 +0800
+ -- Liu Jiangqi <liujiangqi1@huawei.com>  Mon, 01 Jun 2026 12:00:00 +0800
