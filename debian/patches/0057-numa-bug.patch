@@ -1,0 +1,35 @@
+From 00847e2ff245226c1684cbf2d14e366496edb54d Mon Sep 17 00:00:00 2001
+From: fffsfsaf <1825116237@qq.com>
+Date: Wed, 24 Jun 2026 11:18:26 +0800
+Subject: [PATCH 57/71] =?UTF-8?q?=E4=BF=AE=E5=A4=8D=E5=A4=9A=E6=9C=AC?=
+ =?UTF-8?q?=E5=9C=B0numa=E6=9F=A5=E8=AF=A2=E9=85=8D=E7=BD=AE=E6=8E=A5?=
+ =?UTF-8?q?=E5=8F=A3=E7=9A=84bug?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ plugins/smap/src/user/smap_interface.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/plugins/smap/src/user/smap_interface.c b/plugins/smap/src/user/smap_interface.c
+index 5124e97..ffebb45 100644
+--- a/plugins/smap/src/user/smap_interface.c
++++ b/plugins/smap/src/user/smap_interface.c
+@@ -3180,7 +3180,12 @@ static int AssignOldProcessPayload(struct OldProcessPayload *result, ProcessAttr
+     result->l2Node[0] = l2Node;
+     result->scanTime = attr->scanTime;
+     result->migrateMode = attr->migrateMode;
+-    result->memSize = attr->strategyAttr.memSize[l1Node][l2Index];
++    for (int i = 0; i < REMOTE_NUMA_NUM; i++) {
++        if (attr->migrateParam[i].nid == l2Node) {
++            result->memSize = attr->migrateParam[i].memSize;
++            break;
++        }
++    }
+     // only the first elem of l1Node and l2Node is used, so assign invalid nid to other elems
+     for (int i = 1; i < len; i++) {
+         result->l1Node[i] = result->l2Node[i] = NUMA_NO_NODE;
+-- 
+2.53.0.windows.3
+

@@ -1,0 +1,46 @@
+From 82a823c0c08779beb2a510c32178ce9c45505158 Mon Sep 17 00:00:00 2001
+From: davidhwang <huangdewei@huawei.com>
+Date: Sun, 14 Jun 2026 00:11:14 +0800
+Subject: [PATCH 28/71] =?UTF-8?q?fix(rmrs):=20=E4=BF=AE=E6=AD=A3=E8=BF=81?=
+ =?UTF-8?q?=E7=A7=BB=E5=9B=9E=E6=BB=9A=E6=88=90=E5=8A=9F=E6=97=B6=E7=9A=84?=
+ =?UTF-8?q?=E8=BF=94=E5=9B=9E=E5=80=BC?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+在 DoMigrateRollback 函数中，当移除 pid 管理成功时，应返回 true 表示操作成功
+---
+ .../ubturbo_plugin/intranode_strategy/rmrs_rollback_module.cpp | 2 +-
+ test/testcase/rmrs/ubturbo_plugin/test_rmrs_smap_helper.cpp    | 3 +--
+ 2 files changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/plugins/rmrs/src/ubturbo_plugin/intranode_strategy/rmrs_rollback_module.cpp b/plugins/rmrs/src/ubturbo_plugin/intranode_strategy/rmrs_rollback_module.cpp
+index 2d903d0..35134d2 100644
+--- a/plugins/rmrs/src/ubturbo_plugin/intranode_strategy/rmrs_rollback_module.cpp
++++ b/plugins/rmrs/src/ubturbo_plugin/intranode_strategy/rmrs_rollback_module.cpp
+@@ -217,7 +217,7 @@ bool RmrsRollbackModule::DoMigrateRollback(std::unordered_map<pid_t, uint16_t> v
+                 LOG_ERROR << "[MemRollback] Rm pid mgr failed " << res << ".";
+                 return false;
+             }
+-            return false; // 应该返回成功？
++            return true;
+         }
+         LOG_ERROR << "[MemRollback] DoMigrateRollback failed " << res << ".";
+         return false;
+diff --git a/test/testcase/rmrs/ubturbo_plugin/test_rmrs_smap_helper.cpp b/test/testcase/rmrs/ubturbo_plugin/test_rmrs_smap_helper.cpp
+index 978675d..10ecefe 100644
+--- a/test/testcase/rmrs/ubturbo_plugin/test_rmrs_smap_helper.cpp
++++ b/test/testcase/rmrs/ubturbo_plugin/test_rmrs_smap_helper.cpp
+@@ -1153,8 +1153,7 @@ TEST_F(TestRmrsSmapHelper, SmapRemovePidsWithZeroRemoteUsage_AllZeroRemoteUsage)
+     std::vector<uint16_t> remoteNumaIdList = {1, 2};
+     std::vector<pid_t> pidsList = {123, 456};
+ 
+-    SmapQueryProcessConfigFunc smapQueryFunc = [](int nid, ProcessPayload *payloadArr, int inLen,
+-                                                   int *outLen) -> int {
++    SmapQueryProcessConfigFunc smapQueryFunc = [](int nid, ProcessPayload *payloadArr, int inLen, int *outLen) -> int {
+         if (nid == 1) {
+             payloadArr[0] = {};
+             payloadArr[0].pid = 123;
+-- 
+2.53.0.windows.3
+

@@ -1,0 +1,36 @@
+From 5293cbc1bea3a923001f79ce46e4238e6e67f1c1 Mon Sep 17 00:00:00 2001
+From: fffsfsaf <1825116237@qq.com>
+Date: Wed, 24 Jun 2026 14:53:17 +0800
+Subject: [PATCH 58/71] =?UTF-8?q?fix=EF=BC=9A=E7=BB=9F=E8=AE=A1=E6=89=AB?=
+ =?UTF-8?q?=E6=8F=8F=E7=B1=BB=E5=9E=8Bpid=E6=B7=BB=E5=8A=A0=E6=97=B6?=
+ =?UTF-8?q?=E6=A6=82=E7=8E=87=E5=A4=B1=E8=B4=A5?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ plugins/smap/src/drivers/accessed_bit.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index 1924fc6..b92ef2f 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -903,11 +903,11 @@ static int fill_vaddrs_info(struct kvm *kvm, struct hva_info *hva_vec, u64 len,
+ 		for (gpa = memslot->base_gfn << PAGE_SHIFT;
+ 		     gpa < (memslot->base_gfn + memslot->npages) << PAGE_SHIFT;
+ 		     gpa += g_pagesize_huge) {
++			if (!memslot_is_mem(memslot))
++				continue;
+ 			struct vm_area_struct *vma;
+ 			if (idx >= len) {
+-				pr_err("exceeds upper bound: %llu when looking up GPA in memslots\n",
+-				       len);
+-				return -EFAULT;
++				break;
+ 			}
+ 			hva = gfn_to_hva_memslot(memslot, gpa_to_gfn(gpa));
+ 			vma = get_vma_if_huge_page(kvm, hva);
+-- 
+2.53.0.windows.3
+

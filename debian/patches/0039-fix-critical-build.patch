@@ -1,0 +1,32 @@
+From 4c3223d7495da541944dd3229e4980fa6781a52a Mon Sep 17 00:00:00 2001
+From: jamesricado <825511311@qq.com>
+Date: Tue, 16 Jun 2026 14:55:06 +0800
+Subject: [PATCH 39/71] fix:critical build
+
+---
+ plugins/smap/src/tiering/critical.h | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/plugins/smap/src/tiering/critical.h b/plugins/smap/src/tiering/critical.h
+index 062e073..b236c86 100644
+--- a/plugins/smap/src/tiering/critical.h
++++ b/plugins/smap/src/tiering/critical.h
+@@ -7,9 +7,12 @@
+ #ifndef _CRITICAL_H
+ #define _CRITICAL_H
+ 
+-static inline int node_is_critical_err(int nid)
++static inline bool smap_node_is_critical_err(int nid)
+ {
+-	return 0;
++	return false;
+ }
++#undef node_is_critical_err
++
++#define node_is_critical_err(nid) smap_node_is_critical_err(nid)
+ 
+ #endif /* _CRITICAL_H */
+\ No newline at end of file
+-- 
+2.53.0.windows.3
+

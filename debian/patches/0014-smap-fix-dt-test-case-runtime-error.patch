@@ -1,0 +1,151 @@
+From 28b86d025d5e7b0f01d77749f26dfe20e2998e44 Mon Sep 17 00:00:00 2001
+From: woquzhao12138 <1825369014@qq.com>
+Date: Mon, 8 Jun 2026 19:36:39 +0800
+Subject: [PATCH 14/71] smap: fix dt test case runtime error
+
+---
+ plugins/smap/test/drivers/test_hist_tracking.cpp  | 12 ++++++------
+ plugins/smap/test/user/InterfaceTest.cpp          |  2 ++
+ plugins/smap/test/user/manage/ManageTest.cpp      | 10 ++++++----
+ plugins/smap/test/user/strategy/MigrationTest.cpp |  6 ++++--
+ 4 files changed, 18 insertions(+), 12 deletions(-)
+
+diff --git a/plugins/smap/test/drivers/test_hist_tracking.cpp b/plugins/smap/test/drivers/test_hist_tracking.cpp
+index 4ac64e4..57a6992 100644
+--- a/plugins/smap/test/drivers/test_hist_tracking.cpp
++++ b/plugins/smap/test/drivers/test_hist_tracking.cpp
+@@ -61,7 +61,7 @@ extern "C" struct smap_hist_dev g_smap_hist_dev;
+ extern "C" void hist_tracking_enable(struct device *ldev);
+ TEST_F(HistTrackingTest, hist_tracking_enable)
+ {
+-    struct access_tracking_dev hdev;
++    struct access_tracking_dev hdev = {};
+     hdev.access_bit_actc_data = nullptr;
+     hdev.is_hist = true;
+     hdev.enable_on = false;
+@@ -74,7 +74,7 @@ TEST_F(HistTrackingTest, hist_tracking_enable)
+ extern "C" void hist_tracking_disable(struct device *ldev);
+ TEST_F(HistTrackingTest, hist_tracking_disable)
+ {
+-    struct access_tracking_dev hdev;
++    struct access_tracking_dev hdev = {};
+ 
+     hdev.enable_on = true;
+     hdev.is_hist = true;
+@@ -187,12 +187,12 @@ extern "C" int hist_tracking_set_page_size(struct device *ldev, u8 pgsize);
+ TEST_F(HistTrackingTest, hist_tracking_set_page_size)
+ {
+     int ret;
+-    struct device dev;
+-    ret = hist_tracking_set_page_size(&dev, 1);
++    struct access_tracking_dev hdev = {};
++    ret = hist_tracking_set_page_size(&hdev.ldev, 1);
+     EXPECT_EQ(-EINVAL, ret);
+ 
+     MOCKER(drivers_actc_buffer_reinit).stubs().will(returnValue(0));
+-    ret = hist_tracking_set_page_size(&dev, 0);
++    ret = hist_tracking_set_page_size(&hdev.ldev, 0);
+     EXPECT_EQ(0, ret);
+ }
+ 
+@@ -200,7 +200,7 @@ extern "C" int drivers_actc_buffer_init(struct access_tracking_dev *hdev);
+ TEST_F(HistTrackingTest, actc_buffer_init)
+ {
+     int ret;
+-    struct access_tracking_dev dev;
++    struct access_tracking_dev dev = {};
+     MOCKER(drivers_calc_access_len).stubs().will(returnValue((u64)0));
+     ret = drivers_actc_buffer_init(&dev);
+     EXPECT_EQ(0, ret);
+diff --git a/plugins/smap/test/user/InterfaceTest.cpp b/plugins/smap/test/user/InterfaceTest.cpp
+index b6a7351..090b70e 100644
+--- a/plugins/smap/test/user/InterfaceTest.cpp
++++ b/plugins/smap/test/user/InterfaceTest.cpp
+@@ -30,12 +30,14 @@ protected:
+     void SetUp() override
+     {
+         cout << "[Phase SetUp Begin]" << endl;
++        g_processManager.processes = nullptr;
+         cout << "[Phase SetUp End]" << endl;
+     }
+     void TearDown() override
+     {
+         cout << "[Phase TearDown Begin]" << endl;
+         GlobalMockObject::verify();
++        g_processManager.processes = nullptr;
+         cout << "[Phase TearDown End]" << endl;
+     }
+ 
+diff --git a/plugins/smap/test/user/manage/ManageTest.cpp b/plugins/smap/test/user/manage/ManageTest.cpp
+index 2bddeeb..a051ef0 100644
+--- a/plugins/smap/test/user/manage/ManageTest.cpp
++++ b/plugins/smap/test/user/manage/ManageTest.cpp
+@@ -17,6 +17,10 @@
+ using namespace std;
+ 
+ static cpu_set_t g_fake_cpu_mask;
++extern "C" struct ProcessManager g_processManager;
++extern "C" uint32_t g_pageSizeHuge;
++extern "C" RunMode g_runMode;
++extern "C" void RemoteNumaInfoInit();
+ 
+ static int fake_sched_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t *mask)
+ {
+@@ -31,20 +35,18 @@ protected:
+     void SetUp() override
+     {
+         cout << "[Phase SetUp Begin]" << endl;
++        g_processManager.processes = nullptr;
+         cout << "[Phase SetUp End]" << endl;
+     }
+     void TearDown() override
+     {
+         cout << "[Phase TearDown Begin]" << endl;
+         GlobalMockObject::verify();
++        g_processManager.processes = nullptr;
+         cout << "[Phase TearDown End]" << endl;
+     }
+ };
+ 
+-extern "C" struct ProcessManager g_processManager;
+-extern "C" uint32_t g_pageSizeHuge;
+-extern "C" RunMode g_runMode;
+-extern "C" void RemoteNumaInfoInit();
+ TEST_F(ManageTest, TestRemoteNumaInfoInit)
+ {
+     g_processManager.remoteNumaInfo.usedInfo[0].size = 10;
+diff --git a/plugins/smap/test/user/strategy/MigrationTest.cpp b/plugins/smap/test/user/strategy/MigrationTest.cpp
+index 26f3c94..3c28903 100644
+--- a/plugins/smap/test/user/strategy/MigrationTest.cpp
++++ b/plugins/smap/test/user/strategy/MigrationTest.cpp
+@@ -18,23 +18,25 @@
+ 
+ using namespace std;
+ 
++extern "C" struct ProcessManager g_processManager;
++
+ class MigrationTest : public ::testing::Test {
+ protected:
+     void SetUp() override
+     {
+         cout << "[Phase SetUp Begin]" << endl;
++        g_processManager.processes = nullptr;
+         cout << "[Phase SetUp End]" << endl;
+     }
+     void TearDown() override
+     {
+         cout << "[Phase TearDown Begin]" << endl;
+         GlobalMockObject::verify();
++        g_processManager.processes = nullptr;
+         cout << "[Phase TearDown End]" << endl;
+     }
+ };
+ 
+-extern "C" struct ProcessManager g_processManager;
+-
+ TEST_F(MigrationTest, TestAddMigListAddMultiSuccess)
+ {
+     int i;
+-- 
+2.53.0.windows.3
+

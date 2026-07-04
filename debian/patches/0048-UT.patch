@@ -1,0 +1,815 @@
+From 2f7fadf6bb3c95e40ce4c55cac94382c419dfa62 Mon Sep 17 00:00:00 2001
+From: dszhu <2549951418@qq.com>
+Date: Thu, 18 Jun 2026 10:46:06 +0800
+Subject: [PATCH 48/71] =?UTF-8?q?=E8=A1=A5=E5=85=85UT=E4=BB=A3=E7=A0=81?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../smap/test/drivers/test_kvm_pgtable.cpp    | 353 ++++++++++++++-
+ plugins/smap/test/user/manage/test_manage.cpp | 401 ++++++++++++++++++
+ 2 files changed, 738 insertions(+), 16 deletions(-)
+
+diff --git a/plugins/smap/test/drivers/test_kvm_pgtable.cpp b/plugins/smap/test/drivers/test_kvm_pgtable.cpp
+index 5e532db..52b050f 100644
+--- a/plugins/smap/test/drivers/test_kvm_pgtable.cpp
++++ b/plugins/smap/test/drivers/test_kvm_pgtable.cpp
+@@ -25,8 +25,8 @@ struct stage2_attr_data {
+ };
+ 
+ struct kvm_pgtable_walk_data {
+-    struct kvm_pgtable *pgt;
+     struct kvm_pgtable_walker *walker;
++    u64 start;
+     u64 addr;
+     u64 end;
+ };
+@@ -133,11 +133,9 @@ TEST_F(KvmPgTableTest, KvmPgtableWalkTest)
+         .ia_bits = 0x200000,
+         .pgd = nullptr,
+     };
+-    struct kvm_pgtable_walk_data data = {
+-        .pgt = &pgt,
+-        .addr = 0x1,
+-        .end = 0x20,
+-    };
++    struct kvm_pgtable_walk_data data = {};
++    data.addr = 0x1;
++    data.end = 0x20;
+     int ret = _kvm_pgtable_walk(&pgt, &data);
+     EXPECT_EQ(-EINVAL, ret);
+ }
+@@ -148,11 +146,9 @@ TEST_F(KvmPgTableTest, KvmPgtableWalkTestTwo)
+         .ia_bits = 0x200000,
+     };
+     pgt.pgd = (u64 *)malloc(sizeof(u64));
+-    struct kvm_pgtable_walk_data data = {
+-        .pgt = &pgt,
+-        .addr = 0x1,
+-        .end = 0x20,
+-    };
++    struct kvm_pgtable_walk_data data = {};
++    data.addr = 0x1;
++    data.end = 0x20;
+     MOCKER(kvm_pgtable_idx).stubs().will(returnValue(0));
+     MOCKER(__kvm_pgtable_walk).stubs().will(returnValue(-EINVAL));
+     int ret = _kvm_pgtable_walk(&pgt, &data);
+@@ -248,11 +244,9 @@ TEST_F(KvmPgTableTest, KvmPgtableWalkOutOfRange)
+         .ia_bits = 1,
+         .pgd = (u64 *)malloc(sizeof(u64)),
+     };
+-    struct kvm_pgtable_walk_data data = {
+-        .pgt = &pgt,
+-        .addr = 8,
+-        .end = 9,
+-    };
++    struct kvm_pgtable_walk_data data = {};
++    data.addr = 8;
++    data.end = 9;
+ 
+     EXPECT_EQ(-ERANGE, _kvm_pgtable_walk(&pgt, &data));
+     free(pgt.pgd);
+@@ -276,3 +270,330 @@ TEST_F(KvmPgTableTest, Stage2ClearYoungPropagatesWalkError)
+     EXPECT_EQ(-1, level);
+     EXPECT_EQ(0, orig);
+ }
++
++struct smap_stage2_test_clear_young_data {
++    kvm_pte_t attr_set;
++    kvm_pte_t attr_clr;
++    bool mkold;
++    kvm_pte_t pte;
++    u32 level;
++    bool young;
++};
++
++extern "C" bool stage2_pte_executable(kvm_pte_t pte);
++TEST_F(KvmPgTableTest, Stage2PteExecutableWithoutXn)
++{
++    /* pte不含XN位 -> !(pte & KVM_PTE_LEAF_ATTR_HI_S2_XN) -> true */
++    kvm_pte_t pte = 0;
++    bool ret = stage2_pte_executable(pte);
++    EXPECT_EQ(true, ret);
++}
++
++TEST_F(KvmPgTableTest, Stage2PteExecutableWithXn)
++{
++    /* pte含XN位 -> false */
++    /* In DT env, KVM_PTE_LEAF_ATTR_HI_S2_XN = BIT(54) = 54 */
++    kvm_pte_t pte = 54;
++    bool ret = stage2_pte_executable(pte);
++    EXPECT_EQ(false, ret);
++}
++
++extern "C" int kvm_pgtable_visitor_cb(struct kvm_pgtable_walk_data *data,
++    const struct kvm_pgtable_visit_ctx *ctx, enum kvm_pgtable_walk_flags visit);
++TEST_F(KvmPgTableTest, VisitorCbCallsWalkerCb)
++{
++    /* Directly call kvm_pgtable_visitor_cb, do NOT mock it */
++    /* Construct walk_data with walker containing a real cb */
++    struct kvm_pgtable_visit_ctx ctx = {};
++    kvm_pte_t ptep_val = 0;
++    ctx.ptep = &ptep_val;
++    ctx.old = 0;
++    ctx.flags = KVM_PGTABLE_WALK_LEAF;
++
++    struct kvm_pgtable_walker walker = {
++        .cb = my_callback_function,
++        .arg = NULL,
++        .flags = KVM_PGTABLE_WALK_LEAF,
++    };
++
++    struct kvm_pgtable_walk_data data = {};
++    data.walker = &walker;
++
++    int ret = kvm_pgtable_visitor_cb(&data, &ctx, KVM_PGTABLE_WALK_LEAF);
++    EXPECT_EQ(0, ret);
++}
++
++static int stub_visitor_cb_return_neg1(const struct kvm_pgtable_visit_ctx *ctx,
++    enum kvm_pgtable_walk_flags visit)
++{
++    return -1;
++}
++
++TEST_F(KvmPgTableTest, VisitorCbReturnsWalkerError)
++{
++    /* Directly call kvm_pgtable_visitor_cb with cb that returns -1 */
++    struct kvm_pgtable_visit_ctx ctx = {};
++    kvm_pte_t ptep_val = 0;
++    ctx.ptep = &ptep_val;
++    ctx.old = 0;
++    ctx.flags = KVM_PGTABLE_WALK_LEAF;
++
++    struct kvm_pgtable_walker walker = {
++        .cb = stub_visitor_cb_return_neg1,
++        .arg = NULL,
++        .flags = KVM_PGTABLE_WALK_LEAF,
++    };
++
++    struct kvm_pgtable_walk_data data = {};
++    data.walker = &walker;
++
++    int ret = kvm_pgtable_visitor_cb(&data, &ctx, KVM_PGTABLE_WALK_LEAF);
++    EXPECT_EQ(-1, ret);
++}
++
++extern "C" int __kvm_pgtable_visit(struct kvm_pgtable_walk_data *data,
++    struct kvm_pgtable_mm_ops *mm_ops, kvm_pteref_t pteref, u32 level);
++TEST_F(KvmPgTableTest, VisitLeafCallbackWithContinue)
++{
++    /* __kvm_pgtable_visit: table=false, no leaf flags, walk_continue returns true */
++    /* In DT env kvm_pte_valid=false => kvm_pte_table returns false => table=false */
++    /* In DT env KVM_PGTABLE_WALK_LEAF=0 => ctx.flags & KVM_PGTABLE_WALK_LEAF = 0 */
++    /* So neither table nor leaf branches trigger, takes !table path advancing addr */
++    kvm_pte_t pte_val = 0;
++    kvm_pteref_t pteref = &pte_val;
++
++    struct kvm_pgtable_walker walker = {
++        .cb = my_callback_function,
++        .arg = NULL,
++        .flags = KVM_PGTABLE_WALK_LEAF, /* In DT: BIT(0)=0, equivalent to no flags */
++    };
++
++    struct kvm_pgtable_walk_data data = {};
++    data.walker = &walker;
++    data.start = 0x1000;
++    data.addr = 0x1000;
++    data.end = 0x2000;
++
++    struct kvm_pgtable_mm_ops mm_ops = {};
++
++    /* No mocks needed - natural DT behavior: table=false, no leaf flags */
++    int ret = __kvm_pgtable_visit(&data, &mm_ops, pteref, 0);
++    EXPECT_EQ(0, ret);
++}
++
++TEST_F(KvmPgTableTest, VisitTablePreCallback)
++{
++    /* Mock kvm_pte_table to return true to trigger TABLE_PRE branch */
++    /* Do NOT mock kvm_pgtable_visitor_cb - let it really execute */
++    kvm_pte_t pte_val = 0;
++    kvm_pteref_t pteref = &pte_val;
++
++    struct kvm_pgtable_walker walker = {
++        .cb = my_callback_function,
++        .arg = NULL,
++        .flags = KVM_PGTABLE_WALK_TABLE_PRE,
++    };
++
++    struct kvm_pgtable_walk_data data = {};
++    data.walker = &walker;
++    data.start = 0x1000;
++    data.addr = 0x1000;
++    data.end = 0x2000;
++
++    struct kvm_pgtable_mm_ops mm_ops = {};
++
++    /* Mock kvm_pte_table to return true, enabling TABLE_PRE branch */
++    MOCKER(kvm_pte_table).stubs().will(returnValue(true));
++    /* After visitor_cb returns 0 and reload, mock kvm_pte_table for second call */
++    /* In DT: after reload, kvm_pte_table is called again, mock it to return true */
++    /* Mock __kvm_pgtable_walk for child table traversal */
++    MOCKER(__kvm_pgtable_walk).stubs().will(returnValue(0));
++    /* Mock kvm_pte_follow for childp */
++    MOCKER(kvm_pte_follow).stubs().will(returnValue((kvm_pte_t *)malloc(sizeof(kvm_pte_t))));
++    int ret = __kvm_pgtable_visit(&data, &mm_ops, pteref, 0);
++    EXPECT_EQ(0, ret);
++}
++
++TEST_F(KvmPgTableTest, VisitWalkContinueInterrupts)
++{
++    /* Test walk_continue returning false after TABLE_PRE callback returns error */
++    /* walker cb returns -EINVAL -> visitor_cb returns -EINVAL */
++    /* kvm_pgtable_walk_continue(walker, -EINVAL) returns false -> goto out */
++    kvm_pte_t pte_val = 0;
++    kvm_pteref_t pteref = &pte_val;
++
++    struct kvm_pgtable_walker walker = {
++        .cb = stub_visitor_cb_return_neg1,
++        .arg = NULL,
++        .flags = KVM_PGTABLE_WALK_TABLE_PRE,
++    };
++
++    struct kvm_pgtable_walk_data data = {};
++    data.walker = &walker;
++    data.start = 0x1000;
++    data.addr = 0x1000;
++    data.end = 0x2000;
++
++    struct kvm_pgtable_mm_ops mm_ops = {};
++
++    /* Mock kvm_pte_table to return true to trigger TABLE_PRE */
++    MOCKER(kvm_pte_table).stubs().will(returnValue(true));
++    int ret = __kvm_pgtable_visit(&data, &mm_ops, pteref, 0);
++    /* visitor_cb returns -1, walk_continue(false) -> goto out -> return -1 */
++    EXPECT_EQ(-1, ret);
++}
++
++TEST_F(KvmPgTableTest, VisitTablePostCallback)
++{
++    /* Test TABLE_POST flag: table path with post-order callback */
++    /* Mock kvm_pte_table to return true, __kvm_pgtable_walk returns 0 */
++    /* walker cb returns 0 -> visitor_cb returns 0 for TABLE_POST */
++    kvm_pte_t pte_val = 0;
++    kvm_pteref_t pteref = &pte_val;
++
++    struct kvm_pgtable_walker walker = {
++        .cb = my_callback_function,
++        .arg = NULL,
++        .flags = KVM_PGTABLE_WALK_TABLE_POST,
++    };
++
++    struct kvm_pgtable_walk_data data = {};
++    data.walker = &walker;
++    data.start = 0x1000;
++    data.addr = 0x1000;
++    data.end = 0x2000;
++
++    struct kvm_pgtable_mm_ops mm_ops = {};
++
++    /* Mock kvm_pte_table to return true */
++    MOCKER(kvm_pte_table).stubs().will(returnValue(true));
++    /* Mock __kvm_pgtable_walk for child traversal returning 0 */
++    MOCKER(__kvm_pgtable_walk).stubs().will(returnValue(0));
++    /* Mock kvm_pte_follow */
++    MOCKER(kvm_pte_follow).stubs().will(returnValue((kvm_pte_t *)malloc(sizeof(kvm_pte_t))));
++    int ret = __kvm_pgtable_visit(&data, &mm_ops, pteref, 0);
++    EXPECT_EQ(0, ret);
++}
++
++extern "C" int smap_stage2_test_clear_young_walker(const struct kvm_pgtable_visit_ctx *ctx,
++    enum kvm_pgtable_walk_flags visit);
++TEST_F(KvmPgTableTest, WalkerInvalidPteReturnsZero)
++{
++    /* ctx->old=0 (invalid pte in DT: kvm_pte_valid=false) -> returns 0, data->young not set */
++    struct smap_stage2_test_clear_young_data young_data = {};
++    young_data.mkold = true;
++
++    struct kvm_pgtable_visit_ctx ctx = {};
++    kvm_pte_t ptep_val = 0;
++    ctx.ptep = &ptep_val;
++    ctx.old = 0;
++    ctx.arg = &young_data;
++
++    int ret = smap_stage2_test_clear_young_walker(&ctx, KVM_PGTABLE_WALK_LEAF);
++    EXPECT_EQ(0, ret);
++    EXPECT_EQ(false, young_data.young);
++}
++
++TEST_F(KvmPgTableTest, WalkerMkoldFalseReturnsZero)
++{
++    /* data->mkold=false -> early return for invalid pte */
++    /* In DT: kvm_pte_valid(0) = 0 & BIT(0) = 0 & 0 = false */
++    /* !kvm_pte_valid -> true -> early return 0, young not set */
++    struct smap_stage2_test_clear_young_data young_data = {};
++    young_data.mkold = false;
++
++    struct kvm_pgtable_visit_ctx ctx = {};
++    kvm_pte_t ptep_val = 0;
++    ctx.ptep = &ptep_val;
++    ctx.old = 0;
++    ctx.arg = &young_data;
++
++    int ret = smap_stage2_test_clear_young_walker(&ctx, KVM_PGTABLE_WALK_LEAF);
++    EXPECT_EQ(0, ret);
++    EXPECT_EQ(false, young_data.young);
++}
++
++TEST_F(KvmPgTableTest, WalkerMkoldFalseWithValidPtePath)
++{
++    /* In DT: kvm_pte_valid is inline and always returns false (BIT(0)=0) */
++    /* Cannot mock kvm_pte_valid. Test with pte that has AF bit */
++    /* kvm_pte_valid(10) = 10 & 0 = false -> !kvm_pte_valid -> early return */
++    struct smap_stage2_test_clear_young_data young_data = {};
++    young_data.mkold = false;
++
++    struct kvm_pgtable_visit_ctx ctx = {};
++    kvm_pte_t ptep_val = 10; /* Has AF bit (BIT(10)=10) */
++    ctx.ptep = &ptep_val;
++    ctx.old = 10;
++    ctx.arg = &young_data;
++
++    int ret = smap_stage2_test_clear_young_walker(&ctx, KVM_PGTABLE_WALK_LEAF);
++    EXPECT_EQ(0, ret);
++    /* young remains false because !kvm_pte_valid triggers early return */
++    EXPECT_EQ(false, young_data.young);
++}
++
++extern "C" int smap_stage2_test_clear_young(struct kvm_pgtable *pgt, u64 addr,
++    u64 size, kvm_pte_t attr_set, kvm_pte_t attr_clr, bool mkold,
++    kvm_pte_t *orig_pte, int *level, bool *young,
++    enum kvm_pgtable_walk_flags flags);
++TEST_F(KvmPgTableTest, Stage2ClearYoungSuccessPath)
++{
++    /* mock kvm_pgtable_walk返回0 -> 设置young/level/orig_pte输出参数 */
++    struct kvm_pgtable pgt = {};
++    bool young = false;
++    kvm_pte_t orig_pte = 0;
++    int level = -1;
++
++    MOCKER(kvm_pgtable_walk).stubs().will(returnValue(0));
++    int ret = smap_stage2_test_clear_young(&pgt, 0, 1, 0, 0, true,
++        &orig_pte, &level, &young, KVM_PGTABLE_WALK_LEAF);
++    EXPECT_EQ(0, ret);
++    /* After successful walk, output params are set from data */
++    EXPECT_EQ(false, young);
++}
++
++TEST_F(KvmPgTableTest, Stage2ClearYoungSuccessNullOutputs)
++{
++    /* Test with NULL young/level/orig_pte pointers */
++    struct kvm_pgtable pgt = {};
++
++    MOCKER(kvm_pgtable_walk).stubs().will(returnValue(0));
++    int ret = smap_stage2_test_clear_young(&pgt, 0, 1, 0, 0, true,
++        NULL, NULL, NULL, KVM_PGTABLE_WALK_LEAF);
++    EXPECT_EQ(0, ret);
++}
++
++extern "C" bool stage2_try_set_pte(const struct kvm_pgtable_visit_ctx *ctx, kvm_pte_t new_pte);
++TEST_F(KvmPgTableTest, Stage2TrySetPteSharedPath)
++{
++    /* Test shared path: ctx with KVM_PGTABLE_WALK_SHARED flag -> uses cmpxchg */
++    /* In DT: cmpxchg(a, b, c) = (b), so returns old value */
++    struct kvm_pgtable_visit_ctx ctx = {};
++    kvm_pte_t ptep_val = 42;
++    ctx.ptep = &ptep_val;
++    ctx.old = 42;
++    ctx.flags = KVM_PGTABLE_WALK_SHARED; /* BIT(3) = 3 in DT */
++    kvm_pte_t new_pte = 99;
++
++    /* kvm_pgtable_walk_shared(ctx) = ctx.flags & 3 = 3 (truthy) -> shared path */
++    /* cmpxchg(ctx->ptep, ctx->old, new) = ctx->old = 42 == ctx->old -> true */
++    bool ret = stage2_try_set_pte(&ctx, new_pte);
++    EXPECT_EQ(true, ret);
++}
++
++TEST_F(KvmPgTableTest, Stage2TrySetPteNonSharedPath)
++{
++    /* Test non-shared path: ctx without SHARED flag -> uses WRITE_ONCE */
++    /* In DT: WRITE_ONCE(*ctx->ptep, new) = 1, returns true */
++    struct kvm_pgtable_visit_ctx ctx = {};
++    kvm_pte_t ptep_val = 0;
++    ctx.ptep = &ptep_val;
++    ctx.old = 0;
++    ctx.flags = KVM_PGTABLE_WALK_LEAF; /* No SHARED flag */
++    kvm_pte_t new_pte = 42;
++
++    /* kvm_pgtable_walk_shared(ctx) = ctx.flags & 3 = 0 (false) -> non-shared */
++    bool ret = stage2_try_set_pte(&ctx, new_pte);
++    EXPECT_EQ(true, ret);
++}
+diff --git a/plugins/smap/test/user/manage/test_manage.cpp b/plugins/smap/test/user/manage/test_manage.cpp
+index 9b5ee25..1239e91 100644
+--- a/plugins/smap/test/user/manage/test_manage.cpp
++++ b/plugins/smap/test/user/manage/test_manage.cpp
+@@ -2417,3 +2417,404 @@ TEST_F(ManageTest, TestCalibrateMigratePagesThreeLocals)
+     EXPECT_EQ((uint32_t)60, attr.strategyAttr.remoteNrPagesAfterMigrate[1][0]);
+     EXPECT_EQ((uint32_t)120, attr.strategyAttr.remoteNrPagesAfterMigrate[2][0]);
+ }
++
++extern "C" void SetRunMode(RunMode runMode);
++TEST_F(ManageTest, TestSetRunMode)
++{
++    SetRunMode(WATERLINE_MODE);
++    EXPECT_EQ(WATERLINE_MODE, g_runMode);
++    SetRunMode(MEM_POOL_MODE);
++    EXPECT_EQ(MEM_POOL_MODE, g_runMode);
++}
++
++extern "C" PidType GetPidType(struct ProcessManager *manager);
++TEST_F(ManageTest, TestGetPidType)
++{
++    g_processManager.tracking.pageSize = PAGESIZE_4K;
++    g_pageSizeNormal = PAGESIZE_4K;
++    PidType ret = GetPidType(&g_processManager);
++    EXPECT_EQ(PROCESS_TYPE, ret);
++
++    g_processManager.tracking.pageSize = PAGESIZE_2M;
++    g_pageSizeHuge = PAGESIZE_2M;
++    ret = GetPidType(&g_processManager);
++    EXPECT_EQ(VM_TYPE, ret);
++}
++
++extern "C" uint32_t GetNormalPageSize(void);
++TEST_F(ManageTest, TestGetNormalPageSize)
++{
++    g_pageSizeNormal = PAGESIZE_4K;
++    uint32_t ret = GetNormalPageSize();
++    EXPECT_EQ(PAGESIZE_4K, ret);
++}
++
++extern "C" uint32_t GetHugePageSize(void);
++TEST_F(ManageTest, TestGetHugePageSize)
++{
++    g_pageSizeHuge = PAGESIZE_2M;
++    uint32_t ret = GetHugePageSize();
++    EXPECT_EQ(PAGESIZE_2M, ret);
++}
++
++extern "C" uint32_t GetPageSize(void);
++TEST_F(ManageTest, TestGetPageSize)
++{
++    g_processManager.tracking.pageSize = PAGESIZE_4K;
++    uint32_t ret = GetPageSize();
++    EXPECT_EQ(PAGESIZE_4K, ret);
++}
++
++extern "C" int GetNrLocalNuma(void);
++TEST_F(ManageTest, TestGetNrLocalNuma)
++{
++    g_processManager.nrLocalNuma = 4;
++    int ret = GetNrLocalNuma();
++    EXPECT_EQ(4, ret);
++}
++
++extern "C" bool IsHugeMode(void);
++TEST_F(ManageTest, TestIsHugeModeTrue)
++{
++    g_processManager.tracking.pageSize = PAGESIZE_2M;
++    g_pageSizeHuge = PAGESIZE_2M;
++    bool ret = IsHugeMode();
++    EXPECT_EQ(true, ret);
++}
++
++TEST_F(ManageTest, TestIsHugeModeFalse)
++{
++    g_processManager.tracking.pageSize = PAGESIZE_4K;
++    g_pageSizeHuge = PAGESIZE_2M;
++    bool ret = IsHugeMode();
++    EXPECT_EQ(false, ret);
++}
++
++extern "C" void LinkedListAdd(ProcessAttr **head, ProcessAttr **add);
++TEST_F(ManageTest, TestLinkedListAdd)
++{
++    ProcessAttr *head = nullptr;
++    ProcessAttr *node1 = (ProcessAttr *)malloc(sizeof(ProcessAttr));
++    node1->pid = 1;
++    node1->next = nullptr;
++    LinkedListAdd(&head, &node1);
++    EXPECT_EQ(head, node1);
++
++    ProcessAttr *node2 = (ProcessAttr *)malloc(sizeof(ProcessAttr));
++    node2->pid = 2;
++    node2->next = nullptr;
++    LinkedListAdd(&head, &node2);
++    EXPECT_EQ(head, node2);
++    EXPECT_EQ(node2->next, node1);
++
++    free(node1);
++    free(node2);
++}
++
++extern "C" bool IsMemoryLow(pid_t pid);
++TEST_F(ManageTest, TestIsMemoryLowFalse)
++{
++    EnvMutexInit(&g_processManager.lock);
++    g_processManager.processes = nullptr;
++    bool ret = IsMemoryLow(9999);
++    EXPECT_EQ(false, ret);
++}
++
++TEST_F(ManageTest, TestIsMemoryLowTrue)
++{
++    ProcessAttr attr = {};
++    attr.pid = 1234;
++    attr.isLowMem = true;
++    attr.next = nullptr;
++    EnvMutexInit(&g_processManager.lock);
++    g_processManager.processes = &attr;
++    MOCKER(GetProcessAttrLocked).stubs().will(returnValue(&attr));
++    bool ret = IsMemoryLow(1234);
++    EXPECT_EQ(true, ret);
++    g_processManager.processes = nullptr;
++}
++
++extern "C" int AddProcess(ProcessParam *param, PidType type, uint32_t *nodeBitmap);
++TEST_F(ManageTest, TestAddProcessNormal)
++{
++    ProcessParam param = {};
++    param.pid = 123;
++    param.scanTime = 50;
++    param.duration = 1;
++    param.count = 1;
++    param.numaParam[0].nid = 4;
++    param.numaParam[0].ratio = 50;
++    g_processManager.processes = nullptr;
++    g_processManager.nr[VM_TYPE] = 0;
++    g_processManager.nrLocalNuma = 4;
++    EnvMutexInit(&g_processManager.lock);
++    MOCKER(CheckPid).stubs().will(returnValue(0));
++    MOCKER(VMPreprocess).stubs().will(returnValue(0));
++    MOCKER(GetPidNrPages).stubs().will(returnValue(0x100));
++    MOCKER(EnvMutexLock).stubs().will(ignoreReturnValue());
++    MOCKER(SyncAllProcessConfig).stubs().will(returnValue(0));
++    MOCKER(EnvMutexUnlock).stubs().will(ignoreReturnValue());
++    MOCKER(sched_getaffinity).stubs().will(returnValue(0));
++    MOCKER(GetNodeFromCpu).stubs().will(returnValue(4));
++    int ret = AddProcess(&param, VM_TYPE, nullptr);
++    EXPECT_EQ(0, ret);
++    EXPECT_NE(nullptr, g_processManager.processes);
++    free(g_processManager.processes);
++    g_processManager.processes = nullptr;
++}
++
++extern "C" int SetLocalNumaByCpu(pid_t pid, uint32_t *nodeBitmap);
++TEST_F(ManageTest, TestSetLocalNumaByCpu)
++{
++    g_processManager.nrLocalNuma = 4;
++    EnvMutexInit(&g_processManager.lock);
++    CPU_ZERO(&g_fake_cpu_mask);
++    CPU_SET(1, &g_fake_cpu_mask);
++    uint32_t nodeBitmap = 0;
++    MOCKER(sched_getaffinity).stubs().will(invoke(fake_sched_getaffinity));
++    MOCKER(GetNodeFromCpu).stubs().will(returnValue(0));
++    int ret = SetLocalNumaByCpu(1, &nodeBitmap);
++    EXPECT_EQ(0, ret);
++}
++
++extern "C" bool IsRemoteNidValid(int nid);
++TEST_F(ManageTest, TestIsRemoteNidValid)
++{
++    g_processManager.nrLocalNuma = 4;
++    bool ret = IsRemoteNidValid(4);
++    EXPECT_EQ(true, ret);
++    ret = IsRemoteNidValid(0);
++    EXPECT_EQ(false, ret);
++}
++
++extern "C" int InitGroupedUsedPages(pid_t pid, GroupMigrationPolicy *policy, const uint64_t numaPages[MAX_NODES]);
++TEST_F(ManageTest, TestInitGroupedUsedPages)
++{
++    pid_t pid = 1234;
++    GroupMigrationPolicy policy = {};
++    uint64_t numaPages[MAX_NODES] = { 0 };
++    policy.enabled = true;
++    policy.groupCount = 1;
++    policy.groups[0].targetCount = 1;
++    policy.groups[0].targets[0].nid = 4;
++    policy.groups[0].targets[0].quotaPages = 10;  // quotaPages must be set
++    numaPages[4] = 5;  // residentPages <= quotaPages
++    g_processManager.nrLocalNuma = 4;
++    int ret = InitGroupedUsedPages(pid, &policy, numaPages);
++    EXPECT_EQ(0, ret);
++    EXPECT_EQ((uint64_t)5, policy.groups[0].targets[0].usedPages);
++}
++
++// === Additional manage.c tests for uncovered getter/setter and auto_remove ===
++
++extern "C" RunMode GetRunMode(void);
++TEST_F(ManageTest, TestGetRunMode)
++{
++    g_runMode = WATERLINE_MODE;
++    RunMode ret = GetRunMode();
++    EXPECT_EQ(WATERLINE_MODE, ret);
++}
++
++extern "C" bool IsHugeMode(void);
++TEST_F(ManageTest, TestGetCurrentMaxNrPid4K)
++{
++    g_processManager.tracking.pageSize = PAGESIZE_4K;
++    int ret = GetCurrentMaxNrPid();
++    EXPECT_EQ(MAX_4K_PROCESSES_CNT, ret);
++}
++
++TEST_F(ManageTest, TestGetCurrentMaxNrPid2M)
++{
++    g_pageSizeHuge = PAGESIZE_2M;
++    g_processManager.tracking.pageSize = PAGESIZE_2M;
++    int ret = GetCurrentMaxNrPid();
++    EXPECT_EQ(MAX_2M_PROCESSES_CNT, ret);
++    g_processManager.tracking.pageSize = PAGESIZE_4K;
++}
++
++extern "C" ProcessAttr *GetProcessAttr(pid_t pid);
++TEST_F(ManageTest, TestGetProcessAttrFound)
++{
++    ProcessAttr p1 = { .pid = 1, .next = nullptr };
++    ProcessAttr p2 = { .pid = 2, .next = nullptr };
++    p1.next = &p2;
++    g_processManager.processes = &p1;
++    ProcessAttr *ret = GetProcessAttr(1);
++    EXPECT_EQ(1, ret->pid);
++
++    ret = GetProcessAttr(2);
++    EXPECT_EQ(2, ret->pid);
++    g_processManager.processes = nullptr;
++}
++
++TEST_F(ManageTest, TestGetProcessAttrNotFound)
++{
++    ProcessAttr p1 = { .pid = 1, .next = nullptr };
++    g_processManager.processes = &p1;
++    ProcessAttr *ret = GetProcessAttr(3);
++    EXPECT_EQ(nullptr, ret);
++    g_processManager.processes = nullptr;
++}
++
++TEST_F(ManageTest, TestGetProcessAttrNullList)
++{
++    g_processManager.processes = nullptr;
++    ProcessAttr *ret = GetProcessAttr(1);
++    EXPECT_EQ(nullptr, ret);
++}
++
++TEST_F(ManageTest, TestIsMemoryLowPathFailed2)
++{
++    MOCKER((int (*)(char *, unsigned long, unsigned long, char const *, void *))snprintf_s)
++        .stubs()
++        .will(returnValue(-1));
++    bool ret = IsMemoryLow(123);
++    EXPECT_EQ(false, ret);
++}
++
++TEST_F(ManageTest, TestIsMemoryLowFileOpenFailed2)
++{
++    MOCKER((int (*)(char *, unsigned long, unsigned long, char const *, void *))snprintf_s)
++        .stubs()
++        .will(returnValue(0));
++    MOCKER(fopen).stubs().will(returnValue(static_cast<FILE *>(nullptr)));
++    bool ret = IsMemoryLow(123);
++    EXPECT_EQ(false, ret);
++}
++
++TEST_F(ManageTest, TestIsMemoryLowNormal2)
++{
++    static FILE fake_file;
++    char buf[] = "100";
++    MOCKER((int (*)(char *, unsigned long, unsigned long, char const *, void *))snprintf_s)
++        .stubs()
++        .will(returnValue(0));
++    MOCKER(fopen).stubs().will(returnValue(&fake_file));
++    MOCKER(fgets).stubs().will(returnValue(&buf[0])).then(returnValue(static_cast<char *>(nullptr)));
++    MOCKER(fclose).stubs().will(returnValue(0));
++    MOCKER((int (*)(char const *, char const *, void *))sscanf_s).stubs().will(returnValue(1));
++    bool ret = IsMemoryLow(123);
++    EXPECT_EQ(false, ret);
++}
++
++extern "C" int SetLocalNumaByCpu(pid_t pid, uint32_t *nodeBitmap);
++TEST_F(ManageTest, TestSetLocalNumaByCpuAffinityFailed)
++{
++    MOCKER(sched_getaffinity).stubs().will(returnValue(-1));
++    uint32_t nodeBitmap = 0;
++    int ret = SetLocalNumaByCpu(1, &nodeBitmap);
++    EXPECT_EQ(-EINVAL, ret);
++}
++
++extern "C" void LinkedListAdd(ProcessAttr **head, ProcessAttr **add);
++extern "C" void FreeProceccesAttr(ProcessAttr *attr);
++TEST_F(ManageTest, TestFreeProceccesAttrNull)
++{
++    FreeProceccesAttr(nullptr);
++    // Should not crash
++}
++
++extern "C" void SetAdaptMem(bool enable);
++extern "C" bool g_adaptLocalMem;
++TEST_F(ManageTest, TestSetAdaptMemEnable)
++{
++    SetAdaptMem(true);
++    EXPECT_EQ(true, g_adaptLocalMem);
++}
++
++TEST_F(ManageTest, TestSetAdaptMemDisable)
++{
++    SetAdaptMem(false);
++    EXPECT_EQ(false, g_adaptLocalMem);
++}
++
++extern "C" int CheckPid(pid_t pid);
++TEST_F(ManageTest, TestCheckPidValid)
++{
++    MOCKER(GetPidType).stubs().will(returnValue(VM_TYPE));
++    MOCKER(PidIsValid).stubs().will(returnValue(true));
++    MOCKER(IsQemuTask).stubs().will(returnValue((int)VM_TYPE));
++    int ret = CheckPid(1);
++    EXPECT_EQ(0, ret);
++}
++
++extern "C" bool IsMultiNumaVm(ProcessAttr *process);
++TEST_F(ManageTest, TestIsMultiNumaVmSingleRemote)
++{
++    ProcessAttr attr = {};
++    attr.type = VM_TYPE;
++    attr.remoteNumaCnt = 1;
++    attr.numaAttr.numaNodes = 0b00000001;
++    g_processManager.nrLocalNuma = 4;
++    bool ret = IsMultiNumaVm(&attr);
++    EXPECT_EQ(false, ret);
++}
++
++TEST_F(ManageTest, TestIsMultiNumaVmMultiRemote)
++{
++    ProcessAttr attr = {};
++    attr.type = VM_TYPE;
++    attr.remoteNumaCnt = 2;
++    bool ret = IsMultiNumaVm(&attr);
++    EXPECT_EQ(true, ret);
++}
++
++TEST_F(ManageTest, TestIsMultiNumaVmProcessType)
++{
++    ProcessAttr attr = {};
++    attr.type = PROCESS_TYPE;
++    attr.remoteNumaCnt = 2;
++    bool ret = IsMultiNumaVm(&attr);
++    EXPECT_EQ(false, ret);
++}
++
++extern "C" int DestroyProcessManager();
++TEST_F(ManageTest, TestDestroyProcessManagerWithProcesses)
++{
++    ProcessAttr attr = {};
++    attr.pid = 1;
++    attr.next = nullptr;
++    g_processManager.processes = &attr;
++    EnvMutexInit(&g_processManager.lock);
++    EnvMutexInit(&g_processManager.threadLock);
++    MOCKER(AccessIoctlRemoveAllPid).stubs().will(returnValue(0));
++    MOCKER(FreeProceccesAttr).stubs().will(ignoreReturnValue());
++    int ret = DestroyProcessManager();
++    EXPECT_EQ(0, ret);
++}
++
++extern "C" int GetNrLocalNuma(void);
++extern "C" uint32_t GetNormalPageSize(void);
++extern "C" uint32_t GetHugePageSize(void);
++extern "C" uint32_t GetPageSize(void);
++extern "C" int AddProcess(ProcessParam *param, PidType type, uint32_t *nodeBitmap);
++TEST_F(ManageTest, TestAddProcessLimitReached)
++{
++    uint32_t savedNr = g_processManager.nr[VM_TYPE];
++    g_processManager.nr[VM_TYPE] = MAX_2M_PROCESSES_CNT;
++    g_pageSizeHuge = PAGESIZE_2M;
++    g_processManager.tracking.pageSize = PAGESIZE_2M;
++    ProcessParam param = {};
++    param.pid = 123;
++    param.count = 1;
++    int ret = AddProcess(&param, VM_TYPE, nullptr);
++    EXPECT_EQ(-EINVAL, ret);
++    g_processManager.nr[VM_TYPE] = savedNr;
++    g_processManager.tracking.pageSize = PAGESIZE_4K;
++}
++
++/* ====== Coverage-boosting tests for manage.c ====== */
++
++extern "C" bool IsZeroRemoteTargetConfig(ProcessParam *param);
++TEST_F(ManageTest, TestIsZeroRemoteTargetConfigNull)
++{
++    bool ret = IsZeroRemoteTargetConfig(nullptr);
++    EXPECT_EQ(false, ret);
++}
++
++TEST_F(ManageTest, TestIsZeroRemoteTargetConfigZeroCount)
++{
++    ProcessParam param = {.count = 0};
++    bool ret = IsZeroRemoteTargetConfig(&param);
++    EXPECT_EQ(false, ret);
++}
+-- 
+2.53.0.windows.3
+

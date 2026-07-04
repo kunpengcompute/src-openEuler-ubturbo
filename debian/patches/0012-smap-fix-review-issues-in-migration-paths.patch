@@ -1,0 +1,418 @@
+From fa82aa284feab6e4cc4aa37af3e5fe9d4ae9060c Mon Sep 17 00:00:00 2001
+From: woquzhao12138 <1825369014@qq.com>
+Date: Mon, 8 Jun 2026 11:02:54 +0800
+Subject: [PATCH 12/71] smap: fix review issues in migration paths
+
+---
+ plugins/smap/src/drivers/accessed_bit.c       |  4 ++++
+ plugins/smap/src/drivers/hist_tracking.c      |  3 ++-
+ plugins/smap/src/tiering/ham_migration.c      | 20 +++++++++++-----
+ plugins/smap/src/tiering/smap_migrate_pages.c | 11 +++++++--
+ .../smap/src/user/advanced-strategy/scene.c   | 24 +++++++++----------
+ plugins/smap/src/user/manage/thread.c         |  8 ++++++-
+ plugins/smap/src/user/smap_interface.c        | 23 ++++++++++++------
+ plugins/smap/test/user/InterfaceTest.cpp      | 15 ++++++------
+ plugins/smap/test/user/manage/ThreadTest.cpp  | 20 ++++++++++++++--
+ 9 files changed, 90 insertions(+), 38 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index b6e857c..1924fc6 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -1252,6 +1252,10 @@ static int scan_forward_2M(struct access_pid *ap, int page_size)
+ 		return 0;
+ 	}
+ 	pid_s = find_get_pid(ap->pid);
++	if (!pid_s) {
++		pr_err("failed to find pid: %d\n", ap->pid);
++		return -EINVAL;
++	}
+ 	task = get_pid_task(pid_s, PIDTYPE_PID);
+ 	if (!task) {
+ 		put_pid(pid_s);
+diff --git a/plugins/smap/src/drivers/hist_tracking.c b/plugins/smap/src/drivers/hist_tracking.c
+index 091df59..fd0bed4 100644
+--- a/plugins/smap/src/drivers/hist_tracking.c
++++ b/plugins/smap/src/drivers/hist_tracking.c
+@@ -298,7 +298,7 @@ int hist_module_init(void)
+ 	ret = hist_init(SIZE_2M);
+ 	if (ret) {
+ 		pr_err("init SMAP histogram device failed, ret: %d\n", ret);
+-		return ret;
++		goto err_acpi_mem;
+ 	}
+ 
+ 	ret = hist_tracking_init();
+@@ -311,6 +311,7 @@ int hist_module_init(void)
+ 
+ err_tracking_add:
+ 	hist_deinit();
++err_acpi_mem:
+ 	reset_acpi_mem();
+ 	return ret;
+ }
+diff --git a/plugins/smap/src/tiering/ham_migration.c b/plugins/smap/src/tiering/ham_migration.c
+index 39d66c1..2f23b37 100644
+--- a/plugins/smap/src/tiering/ham_migration.c
++++ b/plugins/smap/src/tiering/ham_migration.c
+@@ -960,7 +960,7 @@ static long ioctl_migration_pages(unsigned long arg)
+ 						  HAM_TASK_ALLOW_MIGR);
+ 	if (ret) {
+ 		pr_err("pre task status is not satisfied, migration is not allowed\n");
+-		return ret;
++		goto out_put;
+ 	}
+ 
+ 	ret = fill_task_pages(mig_task);
+@@ -991,6 +991,9 @@ static long ioctl_migration_pages(unsigned long arg)
+ out:
+ 	put_migrate_task(mig_task, HAM_TASK_MIGRATED);
+ 	return ret;
++out_put:
++	put_migrate_task(mig_task, mig_task->status);
++	return ret;
+ }
+ 
+ static long ioctl_rollback_pages(unsigned long arg)
+@@ -1072,7 +1075,7 @@ static long ioctl_stop_migration(unsigned long arg)
+ 	ret = check_task_status(mig_task, HAM_TASK_INITED | HAM_TASK_MIGRATED);
+ 	if (ret) {
+ 		pr_err("pre task status is not satisfied, stop migration is not allowed\n");
+-		return ret;
++		goto out;
+ 	}
+ 
+ 	if (!(mig_task->status & HAM_TASK_ALLOW_MIGR)) {
+@@ -1087,6 +1090,9 @@ static long ioctl_stop_migration(unsigned long arg)
+ 	pr_info("stop migration successfully\n");
+ 	put_migrate_task(mig_task, HAM_TASK_STOPPED);
+ 	return 0;
++out:
++	put_migrate_task(mig_task, mig_task->status);
++	return ret;
+ }
+ 
+ static long ioctl_modify_pagetable(unsigned long arg)
+@@ -1111,7 +1117,7 @@ static long ioctl_modify_pagetable(unsigned long arg)
+ 	ret = check_task_status(mig_task, HAM_TASK_INITED);
+ 	if (ret) {
+ 		pr_err("pre task status is not satisfied, page table modification is not allowed\n");
+-		return ret;
++		goto out;
+ 	}
+ 
+ 	pr_info("start to modify page, pid: %d, cacheable: %d\n", mt_info.pid,
+@@ -1124,6 +1130,7 @@ static long ioctl_modify_pagetable(unsigned long arg)
+ 			mt_info.pid);
+ 	}
+ 
++out:
+ 	put_migrate_task(mig_task, mig_task->status);
+ 	return ret;
+ }
+@@ -1151,21 +1158,22 @@ static long ioctl_cache_clear(unsigned long arg)
+ 	ret = check_task_status(mig_task, HAM_TASK_MIGRATED);
+ 	if (ret) {
+ 		pr_err("pre task status is not satisfied, cache clear is not allowed\n");
+-		return ret;
++		goto out;
+ 	}
+ 
+ 	t1 = ktime_get();
+ 	ret = ham_cache_clear(pid, mig_task);
+ 	if (ret) {
+ 		pr_err("failed to clear cache, pid: %d\n", pid);
+-		return ret;
++		goto out;
+ 	}
+ 	t2 = ktime_get();
+ 	elapsed_cache = ktime_to_us(ktime_sub(t2, t1));
+ 	pr_info("[CACHE_MNT] elapsed time: %lld us\n", elapsed_cache);
+ 
++out:
+ 	put_migrate_task(mig_task, mig_task->status);
+-	return 0;
++	return ret;
+ }
+ 
+ static int ham_open(struct inode *inode, struct file *file)
+diff --git a/plugins/smap/src/tiering/smap_migrate_pages.c b/plugins/smap/src/tiering/smap_migrate_pages.c
+index d0a3d38..28ceb79 100644
+--- a/plugins/smap/src/tiering/smap_migrate_pages.c
++++ b/plugins/smap/src/tiering/smap_migrate_pages.c
+@@ -197,12 +197,19 @@ static int init_mig(unsigned int nr_threads, unsigned int nr_folios,
+ {
+ 	unsigned int i;
+ 	unsigned int avg_cnt;
++	size_t alloc_size;
+ 
+-	avg_cnt = nr_folios / nr_threads + 1;
++	avg_cnt = DIV_ROUND_UP(nr_folios, nr_threads);
++	if (avg_cnt > SIZE_MAX / sizeof(struct folio *)) {
++		pr_err("migrate folio array size overflow, avg_cnt: %u\n",
++		       avg_cnt);
++		return -EINVAL;
++	}
++	alloc_size = (size_t)avg_cnt * sizeof(struct folio *);
+ 	for (i = 0; i < nr_threads; i++) {
+ 		mig[i].nr_folios = 0;
+ 		mig[i].failed_num = 0;
+-		mig[i].folios = vzalloc(avg_cnt * sizeof(struct folio *));
++		mig[i].folios = vzalloc(alloc_size);
+ 		if (!mig[i].folios) {
+ 			clear_mig_folios(i);
+ 			return -ENOMEM;
+diff --git a/plugins/smap/src/user/advanced-strategy/scene.c b/plugins/smap/src/user/advanced-strategy/scene.c
+index 9f27348..33b7f65 100644
+--- a/plugins/smap/src/user/advanced-strategy/scene.c
++++ b/plugins/smap/src/user/advanced-strategy/scene.c
+@@ -423,13 +423,12 @@ static bool IsReadyForAdapt(ProcessAttr *attr)
+ static void AdjustVmMemRatio(struct ProcessManager *manager, int *surpluses, int len)
+ {
+     int i = 0;
+-    int nrVms = manager->nr[VM_TYPE];
+-    BalanceSurpluses(surpluses, nrVms);
+-    ProcessAttr *current = manager->processes;
+-    if (len == 0) {
++    if (len <= 0) {
+         return;
+     }
+-    while (current) {
++    BalanceSurpluses(surpluses, len);
++    ProcessAttr *current = manager->processes;
++    while (current && i < len) {
+         if (IsReadyForAdapt(current)) {
+             SceneInfo *info = &current->sceneInfo;
+             PageInfo *p = &info->pageInfo[info->pageInfoIndex];
+@@ -443,12 +442,9 @@ static void AdjustVmMemRatio(struct ProcessManager *manager, int *surpluses, int
+                 info->currScene = MAX(LIGHT_STABLE_SCENE, (int)info->currScene - 1);
+             }
+             UpdateMemRatio(current);
++            i++;
+         }
+-        i++;
+         current = current->next;
+-        if (i >= len) {
+-            break;
+-        }
+     }
+ }
+ 
+@@ -461,12 +457,16 @@ void ConfigMultiVmRatio(struct ProcessManager *manager)
+     }
+     int i = 0, surpluses[nrVms];
+     ProcessAttr *current = manager->processes;
+-    while (current) {
++    while (current && i < nrVms) {
++        if (!IsReadyForAdapt(current)) {
++            current = current->next;
++            continue;
++        }
+         SceneInfo *info = &current->sceneInfo;
+         PageInfo *p = &info->pageInfo[info->pageInfoIndex];
+         int l1Node = GetAttrL1(current);
+         int l2Node = GetAttrL2(current) - manager->nrLocalNuma;
+-        if (l1Node >= 0 && l2Node >= 0 && IsReadyForAdapt(current)) {
++        if (l1Node >= 0 && l2Node >= 0) {
+             int localPages = p->nrPages * (HUNDRED - current->strategyAttr.l2RemoteMemRatio[l1Node][l2Node]) / HUNDRED;
+             surpluses[i] = localPages - p->nrL1Guarantee;
+         } else {
+@@ -475,7 +475,7 @@ void ConfigMultiVmRatio(struct ProcessManager *manager)
+         i++;
+         current = current->next;
+     }
+-    AdjustVmMemRatio(manager, surpluses, nrVms);
++    AdjustVmMemRatio(manager, surpluses, i);
+ }
+ 
+ static void GetMaxNuma(struct ProcessManager *manager, int *maxL1node, int *maxL2node)
+diff --git a/plugins/smap/src/user/manage/thread.c b/plugins/smap/src/user/manage/thread.c
+index dee85bc..b2d1bae 100644
+--- a/plugins/smap/src/user/manage/thread.c
++++ b/plugins/smap/src/user/manage/thread.c
+@@ -30,6 +30,7 @@ static void *ThreadMain(void *args)
+ 
+ int InitThread(struct ProcessManager *manager, uint32_t period, WorkFunc workFunc)
+ {
++    int ret;
+     ThreadCtx *ctx = malloc(sizeof(ThreadCtx));
+     if (!ctx) {
+         SMAP_LOGGER_ERROR("Alloc mem for thread failed.");
+@@ -39,8 +40,13 @@ int InitThread(struct ProcessManager *manager, uint32_t period, WorkFunc workFun
+     EnvAtomicSet(&ctx->stop, 0);
+     ctx->processManager = manager;
+     ctx->workFunc = workFunc;
++    ret = pthread_create(&ctx->thread, NULL, ThreadMain, ctx);
++    if (ret) {
++        SMAP_LOGGER_ERROR("Create thread failed: %d.", ret);
++        free(ctx);
++        return -ret;
++    }
+     manager->threadCtx[manager->nrThread] = ctx;
+-    pthread_create(&ctx->thread, NULL, ThreadMain, ctx);
+     manager->nrThread++;
+     return 0;
+ }
+diff --git a/plugins/smap/src/user/smap_interface.c b/plugins/smap/src/user/smap_interface.c
+index e6782c4..ea2e791 100644
+--- a/plugins/smap/src/user/smap_interface.c
++++ b/plugins/smap/src/user/smap_interface.c
+@@ -2731,20 +2731,24 @@ static bool IsRemoteNidRatioValid(pid_t pid, int nid, int ratio)
+     return true;
+ }
+ 
+-static uint64_t GetAttrNidInitMemSize(pid_t pid, int nid)
++static int GetAttrNidInitMemSize(pid_t pid, int nid, uint64_t *memSize)
+ {
+     int nrLocalNuma = GetNrLocalNuma();
+-    uint64_t memsize = 0;
++    uint64_t curMemSize = 0;
+     ProcessAttr *attr = GetProcessAttr(pid);
++    if (!memSize) {
++        return -EINVAL;
++    }
+     if (!attr) {
+         return -EINVAL;
+     }
+     for (int i = 0; i < nrLocalNuma; i++) {
+         if (InAttrL1(attr, i)) {
+-            memsize += attr->strategyAttr.memSize[i][nid - nrLocalNuma];
++            curMemSize += attr->strategyAttr.memSize[i][nid - nrLocalNuma];
+         }
+     }
+-    return memsize;
++    *memSize = curMemSize;
++    return 0;
+ }
+ 
+ static bool IsRemoteNidMemSizeValid(pid_t pid, int nid, uint64_t memSize)
+@@ -2752,8 +2756,8 @@ static bool IsRemoteNidMemSizeValid(pid_t pid, int nid, uint64_t memSize)
+     if (memSize % KB_PER_4KB != 0 || memSize == 0) {
+         return false;
+     }
+-    uint64_t curMemSize = GetAttrNidInitMemSize(pid, nid);
+-    if (curMemSize < 0) {
++    uint64_t curMemSize;
++    if (GetAttrNidInitMemSize(pid, nid, &curMemSize)) {
+         return false;
+     }
+     if (memSize > curMemSize) {
+@@ -2840,7 +2844,12 @@ static int SmapMigratePidRemoteNumaCheck(struct MigrateEscapeMsg *msg)
+         }
+         if (msg->payload[i].migrateMode == MIG_MEMSIZE_MODE) {
+             if (msg->payload[i].memSize == 0) {
+-                msg->payload[i].memSize = GetAttrNidInitMemSize(msg->payload[i].pid, msg->payload[i].srcNid);
++                uint64_t curMemSize;
++                if (GetAttrNidInitMemSize(msg->payload[i].pid, msg->payload[i].srcNid, &curMemSize)) {
++                    SMAP_LOGGER_ERROR("[%d] pid: %d get current memSize failed.", i, msg->payload[i].pid);
++                    return -EINVAL;
++                }
++                msg->payload[i].memSize = curMemSize;
+                 SMAP_LOGGER_INFO("[%d] pid: %d memSize is 0, set to curMemSize %llu.", i, msg->payload[i].pid,
+                                  msg->payload[i].memSize);
+             }
+diff --git a/plugins/smap/test/user/InterfaceTest.cpp b/plugins/smap/test/user/InterfaceTest.cpp
+index 901f180..b6a7351 100644
+--- a/plugins/smap/test/user/InterfaceTest.cpp
++++ b/plugins/smap/test/user/InterfaceTest.cpp
+@@ -3810,7 +3810,7 @@ TEST_F(InterfaceTest, TestIsPidArrRemoteNumaMatchTwo)
+ }
+ 
+ extern "C" int GetAttrNidInitRatio(pid_t pid, int nid);
+-extern "C" uint64_t GetAttrNidInitMemSize(pid_t pid, int nid);
++extern "C" int GetAttrNidInitMemSize(pid_t pid, int nid, uint64_t *memSize);
+ extern "C" bool IsRemoteNidMemSizeValid(pid_t pid, int nid, uint64_t memSize);
+ extern "C" int SmapMigratePidRemoteNumaCheckInner(struct MigrateEscapeMsg *msg);
+ extern "C" int BuildMigRemoteNumaMsg(struct MigrateEscapeMsg *msg, struct MigPidRemoteNumaIoctlMsg *ioctlMsg);
+@@ -3838,15 +3838,17 @@ TEST_F(InterfaceTest, TestGetAttrNidInitMemSize)
+ {
+     ProcessAttr attr = { .pid = 1 };
+     attr.strategyAttr.memSize[0][0] = 1024;
++    attr.numaAttr.numaNodes = 0b00010001;
+     g_processManager.nrLocalNuma = 4;
+     g_processManager.processes = &attr;
++    uint64_t memSize = 0;
+ 
+     MOCKER(GetNrLocalNuma).stubs().will(returnValue(4));
+     MOCKER(GetProcessAttr).stubs().will(returnValue(&attr));
+-    MOCKER(GetAttrL1).stubs().will(returnValue(0));
+ 
+-    // Test that function can be called (coverage purpose)
+-    GetAttrNidInitMemSize(1, 4);
++    EXPECT_EQ(0, GetAttrNidInitMemSize(1, 4, &memSize));
++    EXPECT_EQ(1024, memSize);
++    EXPECT_EQ(-EINVAL, GetAttrNidInitMemSize(1, 4, nullptr));
+ 
+     g_processManager.processes = nullptr;
+ }
+@@ -3855,15 +3857,14 @@ TEST_F(InterfaceTest, TestIsRemoteNidMemSizeValid)
+ {
+     ProcessAttr attr = { .pid = 1 };
+     attr.strategyAttr.memSize[0][0] = 2048;
++    attr.numaAttr.numaNodes = 0b00010001;
+     g_processManager.nrLocalNuma = 4;
+     g_processManager.processes = &attr;
+ 
+     MOCKER(GetNrLocalNuma).stubs().will(returnValue(4));
+     MOCKER(GetProcessAttr).stubs().will(returnValue(&attr));
+-    MOCKER(GetAttrL1).stubs().will(returnValue(0));
+ 
+-    // Test that function can be called (coverage purpose)
+-    IsRemoteNidMemSizeValid(1, 4, 2048);
++    EXPECT_TRUE(IsRemoteNidMemSizeValid(1, 4, 2048));
+ 
+     g_processManager.processes = nullptr;
+ }
+diff --git a/plugins/smap/test/user/manage/ThreadTest.cpp b/plugins/smap/test/user/manage/ThreadTest.cpp
+index a34653e..a7fcb64 100644
+--- a/plugins/smap/test/user/manage/ThreadTest.cpp
++++ b/plugins/smap/test/user/manage/ThreadTest.cpp
+@@ -3,6 +3,7 @@
+  * Description: smap5.0 user thread ut code
+  */
+ 
++#include <cerrno>
+ #include <cstdlib>
+ #include "gtest/gtest.h"
+ #include "mockcpp/mokc.h"
+@@ -56,7 +57,7 @@ TEST_F(ThreadTest, TestInitThread)
+     uint32_t period;
+     int ret;
+ 
+-    MOCKER(pthread_create).stubs().will(ignoreReturnValue());
++    MOCKER(pthread_create).stubs().will(returnValue(0));
+     MOCKER(EnvMutexLock).stubs().will(ignoreReturnValue());
+     MOCKER(EnvMutexUnlock).stubs().will(ignoreReturnValue());
+     ret = InitThread(&pm, period, TmpWorkFunc);
+@@ -65,6 +66,21 @@ TEST_F(ThreadTest, TestInitThread)
+     free(pm.threadCtx[0]);
+ }
+ 
++TEST_F(ThreadTest, TestInitThreadCreateFailed)
++{
++    struct ProcessManager pm = {
++        .nrThread = 0
++    };
++    uint32_t period = 50;
++    int ret;
++
++    MOCKER(pthread_create).stubs().will(returnValue(EAGAIN));
++    ret = InitThread(&pm, period, TmpWorkFunc);
++    EXPECT_EQ(-EAGAIN, ret);
++    EXPECT_EQ(0, pm.nrThread);
++    EXPECT_EQ(nullptr, pm.threadCtx[0]);
++}
++
+ TEST_F(ThreadTest, TestDestroyAllThread)
+ {
+     int ret;
+@@ -81,4 +97,4 @@ TEST_F(ThreadTest, TestDestroyAllThread)
+     EXPECT_EQ(nullptr, pm.threadCtx[0]);
+     EXPECT_EQ(nullptr, pm.threadCtx[1]);
+     EXPECT_EQ(0, pm.nrThread);
+-}
+\ No newline at end of file
++}
+-- 
+2.53.0.windows.3
+

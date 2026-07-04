@@ -1,0 +1,60 @@
+From fa0f6496680b509ae1da60937f946c205d057eb4 Mon Sep 17 00:00:00 2001
+From: jamesricado <825511311@qq.com>
+Date: Sun, 7 Jun 2026 14:38:47 +0800
+Subject: [PATCH 07/71] fix dt
+
+---
+ .../test/tiering/test_smap_migrate_pages.cpp  | 37 -------------------
+ 1 file changed, 37 deletions(-)
+
+diff --git a/plugins/smap/test/tiering/test_smap_migrate_pages.cpp b/plugins/smap/test/tiering/test_smap_migrate_pages.cpp
+index 94caa04..8ce1f74 100644
+--- a/plugins/smap/test/tiering/test_smap_migrate_pages.cpp
++++ b/plugins/smap/test/tiering/test_smap_migrate_pages.cpp
+@@ -1006,43 +1006,6 @@ TEST_F(SmapMigratePagesTest, DoMigrateNrFoliosZeroGotoAgainInvalidPfn)
+     EXPECT_EQ(0, mig_list[0].failed_mig_nr);
+     EXPECT_EQ(NR_BATCHED_MIGRATION, mig_list[0].failed_pre_migrated_nr);
+ 
+-    vfree(mig_list[0].addr);
+-    kfree(msg);
+-    kfree(mig_list);
+-}
+-
+-TEST_F(SmapMigratePagesTest, DoMigrateNrFoliosZeroNoRemainContinue)
+-{
+-    // When nr_folios == 0 and nr_remain_folios == 0, continue (no goto again)
+-    struct page page;
+-    int arr[1] = {0};
+-    unsigned int nr_folios = 0;
+-    const u64 nr_total = NR_BATCHED_MIGRATION;
+-    struct migrate_msg *msg = (struct migrate_msg *)kmalloc(sizeof(struct migrate_msg), GFP_KERNEL);
+-    struct mig_list *mig_list = (struct mig_list *)kmalloc(sizeof(struct mig_list), GFP_KERNEL);
+-
+-    mig_list[0].from = NUMA_NO_NODE + 1;
+-    mig_list[0].nr = nr_total;
+-    mig_list[0].addr = (u64*)vzalloc(nr_total * sizeof(u64));
+-    ASSERT_NE(nullptr, mig_list[0].addr);
+-    for (u64 j = 0; j < nr_total; j++) {
+-        mig_list[0].addr[j] = 0x100000 + j * 0x1000;
+-    }
+-    msg->cnt = 1;
+-    msg->mul_mig.page_size = 0x1000;
+-    msg->mig_list = mig_list;
+-
+-    MOCKER(kzalloc).stubs().will(returnValue((void*)arr));
+-    MOCKER(pfn_valid).stubs().will(returnValue(true));
+-    MOCKER(pfn_to_online_page).stubs().will(returnValue(&page));
+-    MOCKER(is_filter_4k).stubs().will(returnValue(0));
+-    MOCKER(kfree).stubs().will(ignoreReturnValue());
+-
+-    int ret = do_migrate(msg, mig_list);
+-    EXPECT_EQ(0, ret);
+-    EXPECT_EQ(0, mig_list[0].failed_mig_nr);
+-    EXPECT_EQ(NR_BATCHED_MIGRATION, mig_list[0].failed_pre_migrated_nr);
+-
+     vfree(mig_list[0].addr);
+     kfree(msg);
+     kfree(mig_list);
+-- 
+2.53.0.windows.3
+

@@ -1,0 +1,162 @@
+From 83d3a258a09f4b3bdc11fb2964b522bc7e8f3899 Mon Sep 17 00:00:00 2001
+From: discrete_brain <discrete_brain@163.com>
+Date: Sat, 6 Jun 2026 21:16:31 +0800
+Subject: [PATCH 09/71] refactor: rename CalcRemoteBorrowPages() to MBToPage()
+
+---
+ plugins/smap/src/user/manage/manage.c         | 25 +++++++------------
+ plugins/smap/src/user/manage/manage.h         |  7 ++++--
+ plugins/smap/src/user/manage/smap_config.c    |  6 ++---
+ plugins/smap/test/user/manage/ManageTest.cpp  |  6 ++---
+ .../smap/test/user/manage/SmapConfigTest.cpp  |  1 -
+ 5 files changed, 20 insertions(+), 25 deletions(-)
+
+diff --git a/plugins/smap/src/user/manage/manage.c b/plugins/smap/src/user/manage/manage.c
+index 8875f7f..85738d0 100644
+--- a/plugins/smap/src/user/manage/manage.c
++++ b/plugins/smap/src/user/manage/manage.c
+@@ -1506,13 +1506,6 @@ static int ParseBitmap(size_t bufLen, char *buf, size_t *offset, struct ProcessM
+     return 0;
+ }
+ 
+-uint64_t CalcRemoteBorrowPages(uint64_t size)
+-{
+-    uint64_t result = size;
+-    result = result * MIB / GetPageSize();
+-    return result;
+-}
+-
+ static void NoAccountAlloc(int remoteNid, ProcessAttr *attr)
+ {
+     int i;
+@@ -1784,9 +1777,9 @@ static void CalTmpBorrowPage(uint32_t tmpMaxAllocNrPages[LOCAL_NUMA_NUM][REMOTE_
+     struct RemoteNumaInfo remoteNumaInfo = g_processManager.remoteNumaInfo;
+     for (int j = 0; j < REMOTE_NUMA_NUM; j++) {
+         if (remoteNumaInfo.sharedSize[j] > 0) {
+-            tmpSharedBorrowPageToUse[j] = CalcRemoteBorrowPages(remoteNumaInfo.sharedSize[j]) -
+-                                          MIN(CalcRemoteBorrowPages(remoteNumaInfo.sharedSize[j]) * RESERVED_RATIO,
+-                                              CalcRemoteBorrowPages(RESERVED_MEMORY));
++            tmpSharedBorrowPageToUse[j] = MBToPage(remoteNumaInfo.sharedSize[j]) -
++                                          MIN(MBToPage(remoteNumaInfo.sharedSize[j]) * RESERVED_RATIO,
++                                              MBToPage(RESERVED_MEMORY));
+             SMAP_LOGGER_DEBUG("tmpSharedBorrowPageToUse[%d] %llu.", j, tmpSharedBorrowPageToUse[j]);
+         }
+         for (int i = 0; i < GetNrLocalNuma(); i++) {
+@@ -1795,9 +1788,9 @@ static void CalTmpBorrowPage(uint32_t tmpMaxAllocNrPages[LOCAL_NUMA_NUM][REMOTE_
+             }
+             if (remoteNumaInfo.privateSize[i][j] > 0) {
+                 tmpPrivateBorrowPageToUse[i][j] =
+-                    CalcRemoteBorrowPages(remoteNumaInfo.privateSize[i][j]) -
+-                    MIN(CalcRemoteBorrowPages(remoteNumaInfo.privateSize[i][j]) * RESERVED_RATIO,
+-                        CalcRemoteBorrowPages(RESERVED_MEMORY));
++                    MBToPage(remoteNumaInfo.privateSize[i][j]) -
++                    MIN(MBToPage(remoteNumaInfo.privateSize[i][j]) * RESERVED_RATIO,
++                        MBToPage(RESERVED_MEMORY));
+                 SMAP_LOGGER_DEBUG("tmpPrivateBorrowPageToUse[%d][%d] %llu.", i, j, tmpPrivateBorrowPageToUse[i][j]);
+             }
+         }
+@@ -2003,12 +1996,12 @@ int SetRemoteNumaInfo(int srcNid, int destNid, uint64_t size)
+     }
+     for (int j = 0; j < REMOTE_NUMA_NUM; j++) {
+         numaInfo->usedInfo[j].ifUsedFreshed = false;
+-        numaInfo->usedInfo[j].size = CalcRemoteBorrowPages(numaInfo->sharedSize[j]);
++        numaInfo->usedInfo[j].size = MBToPage(numaInfo->sharedSize[j]);
+         SMAP_LOGGER_DEBUG("Node%d shared size: %llu.", j, numaInfo->usedInfo[j].size);
+         for (int i = 0; i < g_processManager.nrLocalNuma; i++) {
+-            numaInfo->usedInfo[j].size += CalcRemoteBorrowPages(numaInfo->privateSize[i][j]);
++            numaInfo->usedInfo[j].size += MBToPage(numaInfo->privateSize[i][j]);
+             numaInfo->privateUsedInfo[i][j].ifUsedFreshed = false;
+-            numaInfo->privateUsedInfo[i][j].size = CalcRemoteBorrowPages(numaInfo->privateSize[i][j]);
++            numaInfo->privateUsedInfo[i][j].size = MBToPage(numaInfo->privateSize[i][j]);
+             SMAP_LOGGER_INFO("local %d borrow remote %d private size: %llu.", i, j,
+                              numaInfo->privateUsedInfo[i][j].size);
+         }
+diff --git a/plugins/smap/src/user/manage/manage.h b/plugins/smap/src/user/manage/manage.h
+index b080582..77e397e 100644
+--- a/plugins/smap/src/user/manage/manage.h
++++ b/plugins/smap/src/user/manage/manage.h
+@@ -407,8 +407,6 @@ typedef struct {
+     } numaParam[REMOTE_NUMA_NUM];
+ } ProcessParam;
+ 
+-uint64_t CalcRemoteBorrowPages(uint64_t size);
+-
+ void DebugProcessAttr(struct ProcessManager *manager);
+ 
+ int GetNrLocalNuma(void);
+@@ -590,6 +588,11 @@ static inline uint64_t KBToNormalPage(uint64_t memSize)
+     return memSize / (size / KIB);
+ }
+ 
++static inline uint64_t MBToPage(uint64_t memSize)
++{
++    return memSize * MIB / GetPageSize();
++}
++
+ static inline int GetCurrentMaxNrPid(void)
+ {
+     return IsHugeMode() ? MAX_2M_PROCESSES_CNT : MAX_4K_PROCESSES_CNT;
+diff --git a/plugins/smap/src/user/manage/smap_config.c b/plugins/smap/src/user/manage/smap_config.c
+index 2634495..efc0649 100644
+--- a/plugins/smap/src/user/manage/smap_config.c
++++ b/plugins/smap/src/user/manage/smap_config.c
+@@ -347,7 +347,7 @@ static int RecoverNumaConfig(char *numaBase)
+         for (int j = 0; j < REMOTE_NUMA_NUM; j++) {
+             // only called during initialization, no need to lock
+             numaInfo->privateSize[i][j] = payload->size;
+-            numaInfo->privateUsedInfo[i][j].size = CalcRemoteBorrowPages(payload->size);
++            numaInfo->privateUsedInfo[i][j].size = MBToPage(payload->size);
+             SMAP_LOGGER_INFO("Numa privateSize[%d][%d] %u.", i, j, payload->size);
+             payload++;
+         }
+@@ -358,9 +358,9 @@ static int RecoverNumaConfig(char *numaBase)
+         payload++;
+     }
+     for (int j = 0; j < REMOTE_NUMA_NUM; j++) {
+-        numaInfo->usedInfo[j].size = CalcRemoteBorrowPages(numaInfo->sharedSize[j]);
++        numaInfo->usedInfo[j].size = MBToPage(numaInfo->sharedSize[j]);
+         for (int i = 0; i < GetNrLocalNuma(); i++) {
+-            numaInfo->usedInfo[j].size += CalcRemoteBorrowPages(numaInfo->privateSize[i][j]);
++            numaInfo->usedInfo[j].size += MBToPage(numaInfo->privateSize[i][j]);
+         }
+         SMAP_LOGGER_INFO("Numa usedInfo[%d] %u.", j, numaInfo->usedInfo[j].size);
+     }
+diff --git a/plugins/smap/test/user/manage/ManageTest.cpp b/plugins/smap/test/user/manage/ManageTest.cpp
+index f05b9f0..2bddeeb 100644
+--- a/plugins/smap/test/user/manage/ManageTest.cpp
++++ b/plugins/smap/test/user/manage/ManageTest.cpp
+@@ -1051,16 +1051,16 @@ TEST_F(ManageTest, TestClearRemoteMemUsed)
+     EXPECT_EQ(0, g_processManager.remoteNumaInfo.usedInfo[1].used);
+ }
+ 
+-extern "C" uint64_t CalcRemoteBorrowPages(uint64_t size);
++extern "C" uint64_t MBToPage(uint64_t size);
+ TEST_F(ManageTest, TestCalcRemoteBorrowPages)
+ {
+     uint32_t ret;
+     g_processManager.tracking.pageSize = PAGESIZE_4K;
+-    ret = CalcRemoteBorrowPages(100);
++    ret = MBToPage(100);
+     EXPECT_EQ(25600, ret);
+ 
+     g_processManager.tracking.pageSize = PAGESIZE_2M;
+-    ret = CalcRemoteBorrowPages(100);
++    ret = MBToPage(100);
+     EXPECT_EQ(50, ret);
+ }
+ 
+diff --git a/plugins/smap/test/user/manage/SmapConfigTest.cpp b/plugins/smap/test/user/manage/SmapConfigTest.cpp
+index cba84c4..fd0c713 100644
+--- a/plugins/smap/test/user/manage/SmapConfigTest.cpp
++++ b/plugins/smap/test/user/manage/SmapConfigTest.cpp
+@@ -503,7 +503,6 @@ TEST_F(SmapConfigTest, TestRecoverNumaConfig)
+     MOCKER(GetProcessManager).stubs().will(returnValue(&manager));
+     MOCKER(GetNrLocalNuma).stubs().will(returnValue(nrLocal));
+     MOCKER(JumpToNumaPayload).stubs().will(returnValue(reinterpret_cast<char *>(payload)));
+-    MOCKER(CalcRemoteBorrowPages).stubs().will(returnValue((unsigned long)0));
+     ret = RecoverNumaConfig(&numaBase);
+     EXPECT_EQ(0, ret);
+     free(payload);
+-- 
+2.53.0.windows.3
+

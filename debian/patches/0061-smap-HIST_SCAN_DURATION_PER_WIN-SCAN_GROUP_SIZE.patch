@@ -1,0 +1,279 @@
+From ae8ebf1141559f5541584ccc13956b9b0e69aed1 Mon Sep 17 00:00:00 2001
+From: fffsfsaf <1825116237@qq.com>
+Date: Tue, 30 Jun 2026 17:31:39 +0800
+Subject: [PATCH 61/71] =?UTF-8?q?smap:=20=E5=B0=86HIST=5FSCAN=5FDURATION?=
+ =?UTF-8?q?=5FPER=5FWIN=E5=92=8CSCAN=5FGROUP=5FSIZE=E6=94=B9=E4=B8=BA?=
+ =?UTF-8?q?=E5=8F=AF=E5=8A=A8=E6=80=81=E4=BF=AE=E6=94=B9=E7=9A=84=E5=86=85?=
+ =?UTF-8?q?=E6=A0=B8=E5=8F=82=E6=95=B0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ plugins/smap/src/drivers/accessed_bit.c       | 49 ++++++++++++++++-
+ plugins/smap/src/drivers/accessed_bit.h       |  2 -
+ plugins/smap/src/drivers/hist_ops.c           | 53 ++++++++++++++++++-
+ plugins/smap/src/drivers/hist_ops.h           |  1 -
+ plugins/smap/test/depends/include/linux/fs.h  |  1 +
+ .../smap/test/depends/include/linux/kstrtox.h |  2 +-
+ .../test/depends/include/linux/moduleparam.h  |  2 +
+ plugins/smap/test/depends/kernel/param.c      | 12 ++++-
+ plugins/smap/test/depends/lib/kstrtox.c       | 14 +++++
+ 9 files changed, 128 insertions(+), 8 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index 51eb562..adc751b 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -49,6 +49,53 @@ spinlock_t ham_lock;
+ struct rw_semaphore statistic_lock;
+ static u64 freq_info_num;
+ 
++static int scan_group_size_set(const char *val, const struct kernel_param *kp);
++
++/* Custom parameter operations structure */
++static const struct kernel_param_ops scan_group_size_ops = {
++	.set = scan_group_size_set,
++	.get = param_get_ulong,
++};
++
++/* Scan group size kernel parameter: default 64KiB */
++unsigned long scan_group_size = 64UL * 1024;
++module_param_cb(scan_group_size, &scan_group_size_ops, &scan_group_size, 0644);
++MODULE_PARM_DESC(scan_group_size, "Scan group size in bytes (default: 64KiB)");
++
++/**
++ * scan_group_size_set - Callback for setting scan group size parameter
++ * @val: String containing the new group size value
++ * @kp: Pointer to kernel_param structure
++ *
++ * When user modifies the parameter via sysfs:
++ * - Validate the value is positive and a power of 2
++ * - Update the global scan group size
++ */
++static int scan_group_size_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned long new_size;
++	int ret;
++
++	/* Parse parameter value */
++	ret = kstrtoul(val, 10, &new_size);
++	if (ret)
++		return ret;
++
++	/* Validate parameter: must be positive and power of 2 */
++	if (new_size == 0 || (new_size & (new_size - 1)) != 0) {
++		pr_err("invalid scan group size: %lu, must be > 0 and power of 2\n",
++		       new_size);
++		return -EINVAL;
++	}
++
++	pr_info("scan group size changed: %lu -> %lu\n", scan_group_size, new_size);
++
++	/* Update scan group size */
++	scan_group_size = new_size;
++
++	return 0;
++}
++
+ struct smap_vma_struct {
+ 	unsigned long start_vaddr;
+ 	unsigned long end_vaddr;
+@@ -1317,7 +1364,7 @@ static int check_pte_young(pte_t *pte, unsigned long addr, unsigned long next,
+ 	is_local = nid < nr_local_numa;
+ 	/* 64KiB分组优化：NORMAL_SCAN类型，首页young则跳过后续页 */
+ 	if (pte_walk->type == NORMAL_SCAN) {
+-		bool is_first = (addr & (SCAN_GROUP_SIZE - 1)) == 0;
++		bool is_first = (addr & (scan_group_size - 1)) == 0;
+ 		if (is_first)
+ 			pte_walk->group_hot = is_young;
+ 		else if (pte_walk->group_hot) {
+diff --git a/plugins/smap/src/drivers/accessed_bit.h b/plugins/smap/src/drivers/accessed_bit.h
+index 2001a8b..ce56710 100644
+--- a/plugins/smap/src/drivers/accessed_bit.h
++++ b/plugins/smap/src/drivers/accessed_bit.h
+@@ -16,8 +16,6 @@
+ #define SCAN_PERIOD_UNIT_MS 50
+ 
+ #define MMAPLOCK_BATCH_SIZE (64UL * 1024 * 1024)
+-#define SCAN_GROUP_SIZE (64UL * 1024) /* 64KiB分组扫描优化 */
+-
+ #define SCAN_RESULT_CAPACITY (MMAPLOCK_BATCH_SIZE / PAGE_SIZE)
+ 
+ extern struct list_head remote_ram_list;
+diff --git a/plugins/smap/src/drivers/hist_ops.c b/plugins/smap/src/drivers/hist_ops.c
+index 35f72b0..1641a21 100644
+--- a/plugins/smap/src/drivers/hist_ops.c
++++ b/plugins/smap/src/drivers/hist_ops.c
+@@ -90,6 +90,55 @@ module_param_cb(hist_4k_scan_mode_param, &hist_4k_scan_mode_ops,
+ MODULE_PARM_DESC(hist_4k_scan_mode_param,
+ 		 "4K scan mode: 0=multi-granularity, 1=seq-loop (default)");
+ 
++static int hist_scan_duration_per_win_set(const char *val, const struct kernel_param *kp);
++
++/* Custom parameter operations structure */
++static const struct kernel_param_ops hist_scan_duration_per_win_ops = {
++	.set = hist_scan_duration_per_win_set,
++	.get = param_get_uint,
++};
++
++/* Scan duration per window kernel parameter: default 64ms */
++unsigned int hist_scan_duration_per_win = 64;
++module_param_cb(hist_scan_duration_per_win, &hist_scan_duration_per_win_ops,
++		&hist_scan_duration_per_win, 0644);
++MODULE_PARM_DESC(hist_scan_duration_per_win,
++		 "Scan duration per window in ms (default: 64)");
++
++/**
++ * hist_scan_duration_per_win_set - Callback for setting scan duration per window parameter
++ * @val: String containing the new scan duration value
++ * @kp: Pointer to kernel_param structure
++ *
++ * When user modifies the parameter via sysfs:
++ * - Validate the value is positive
++ * - Update the global scan duration per window
++ */
++static int hist_scan_duration_per_win_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned int new_duration;
++	int ret;
++
++	/* Parse parameter value */
++	ret = kstrtouint(val, 10, &new_duration);
++	if (ret)
++		return ret;
++
++	/* Validate parameter range: must be positive */
++	if (new_duration == 0 || new_duration > HIST_THREAD_PERIOD) {
++		pr_err("invalid scan duration per win: %u, must be > 0 and < 512\n", new_duration);
++		return -EINVAL;
++	}
++
++	pr_info("hist scan duration per win changed: %u -> %u\n",
++		hist_scan_duration_per_win, new_duration);
++
++	/* Update scan duration */
++	hist_scan_duration_per_win = new_duration;
++
++	return 0;
++}
++
+ static inline u64 align_addr(u64 addr, u32 low_bit_len)
+ {
+ 	return (addr >> low_bit_len) << low_bit_len;
+@@ -461,7 +510,7 @@ static int generate_aligned_4k_scan_wins_info(struct segs_info *win_info,
+ 	struct smap_hist_dev *dev = &g_smap_hist_dev;
+ 	int ret;
+ 	int max_wins_4k_per_ba =
+-		HIST_THREAD_PERIOD / HIST_SCAN_DURATION_PER_WIN -
++		HIST_THREAD_PERIOD / hist_scan_duration_per_win -
+ 		dev->scan_wins_num_per_ba;
+ 	u32 nr_wins_4k = count_nr_windows(info->segs, info->cnt, STS_SIZE_4K);
+ 	if (nr_wins_4k == 0 || max_wins_4k_per_ba <= 0)
+@@ -915,7 +964,7 @@ static int do_hist_scan_sliding(struct segs_info *info, bool do_multi_gran,
+ 	 * Multi-granularity scan: dynamically calculated based on window count
+ 	 */
+ 	scan_time = (do_multi_gran || do_4k_seq_loop)
+-			    ? HIST_SCAN_DURATION_PER_WIN
++			    ? hist_scan_duration_per_win
+ 			    : HIST_THREAD_PERIOD / dev->scan_wins_num_per_ba;
+ 	pr_debug("scan_time_per_win: %u ms\n", scan_time);
+ 
+diff --git a/plugins/smap/src/drivers/hist_ops.h b/plugins/smap/src/drivers/hist_ops.h
+index ca28722..09437bc 100644
+--- a/plugins/smap/src/drivers/hist_ops.h
++++ b/plugins/smap/src/drivers/hist_ops.h
+@@ -30,7 +30,6 @@
+ #define STS_PER_WORD (2)
+ #define HIST_STS_VALUE_NUM (HIST_STS_VALUE_WORD_NUM * STS_PER_WORD)
+ #define HIST_THREAD_PERIOD (512)
+-#define HIST_SCAN_DURATION_PER_WIN (64)
+ #define PAGE_SIZE_64K_DIV_4K 16
+ 
+ #define THREAD_SLEEP (50)
+diff --git a/plugins/smap/test/depends/include/linux/fs.h b/plugins/smap/test/depends/include/linux/fs.h
+index 44b906b..7f0c3f1 100644
+--- a/plugins/smap/test/depends/include/linux/fs.h
++++ b/plugins/smap/test/depends/include/linux/fs.h
+@@ -99,6 +99,7 @@ extern int iterate_dir(struct file *, struct dir_context *);
+ extern int scnprintf(char *buf, size_t size, const char *fmt, ...);
+ extern int kstrtouint(const char *s, unsigned int base, unsigned int *res);
+ extern int kstrtoull(const char *s, unsigned int base, unsigned long long *res);
++extern int kstrtoul(const char *s, unsigned int base, unsigned long *res);
+ static inline struct inode *file_inode(const struct file *f)
+ {
+     return 0;
+diff --git a/plugins/smap/test/depends/include/linux/kstrtox.h b/plugins/smap/test/depends/include/linux/kstrtox.h
+index 514646b..40d9ae9 100644
+--- a/plugins/smap/test/depends/include/linux/kstrtox.h
++++ b/plugins/smap/test/depends/include/linux/kstrtox.h
+@@ -12,7 +12,7 @@ extern "C" {
+ 
+ int kstrtouint(const char *s, unsigned int base, unsigned int *res);
+ int kstrtoint(const char *s, unsigned int base, int *res);
+-
++int kstrtoul(const char *s, unsigned int base, unsigned long *res);
+ int kstrtoull(const char *s, unsigned int base, unsigned long long *res);
+ 
+ #ifdef __cplusplus
+diff --git a/plugins/smap/test/depends/include/linux/moduleparam.h b/plugins/smap/test/depends/include/linux/moduleparam.h
+index 3123e39..9c904ff 100644
+--- a/plugins/smap/test/depends/include/linux/moduleparam.h
++++ b/plugins/smap/test/depends/include/linux/moduleparam.h
+@@ -20,5 +20,7 @@ struct kernel_param {
+ 
+ extern int param_set_uint(const char *val, const struct kernel_param *kp);
+ extern int param_get_uint(char *buffer, const struct kernel_param *kp);
++extern int param_set_ulong(const char *val, const struct kernel_param *kp);
++extern int param_get_ulong(char *buffer, const struct kernel_param *kp);
+ 
+ #endif /* _LINUX_MODULE_PARAMS_H */
+diff --git a/plugins/smap/test/depends/kernel/param.c b/plugins/smap/test/depends/kernel/param.c
+index 19f63ac..bd2d945 100644
+--- a/plugins/smap/test/depends/kernel/param.c
++++ b/plugins/smap/test/depends/kernel/param.c
+@@ -9,4 +9,14 @@ int param_get_uint(char *buffer, const struct kernel_param *kp)
+ int param_set_uint(const char *val, const struct kernel_param *kp)
+ {
+     return 0;
+-}
+\ No newline at end of file
++}
++
++int param_get_ulong(char *buffer, const struct kernel_param *kp)
++{
++    return 0;
++}
++
++int param_set_ulong(const char *val, const struct kernel_param *kp)
++{
++    return 0;
++}
+diff --git a/plugins/smap/test/depends/lib/kstrtox.c b/plugins/smap/test/depends/lib/kstrtox.c
+index 3f66d7c..d0f7f45 100644
+--- a/plugins/smap/test/depends/lib/kstrtox.c
++++ b/plugins/smap/test/depends/lib/kstrtox.c
+@@ -28,6 +28,20 @@ int kstrtouint(const char *str, unsigned int base, unsigned int *result)
+ 	return 0;
+ }
+ 
++int kstrtoul(const char *str, unsigned int base, unsigned long *result)
++{
++    unsigned long long tmp;
++
++    errno = 0;
++    tmp = strtoull(str, NULL, base);
++    if (errno)
++        return -errno;
++    if (tmp != (unsigned long)tmp)
++        return -ERANGE;
++    *result = (unsigned long)tmp;
++    return 0;
++}
++
+ int kstrtoull(const char *s, unsigned int base, unsigned long long *res)
+ {
+     unsigned long long tmp;
+-- 
+2.53.0.windows.3
+

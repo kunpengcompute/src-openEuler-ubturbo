@@ -1,0 +1,574 @@
+From f1fdb33064d5eaf7b4e8bd38b2cac86bc257cf2b Mon Sep 17 00:00:00 2001
+From: woquzhao12138 <1825369014@qq.com>
+Date: Thu, 18 Jun 2026 16:12:14 +0800
+Subject: [PATCH 50/71] smap: tighten grouped swap trigger
+
+---
+ plugins/smap/src/user/manage/manage.c         |   3 +
+ plugins/smap/src/user/manage/manage.h         |   3 +
+ .../smap/src/user/strategy/grouped_strategy.c |  43 ++++-
+ .../smap/src/user/strategy/strategy_config.c  |  50 +++++-
+ .../smap/src/user/strategy/strategy_config.h  |   2 +
+ .../user/strategy/test_grouped_strategy.cpp   | 165 ++++++++++++++++++
+ .../user/strategy/test_strategy_config.cpp    |  36 +++-
+ 7 files changed, 297 insertions(+), 5 deletions(-)
+
+diff --git a/plugins/smap/src/user/manage/manage.c b/plugins/smap/src/user/manage/manage.c
+index 582a99d..36236f2 100644
+--- a/plugins/smap/src/user/manage/manage.c
++++ b/plugins/smap/src/user/manage/manage.c
+@@ -639,6 +639,9 @@ static void SetGroupedProcessConfig(ProcessAttr *attr, pid_t pid, uint32_t nodeB
+     attr->initLocalMemRatio = HUNDRED;
+     attr->numaAttr.numaNodes = nodeBitmap;
+     attr->groupPolicy = *policy;
++    attr->groupSwapLastTotalPages = 0;
++    attr->groupSwapStableTotalRounds = 0;
++    attr->groupSwapTotalPagesValid = false;
+     attr->pendingGroupPolicy.valid = false;
+     attr->autoRemoveWhenRemoteEmpty = false;
+     attr->syncWaitRemoteEmpty = false;
+diff --git a/plugins/smap/src/user/manage/manage.h b/plugins/smap/src/user/manage/manage.h
+index 99456ad..3b9c088 100644
+--- a/plugins/smap/src/user/manage/manage.h
++++ b/plugins/smap/src/user/manage/manage.h
+@@ -283,6 +283,9 @@ struct ProcessAttribute {
+     WalkPage walkPage;
+     AdaptMem adaptMem;
+     GroupMigrationPolicy groupPolicy;
++    uint64_t groupSwapLastTotalPages;
++    uint8_t groupSwapStableTotalRounds;
++    bool groupSwapTotalPagesValid;
+     PendingGroupMigrationPolicy pendingGroupPolicy;
+     StrategyAttribute strategyAttr;
+     ScanAttribute scanAttr;
+diff --git a/plugins/smap/src/user/strategy/grouped_strategy.c b/plugins/smap/src/user/strategy/grouped_strategy.c
+index 9dfa37a..e6b6023 100644
+--- a/plugins/smap/src/user/strategy/grouped_strategy.c
++++ b/plugins/smap/src/user/strategy/grouped_strategy.c
+@@ -207,9 +207,12 @@ static uint64_t CalcGroupExcess(ProcessAttr *process, const MigrationGroupAttr *
+ 
+ static bool IsGroupLocalSteady(ProcessAttr *process, const MigrationGroupAttr *group)
+ {
++    uint32_t ratio = GetGroupSwapLocalWatermarkRatioConfig();
+     for (int i = 0; i < group->localCount; i++) {
+         int nid = group->locals[i].nid;
+-        if (process->scanAttr.actcLen[nid] != group->locals[i].localReservePages) {
++        uint64_t reserve = group->locals[i].localReservePages;
++        uint64_t threshold = ((__uint128_t)reserve * ratio + GROUP_SWAP_PERCENT_BASE - 1) / GROUP_SWAP_PERCENT_BASE;
++        if (process->scanAttr.actcLen[nid] < threshold) {
+             return false;
+         }
+     }
+@@ -225,6 +228,38 @@ static uint64_t CalcRemoteUsed(const MigrationGroupAttr *group)
+     return used;
+ }
+ 
++static uint64_t CalcProcessTotalPages(const ProcessAttr *process)
++{
++    uint64_t total = 0;
++
++    for (int nid = 0; nid < MAX_NODES; nid++) {
++        total += process->scanAttr.actcLen[nid];
++    }
++    return total;
++}
++
++static bool UpdateGroupSwapTotalPagesStable(ProcessAttr *process)
++{
++    uint64_t totalPages = CalcProcessTotalPages(process);
++
++    if (!process->groupSwapTotalPagesValid || process->groupSwapLastTotalPages != totalPages) {
++        process->groupSwapLastTotalPages = totalPages;
++        process->groupSwapStableTotalRounds = 1;
++        process->groupSwapTotalPagesValid = true;
++    } else if (process->groupSwapStableTotalRounds < GROUP_SWAP_READY_ROUNDS) {
++        process->groupSwapStableTotalRounds++;
++    }
++
++    return process->groupSwapStableTotalRounds >= GROUP_SWAP_READY_ROUNDS;
++}
++
++static void ResetGroupSwapCandidateRounds(GroupMigrationPolicy *policy)
++{
++    for (int i = 0; i < policy->groupCount; i++) {
++        policy->groups[i].swapCandidateRounds = 0;
++    }
++}
++
+ static uint64_t CalcRemoteRemaining(const MigrationGroupAttr *group, int targetIdx)
+ {
+     const GroupTargetAttr *target = &group->targets[targetIdx];
+@@ -1094,6 +1129,12 @@ static int RunSwapStage(ProcessAttr *process, struct MigList mlist[MAX_NODES][MA
+     if (!process->enableSwap) {
+         return 0;
+     }
++    if (!UpdateGroupSwapTotalPagesStable(process)) {
++        SMAP_LOGGER_INFO("grouped pid %d swap waits for stable total pages, current %llu round %u.", process->pid,
++                         process->groupSwapLastTotalPages, process->groupSwapStableTotalRounds);
++        ResetGroupSwapCandidateRounds(&process->groupPolicy);
++        return 0;
++    }
+     for (int i = 0; i < process->groupPolicy.groupCount; i++) {
+         MigrationGroupAttr *group = &process->groupPolicy.groups[i];
+         uint64_t localUsed = CalcLocalUsed(process, group);
+diff --git a/plugins/smap/src/user/strategy/strategy_config.c b/plugins/smap/src/user/strategy/strategy_config.c
+index 2991b0a..d38f9f5 100644
+--- a/plugins/smap/src/user/strategy/strategy_config.c
++++ b/plugins/smap/src/user/strategy/strategy_config.c
+@@ -20,7 +20,7 @@
+ #include "securec.h"
+ #include "strategy_config.h"
+ 
+-#define STRATEGY_CONFIG_ENTRY 13
++#define STRATEGY_CONFIG_ENTRY 14
+ #define STRATEGY_CONFIG_BUFFSIZE 500
+ 
+ #define RETURN_OK 0
+@@ -55,6 +55,10 @@
+ #define DEFAULT_GROUP_SWAP_MIN_FREQ_GAIN 0
+ #define MIN_GROUP_SWAP_MIN_FREQ_GAIN 0
+ 
++#define MAX_GROUP_SWAP_LOCAL_WATERMARK_RATIO 100
++#define DEFAULT_GROUP_SWAP_LOCAL_WATERMARK_RATIO 95
++#define MIN_GROUP_SWAP_LOCAL_WATERMARK_RATIO 0
++
+ #define MAX_MIGRATE_MODE 2
+ #define DEFAULT_MIGRATE_MODE 1
+ #define MIN_MIGRATE_MODE 0
+@@ -73,6 +77,7 @@ typedef struct {
+     uint32_t groupSwapRatio;
+     uint32_t groupSwapMinRemoteFreq;
+     uint32_t groupSwapMinFreqGain;
++    uint32_t groupSwapLocalWatermarkRatio;
+     uint32_t migrateMode;
+     bool migrateModeChanged;
+     bool zeroFreqMigrateEnable;
+@@ -140,6 +145,11 @@ uint32_t GetGroupSwapMinFreqGainConfig(void)
+     return g_strategyConfig.groupSwapMinFreqGain;
+ }
+ 
++uint32_t GetGroupSwapLocalWatermarkRatioConfig(void)
++{
++    return g_strategyConfig.groupSwapLocalWatermarkRatio;
++}
++
+ uint32_t GetMigrateModeConfig(void)
+ {
+     return g_strategyConfig.migrateMode;
+@@ -371,6 +381,24 @@ static int32_t ConfigGroupSwapMinFreqGain(char *substr, char *value)
+     return RETURN_OK;
+ }
+ 
++static int32_t ConfigGroupSwapLocalWatermarkRatio(char *substr, char *value)
++{
++    SMAP_LOGGER_DEBUG("Read config key:%s, value:%s.", substr, value);
++    int32_t ret = ConfigReadValueToInt(value, &g_tmpStrategyConfig.groupSwapLocalWatermarkRatio);
++    if (ret != RETURN_OK) {
++        SMAP_LOGGER_ERROR("Config group swap local watermark ratio read failed, key:%s.", substr);
++        return ret;
++    }
++    if (g_tmpStrategyConfig.groupSwapLocalWatermarkRatio < MIN_GROUP_SWAP_LOCAL_WATERMARK_RATIO ||
++        g_tmpStrategyConfig.groupSwapLocalWatermarkRatio > MAX_GROUP_SWAP_LOCAL_WATERMARK_RATIO) {
++        SMAP_LOGGER_ERROR("Config group swap local watermark ratio(%u) invalid, range(%d-%d), key:%s.",
++                          g_tmpStrategyConfig.groupSwapLocalWatermarkRatio, MIN_GROUP_SWAP_LOCAL_WATERMARK_RATIO,
++                          MAX_GROUP_SWAP_LOCAL_WATERMARK_RATIO, substr);
++        return RETURN_ERROR;
++    }
++    return RETURN_OK;
++}
++
+ static int32_t ConfigMigrateMode(char *substr, char *value)
+ {
+     SMAP_LOGGER_DEBUG("Read config key:%s, value:%s.", substr, value);
+@@ -487,6 +515,12 @@ static StrategyConfigReadElem g_strategyConfigRead[] = {
+         1UL,
+         0UL,
+     },
++    {
++        "smap.group.swap.local.watermark.ratio",
++        ConfigGroupSwapLocalWatermarkRatio,
++        1UL,
++        0UL,
++    },
+     {
+         "smap.migrate.mode",
+         ConfigMigrateMode,
+@@ -659,6 +693,7 @@ static void InitStrategyConfig(void)
+     g_strategyConfig.groupSwapRatio = DEFAULT_GROUP_SWAP_RATIO;
+     g_strategyConfig.groupSwapMinRemoteFreq = DEFAULT_GROUP_SWAP_MIN_REMOTE_FREQ;
+     g_strategyConfig.groupSwapMinFreqGain = DEFAULT_GROUP_SWAP_MIN_FREQ_GAIN;
++    g_strategyConfig.groupSwapLocalWatermarkRatio = DEFAULT_GROUP_SWAP_LOCAL_WATERMARK_RATIO;
+     g_strategyConfig.migrateMode = DEFAULT_MIGRATE_MODE;
+     g_strategyConfig.migrateModeChanged = false;
+     g_strategyConfig.zeroFreqMigrateEnable = true;
+@@ -707,6 +742,7 @@ static int32_t InitStrategyConfigFileBuffer(char strategyDefaultConfig[STRATEGY_
+         { "smap.group.swap.ratio = %d\n", DEFAULT_GROUP_SWAP_RATIO },
+         { "smap.group.swap.min.remote.freq = %d\n", DEFAULT_GROUP_SWAP_MIN_REMOTE_FREQ },
+         { "smap.group.swap.min.freq.gain = %d\n", DEFAULT_GROUP_SWAP_MIN_FREQ_GAIN },
++        { "smap.group.swap.local.watermark.ratio = %d\n", DEFAULT_GROUP_SWAP_LOCAL_WATERMARK_RATIO },
+         { "smap.migrate.mode = %d\n", DEFAULT_MIGRATE_MODE },
+     };
+     size_t numConfigs = sizeof(configs) / sizeof(configs[0]);
+@@ -808,6 +844,7 @@ static bool UpdateStrategyConfigChanged(void)
+     uint32_t oldScanPeriod, oldMigratePeriod, oldRemoteHotThreshold, scanPeriod, migratePeriod, remoteHotThreshold;
+     uint32_t oldRemoteFreqPercentile, oldSlowThreshold, remoteFreqPercentile, slowThreshold;
+     uint32_t oldGroupSwapRatio, oldGroupSwapMinRemoteFreq, oldGroupSwapMinFreqGain;
++    uint32_t oldGroupSwapLocalWatermarkRatio, groupSwapLocalWatermarkRatio;
+     uint32_t oldMigrateMode, groupSwapRatio, groupSwapMinRemoteFreq, groupSwapMinFreqGain, migrateMode;
+     uint64_t oldFreqWt, freqWt;
+     bool oldZeroFreqMigrateEnable, zeroFreqMigrateEnable;
+@@ -828,6 +865,7 @@ static bool UpdateStrategyConfigChanged(void)
+     oldGroupSwapRatio = g_strategyConfig.groupSwapRatio;
+     oldGroupSwapMinRemoteFreq = g_strategyConfig.groupSwapMinRemoteFreq;
+     oldGroupSwapMinFreqGain = g_strategyConfig.groupSwapMinFreqGain;
++    oldGroupSwapLocalWatermarkRatio = g_strategyConfig.groupSwapLocalWatermarkRatio;
+     oldMigrateMode = g_strategyConfig.migrateMode;
+     oldZeroFreqMigrateEnable = g_strategyConfig.zeroFreqMigrateEnable;
+     oldAdaptiveRatioEnable = g_strategyConfig.adaptiveRatioEnable;
+@@ -841,6 +879,7 @@ static bool UpdateStrategyConfigChanged(void)
+     groupSwapRatio = g_tmpStrategyConfig.groupSwapRatio;
+     groupSwapMinRemoteFreq = g_tmpStrategyConfig.groupSwapMinRemoteFreq;
+     groupSwapMinFreqGain = g_tmpStrategyConfig.groupSwapMinFreqGain;
++    groupSwapLocalWatermarkRatio = g_tmpStrategyConfig.groupSwapLocalWatermarkRatio;
+     migrateMode = g_tmpStrategyConfig.migrateMode;
+     zeroFreqMigrateEnable = g_tmpStrategyConfig.zeroFreqMigrateEnable;
+     adaptiveRatioEnable = g_tmpStrategyConfig.adaptiveRatioEnable;
+@@ -849,8 +888,8 @@ static bool UpdateStrategyConfigChanged(void)
+         oldRemoteHotThreshold == remoteHotThreshold && oldRemoteFreqPercentile == remoteFreqPercentile &&
+         oldSlowThreshold == slowThreshold && oldFreqWt == freqWt && oldGroupSwapRatio == groupSwapRatio &&
+         oldGroupSwapMinRemoteFreq == groupSwapMinRemoteFreq && oldGroupSwapMinFreqGain == groupSwapMinFreqGain &&
+-        oldMigrateMode == migrateMode && oldZeroFreqMigrateEnable == zeroFreqMigrateEnable &&
+-        oldAdaptiveRatioEnable == adaptiveRatioEnable) {
++        oldGroupSwapLocalWatermarkRatio == groupSwapLocalWatermarkRatio && oldMigrateMode == migrateMode &&
++        oldZeroFreqMigrateEnable == zeroFreqMigrateEnable && oldAdaptiveRatioEnable == adaptiveRatioEnable) {
+         return false;
+     }
+ 
+@@ -890,6 +929,11 @@ static bool UpdateStrategyConfigChanged(void)
+         SMAP_LOGGER_INFO("Start update group swap min freq gain from config to %u.", groupSwapMinFreqGain);
+     }
+ 
++    if (oldGroupSwapLocalWatermarkRatio != groupSwapLocalWatermarkRatio) {
++        SMAP_LOGGER_INFO("Start update group swap local watermark ratio from config to %u.",
++                         groupSwapLocalWatermarkRatio);
++    }
++
+     if (oldMigrateMode != migrateMode) {
+         g_tmpStrategyConfig.migrateModeChanged = true;
+         SMAP_LOGGER_INFO("Start update migrate mode from config to %u.", migrateMode);
+diff --git a/plugins/smap/src/user/strategy/strategy_config.h b/plugins/smap/src/user/strategy/strategy_config.h
+index 5a71be9..49acd12 100644
+--- a/plugins/smap/src/user/strategy/strategy_config.h
++++ b/plugins/smap/src/user/strategy/strategy_config.h
+@@ -51,6 +51,8 @@ uint32_t GetGroupSwapMinRemoteFreqConfig(void);
+ 
+ uint32_t GetGroupSwapMinFreqGainConfig(void);
+ 
++uint32_t GetGroupSwapLocalWatermarkRatioConfig(void);
++
+ bool GetZeroFreqMigrateEnableConfig(void);
+ 
+ bool GetAdaptiveRatioEnableConfig(void);
+diff --git a/plugins/smap/test/user/strategy/test_grouped_strategy.cpp b/plugins/smap/test/user/strategy/test_grouped_strategy.cpp
+index 38c6c85..720fb6c 100644
+--- a/plugins/smap/test/user/strategy/test_grouped_strategy.cpp
++++ b/plugins/smap/test/user/strategy/test_grouped_strategy.cpp
+@@ -525,6 +525,65 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySwapAfterStableRounds)
+     process.scanAttr.actcData[4] = remotePages;
+     process.scanAttr.actcLen[4] = 2;
+ 
++    MOCKER(GetGroupSwapLocalWatermarkRatioConfig).stubs().will(returnValue((uint32_t)100));
++
++    EXPECT_EQ(0, GroupedMigrationStrategy(&process, mlist));
++    EXPECT_EQ(0, mlist[4][0].nr);
++    EXPECT_EQ(0, mlist[0][4].nr);
++
++    MOCKER(GetNrFreeHugePagesByNode).stubs().will(returnValue((uint64_t)10));
++    MOCKER(GetGroupSwapRatioConfig).stubs().will(returnValue((uint32_t)5));
++    MOCKER(GetGroupSwapMinRemoteFreqConfig).stubs().will(returnValue((uint32_t)0));
++    MOCKER(GetGroupSwapMinFreqGainConfig).stubs().will(returnValue((uint32_t)0));
++
++    EXPECT_EQ(0, GroupedMigrationStrategy(&process, mlist));
++    EXPECT_EQ(0, mlist[4][0].nr);
++    EXPECT_EQ(0, mlist[0][4].nr);
++
++    EXPECT_EQ(0, GroupedMigrationStrategy(&process, mlist));
++    EXPECT_EQ(1, mlist[4][0].nr);
++    EXPECT_EQ(0x4000, mlist[4][0].addr[0]);
++    EXPECT_EQ(1, mlist[0][4].nr);
++    EXPECT_EQ(0x1000, mlist[0][4].addr[0]);
++
++    FreeMigList(mlist);
++}
++
++TEST_F(GroupedStrategyTest, TestGroupedStrategySwapUsesLocalWatermarkRatio)
++{
++    ProcessAttr process = {};
++    struct MigList mlist[MAX_NODES][MAX_NODES] = {};
++    ActcData localPages[95] = {};
++    ActcData remotePages[1] = {};
++
++    process.pid = 116;
++    process.enableSwap = true;
++    process.separateParam.maxMigrate = 10;
++    process.separateParam.freqWt = 1;
++    process.separateParam.slowThred = 1;
++    process.groupPolicy.enabled = true;
++    process.groupPolicy.groupCount = 1;
++    process.groupPolicy.groups[0].localCount = 1;
++    process.groupPolicy.groups[0].locals[0].nid = 0;
++    process.groupPolicy.groups[0].locals[0].localReservePages = 100;
++    process.groupPolicy.groups[0].targetCount = 1;
++    process.groupPolicy.groups[0].targets[0].nid = 4;
++    process.groupPolicy.groups[0].targets[0].quotaPages = 10;
++    process.groupPolicy.groups[0].targets[0].usedPages = 1;
++
++    for (uint64_t i = 0; i < 95; i++) {
++        localPages[i].addr = 0x1000 + i;
++        localPages[i].freq = 1;
++    }
++    process.scanAttr.actcData[0] = localPages;
++    process.scanAttr.actcLen[0] = 95;
++    remotePages[0].addr = 0x4000;
++    remotePages[0].freq = 10;
++    process.scanAttr.actcData[4] = remotePages;
++    process.scanAttr.actcLen[4] = 1;
++
++    MOCKER(GetGroupSwapLocalWatermarkRatioConfig).stubs().will(returnValue((uint32_t)95));
++
+     EXPECT_EQ(0, GroupedMigrationStrategy(&process, mlist));
+     EXPECT_EQ(0, mlist[4][0].nr);
+     EXPECT_EQ(0, mlist[0][4].nr);
+@@ -534,6 +593,10 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySwapAfterStableRounds)
+     MOCKER(GetGroupSwapMinRemoteFreqConfig).stubs().will(returnValue((uint32_t)0));
+     MOCKER(GetGroupSwapMinFreqGainConfig).stubs().will(returnValue((uint32_t)0));
+ 
++    EXPECT_EQ(0, GroupedMigrationStrategy(&process, mlist));
++    EXPECT_EQ(0, mlist[4][0].nr);
++    EXPECT_EQ(0, mlist[0][4].nr);
++
+     EXPECT_EQ(0, GroupedMigrationStrategy(&process, mlist));
+     EXPECT_EQ(1, mlist[4][0].nr);
+     EXPECT_EQ(0x4000, mlist[4][0].addr[0]);
+@@ -543,6 +606,103 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySwapAfterStableRounds)
+     FreeMigList(mlist);
+ }
+ 
++TEST_F(GroupedStrategyTest, TestGroupedStrategySwapWaitsForStableTotalPages)
++{
++    ProcessAttr process = {};
++    struct MigList mlist[MAX_NODES][MAX_NODES] = {};
++    ActcData localPages[2] = {};
++    ActcData remotePages[2] = {};
++
++    process.pid = 118;
++    process.enableSwap = true;
++    process.separateParam.maxMigrate = 10;
++    process.separateParam.freqWt = 1;
++    process.separateParam.slowThred = 1;
++    process.groupPolicy.enabled = true;
++    process.groupPolicy.groupCount = 1;
++    process.groupPolicy.groups[0].localCount = 1;
++    process.groupPolicy.groups[0].locals[0].nid = 0;
++    process.groupPolicy.groups[0].locals[0].localReservePages = 2;
++    process.groupPolicy.groups[0].targetCount = 1;
++    process.groupPolicy.groups[0].targets[0].nid = 4;
++    process.groupPolicy.groups[0].targets[0].quotaPages = 10;
++    process.groupPolicy.groups[0].targets[0].usedPages = 1;
++
++    localPages[0].addr = 0x1000;
++    localPages[0].freq = 1;
++    localPages[1].addr = 0x2000;
++    localPages[1].freq = 2;
++    process.scanAttr.actcData[0] = localPages;
++    process.scanAttr.actcLen[0] = 2;
++    remotePages[0].addr = 0x4000;
++    remotePages[0].freq = 10;
++    remotePages[1].addr = 0x5000;
++    remotePages[1].freq = 8;
++    process.scanAttr.actcData[4] = remotePages;
++    process.scanAttr.actcLen[4] = 1;
++
++    MOCKER(GetGroupSwapLocalWatermarkRatioConfig).stubs().will(returnValue((uint32_t)100));
++    MOCKER(GetNrFreeHugePagesByNode).stubs().will(returnValue((uint64_t)10));
++    MOCKER(GetGroupSwapRatioConfig).stubs().will(returnValue((uint32_t)5));
++    MOCKER(GetGroupSwapMinRemoteFreqConfig).stubs().will(returnValue((uint32_t)0));
++    MOCKER(GetGroupSwapMinFreqGainConfig).stubs().will(returnValue((uint32_t)0));
++
++    EXPECT_EQ(0, GroupedMigrationStrategy(&process, mlist));
++    EXPECT_EQ(0, mlist[4][0].nr);
++    EXPECT_EQ(0, mlist[0][4].nr);
++
++    process.scanAttr.actcLen[4] = 2;
++    EXPECT_EQ(0, GroupedMigrationStrategy(&process, mlist));
++    EXPECT_EQ(0, mlist[4][0].nr);
++    EXPECT_EQ(0, mlist[0][4].nr);
++
++    EXPECT_EQ(0, GroupedMigrationStrategy(&process, mlist));
++    EXPECT_EQ(0, mlist[4][0].nr);
++    EXPECT_EQ(0, mlist[0][4].nr);
++
++    EXPECT_EQ(0, GroupedMigrationStrategy(&process, mlist));
++    EXPECT_EQ(1, mlist[4][0].nr);
++    EXPECT_EQ(0x4000, mlist[4][0].addr[0]);
++    EXPECT_EQ(1, mlist[0][4].nr);
++    EXPECT_EQ(0x1000, mlist[0][4].addr[0]);
++
++    FreeMigList(mlist);
++}
++
++TEST_F(GroupedStrategyTest, TestGroupedStrategySwapBelowLocalWatermarkRatio)
++{
++    ProcessAttr process = {};
++    struct MigList mlist[MAX_NODES][MAX_NODES] = {};
++    ActcData localPages[94] = {};
++    ActcData remotePages[1] = {};
++
++    process.pid = 117;
++    process.enableSwap = true;
++    process.groupPolicy.enabled = true;
++    process.groupPolicy.groupCount = 1;
++    process.groupPolicy.groups[0].localCount = 1;
++    process.groupPolicy.groups[0].locals[0].nid = 0;
++    process.groupPolicy.groups[0].locals[0].localReservePages = 100;
++    process.groupPolicy.groups[0].targetCount = 1;
++    process.groupPolicy.groups[0].targets[0].nid = 4;
++    process.groupPolicy.groups[0].targets[0].quotaPages = 10;
++    process.groupPolicy.groups[0].targets[0].usedPages = 1;
++
++    process.scanAttr.actcData[0] = localPages;
++    process.scanAttr.actcLen[0] = 94;
++    remotePages[0].addr = 0x4000;
++    remotePages[0].freq = 10;
++    process.scanAttr.actcData[4] = remotePages;
++    process.scanAttr.actcLen[4] = 1;
++
++    MOCKER(GetGroupSwapLocalWatermarkRatioConfig).stubs().will(returnValue((uint32_t)95));
++
++    EXPECT_EQ(0, GroupedMigrationStrategy(&process, mlist));
++    EXPECT_EQ(0, GroupedMigrationStrategy(&process, mlist));
++    EXPECT_EQ(0, mlist[4][0].nr);
++    EXPECT_EQ(0, mlist[0][4].nr);
++}
++
+ TEST_F(GroupedStrategyTest, TestGroupedStrategySwapDisabled)
+ {
+     ProcessAttr process = {};
+@@ -571,6 +731,8 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySwapDisabled)
+     process.scanAttr.actcData[4] = remotePages;
+     process.scanAttr.actcLen[4] = 1;
+ 
++    MOCKER(GetGroupSwapLocalWatermarkRatioConfig).stubs().will(returnValue((uint32_t)100));
++
+     EXPECT_EQ(0, GroupedMigrationStrategy(&process, mlist));
+     EXPECT_EQ(0, GroupedMigrationStrategy(&process, mlist));
+     EXPECT_EQ(0, mlist[4][0].nr);
+@@ -615,6 +777,8 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySwapSkipsSharedTarget)
+     process.scanAttr.actcData[4] = remotePages;
+     process.scanAttr.actcLen[4] = 1;
+ 
++    MOCKER(GetGroupSwapLocalWatermarkRatioConfig).stubs().will(returnValue((uint32_t)100));
++
+     EXPECT_EQ(0, GroupedMigrationStrategy(&process, mlist));
+     EXPECT_EQ(0, GroupedMigrationStrategy(&process, mlist));
+     EXPECT_EQ(0, mlist[4][0].nr);
+@@ -652,6 +816,7 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySwapRequiresHotColdGap)
+     process.scanAttr.actcData[4] = remotePages;
+     process.scanAttr.actcLen[4] = 1;
+ 
++    MOCKER(GetGroupSwapLocalWatermarkRatioConfig).stubs().will(returnValue((uint32_t)100));
+     MOCKER(GetNrFreeHugePagesByNode).stubs().will(returnValue((uint64_t)10));
+     MOCKER(GetGroupSwapRatioConfig).stubs().will(returnValue((uint32_t)5));
+     MOCKER(GetGroupSwapMinRemoteFreqConfig).stubs().will(returnValue((uint32_t)0));
+diff --git a/plugins/smap/test/user/strategy/test_strategy_config.cpp b/plugins/smap/test/user/strategy/test_strategy_config.cpp
+index f62185f..f69dbbf 100644
+--- a/plugins/smap/test/user/strategy/test_strategy_config.cpp
++++ b/plugins/smap/test/user/strategy/test_strategy_config.cpp
+@@ -48,6 +48,7 @@ typedef struct {
+     uint32_t groupSwapRatio;
+     uint32_t groupSwapMinRemoteFreq;
+     uint32_t groupSwapMinFreqGain;
++    uint32_t groupSwapLocalWatermarkRatio;
+     uint32_t migrateMode;
+     bool migrateModeChanged;
+     bool zeroFreqMigrateEnable;
+@@ -138,6 +139,14 @@ TEST_F(PeriodConfigTest, GetGroupSwapMinFreqGainConfigTest)
+     EXPECT_EQ(3, ret);
+ }
+ 
++extern "C" uint32_t GetGroupSwapLocalWatermarkRatioConfig(void);
++TEST_F(PeriodConfigTest, GetGroupSwapLocalWatermarkRatioConfigTest)
++{
++    g_strategyConfig.groupSwapLocalWatermarkRatio = 95;
++    uint32_t ret = GetGroupSwapLocalWatermarkRatioConfig();
++    EXPECT_EQ(95, ret);
++}
++
+ extern "C" uint32_t GetMigrateModeConfig(void);
+ TEST_F(PeriodConfigTest, GetMigrateModeConfigTest)
+ {
+@@ -471,6 +480,28 @@ TEST_F(PeriodConfigTest, ConfigGroupSwapMinFreqGainTest)
+     EXPECT_EQ(3, g_tmpStrategyConfig.groupSwapMinFreqGain);
+ }
+ 
++extern "C" int32_t ConfigGroupSwapLocalWatermarkRatio(char *substr, char *value);
++TEST_F(PeriodConfigTest, ConfigGroupSwapLocalWatermarkRatioTest)
++{
++    char *substr = "smap.group.swap.local.watermark.ratio";
++    char *value = "101";
++    MOCKER(ConfigReadValueToInt).stubs().will(returnValue(-1));
++    int32_t ret = ConfigGroupSwapLocalWatermarkRatio(substr, value);
++    EXPECT_EQ(-1, ret);
++
++    g_tmpStrategyConfig.groupSwapLocalWatermarkRatio = 101;
++    GlobalMockObject::verify();
++    ret = ConfigGroupSwapLocalWatermarkRatio(substr, value);
++    EXPECT_EQ(RETURN_ERROR, ret);
++    EXPECT_EQ(101, g_tmpStrategyConfig.groupSwapLocalWatermarkRatio);
++
++    GlobalMockObject::verify();
++    char *value1 = "95";
++    ret = ConfigGroupSwapLocalWatermarkRatio(substr, value1);
++    EXPECT_EQ(0, ret);
++    EXPECT_EQ(95, g_tmpStrategyConfig.groupSwapLocalWatermarkRatio);
++}
++
+ TEST_F(PeriodConfigTest, ConfigFileConfSwitchTest)
+ {
+     char* substr = "test";
+@@ -544,7 +575,7 @@ TEST_F(PeriodConfigTest, PeriodConfigReviewTest)
+     int32_t ret = StrategyConfigReview();
+     EXPECT_EQ(-1, ret);
+ 
+-    uint32_t num = 13;
++    uint32_t num = 14;
+     for (int i = 0; i < num; i++) {
+         g_strategyConfigRead[i].needCfg = 2UL;
+         g_strategyConfigRead[i].realCfg = 2UL;
+@@ -587,6 +618,7 @@ TEST_F(PeriodConfigTest, InitPeriodConfigTest)
+     EXPECT_EQ(1, g_strategyConfig.groupSwapRatio);
+     EXPECT_EQ(0, g_strategyConfig.groupSwapMinRemoteFreq);
+     EXPECT_EQ(0, g_strategyConfig.groupSwapMinFreqGain);
++    EXPECT_EQ(95, g_strategyConfig.groupSwapLocalWatermarkRatio);
+     EXPECT_EQ(1, g_strategyConfig.migrateMode);
+     EXPECT_EQ(false, g_strategyConfig.migrateModeChanged);
+     EXPECT_EQ(true, g_strategyConfig.zeroFreqMigrateEnable);
+@@ -634,6 +666,7 @@ TEST_F(PeriodConfigTest, TestUpdatePeriodConfigChangedNoChange)
+     g_strategyConfig.groupSwapRatio = 1;
+     g_strategyConfig.groupSwapMinRemoteFreq = 5;
+     g_strategyConfig.groupSwapMinFreqGain = 3;
++    g_strategyConfig.groupSwapLocalWatermarkRatio = 95;
+     g_strategyConfig.migrateMode = 1;
+     g_strategyConfig.zeroFreqMigrateEnable = true;
+     g_strategyConfig.adaptiveRatioEnable = true;
+@@ -646,6 +679,7 @@ TEST_F(PeriodConfigTest, TestUpdatePeriodConfigChangedNoChange)
+     g_tmpStrategyConfig.groupSwapRatio = 1;
+     g_tmpStrategyConfig.groupSwapMinRemoteFreq = 5;
+     g_tmpStrategyConfig.groupSwapMinFreqGain = 3;
++    g_tmpStrategyConfig.groupSwapLocalWatermarkRatio = 95;
+     g_tmpStrategyConfig.migrateMode = 1;
+     g_tmpStrategyConfig.zeroFreqMigrateEnable = true;
+     g_tmpStrategyConfig.adaptiveRatioEnable = true;
+-- 
+2.53.0.windows.3
+

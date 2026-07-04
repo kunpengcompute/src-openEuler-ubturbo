@@ -1,0 +1,26 @@
+From 57d1ea1741eaec7fd0c2d157d6d2368364a572ac Mon Sep 17 00:00:00 2001
+From: woquzhao12138 <1825369014@qq.com>
+Date: Tue, 9 Jun 2026 17:42:03 +0800
+Subject: [PATCH 22/71] feat(smap): The maximum SMAP migration period is
+ changed to 300s
+
+---
+ plugins/smap/src/user/strategy/strategy_config.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/plugins/smap/src/user/strategy/strategy_config.h b/plugins/smap/src/user/strategy/strategy_config.h
+index 317540b..a9c7ea4 100644
+--- a/plugins/smap/src/user/strategy/strategy_config.h
++++ b/plugins/smap/src/user/strategy/strategy_config.h
+@@ -23,7 +23,7 @@ extern "C" {
+ #define DEFAULT_SCAN_PERIOD 200
+ #define MIN_SCAN_PERIOD 50
+ 
+-#define MAX_MIGRATE_PERIOD 60000
++#define MAX_MIGRATE_PERIOD 300000
+ #define DEFAULT_MIGRATE_PERIOD 2000
+ #define MIN_MIGRATE_PERIOD 500
+ 
+-- 
+2.53.0.windows.3
+

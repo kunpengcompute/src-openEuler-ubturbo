@@ -1,0 +1,77 @@
+From 2e4a59b35667825a44ba577e4bcf8fe56c0c57dd Mon Sep 17 00:00:00 2001
+From: davidhwang <huangdewei@huawei.com>
+Date: Sat, 13 Jun 2026 11:12:44 +0800
+Subject: [PATCH 25/71] =?UTF-8?q?fix(rmrs):=20=E5=A2=9E=E5=8A=A0=E7=A9=BA?=
+ =?UTF-8?q?=E6=8C=87=E9=92=88=E6=A3=80=E6=9F=A5=E5=B9=B6=E4=BF=AE=E5=A4=8D?=
+ =?UTF-8?q?=E5=BE=AA=E7=8E=AF=E5=8F=98=E9=87=8F=E7=B1=BB=E5=9E=8B?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- 在 RmrsInStream 构造函数中增加对空指针和零长度的检查
+- 修复 ParseCPUList 中循环变量类型不匹配的问题
+- 在 LibvirtHelper 中增加对 VirConnectOpen 函数指针的判空检查
+---
+ plugins/rmrs/src/include/rmrs_serialize.h                 | 5 +++++
+ .../export/libvirt_helper/rmrs_libvirt_helper.cpp         | 8 +++++++-
+ .../ubturbo_plugin/export/os_helper/rmrs_os_helper.cpp    | 2 +-
+ 3 files changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/plugins/rmrs/src/include/rmrs_serialize.h b/plugins/rmrs/src/include/rmrs_serialize.h
+index 8b2d21c..93ffc0b 100644
+--- a/plugins/rmrs/src/include/rmrs_serialize.h
++++ b/plugins/rmrs/src/include/rmrs_serialize.h
+@@ -12,6 +12,7 @@
+ 
+ #ifndef RMRS_SERIALIZE_UTIL_H
+ #define RMRS_SERIALIZE_UTIL_H
++#include <algorithm>
+ #include <cstring>
+ #include <iostream>
+ #include <map>
+@@ -147,6 +148,10 @@ public:
+     RmrsInStream(const std::string &s) : inStream(s) {}
+     RmrsInStream(const uint8_t *s, size_t len)
+     {
++        if (s == nullptr || len == 0) {
++            mFlag = false;
++            return;
++        }
+         inStream = std::string(reinterpret_cast<const char *>(s), len);
+     }
+     template <typename T>
+diff --git a/plugins/rmrs/src/ubturbo_plugin/export/libvirt_helper/rmrs_libvirt_helper.cpp b/plugins/rmrs/src/ubturbo_plugin/export/libvirt_helper/rmrs_libvirt_helper.cpp
+index 5d97d29..f79a09a 100644
+--- a/plugins/rmrs/src/ubturbo_plugin/export/libvirt_helper/rmrs_libvirt_helper.cpp
++++ b/plugins/rmrs/src/ubturbo_plugin/export/libvirt_helper/rmrs_libvirt_helper.cpp
+@@ -46,7 +46,13 @@ uint32_t LibvirtHelper::Connect()
+     try {
+         UBTURBO_LOG_INFO(RMRS_MODULE_NAME, RMRS_MODULE_CODE)
+             << "[RmrsResourceExport] [LibvirtHelper] Start to get libvirt connection.";
+-        virConnect = LibvirtModule::VirConnectOpen()("qemu:///system");
++        auto virConnectOpenFunc = LibvirtModule::VirConnectOpen();
++        if (virConnectOpenFunc == nullptr) {
++            UBTURBO_LOG_ERROR(RMRS_MODULE_NAME, RMRS_MODULE_CODE)
++                << "[RmrsResourceExport] [LibvirtHelper] Get VirConnectOpen function failed.";
++            return RMRS_ERROR;
++        }
++        virConnect = virConnectOpenFunc("qemu:///system");
+         if (virConnect == nullptr) {
+             UBTURBO_LOG_ERROR(RMRS_MODULE_NAME, RMRS_MODULE_CODE)
+                 << "[RmrsResourceExport] [LibvirtHelper] Libvirt conn "
+diff --git a/plugins/rmrs/src/ubturbo_plugin/export/os_helper/rmrs_os_helper.cpp b/plugins/rmrs/src/ubturbo_plugin/export/os_helper/rmrs_os_helper.cpp
+index aaa45ed..6315c6d 100644
+--- a/plugins/rmrs/src/ubturbo_plugin/export/os_helper/rmrs_os_helper.cpp
++++ b/plugins/rmrs/src/ubturbo_plugin/export/os_helper/rmrs_os_helper.cpp
+@@ -452,7 +452,7 @@ vector<uint16_t> OsHelper::ParseCPUList(const string &line)
+         if (dashPos != string::npos) {
+             auto start = RmrsStringUtil::SafeStou16(token.substr(0, dashPos));
+             auto end = RmrsStringUtil::SafeStou16(token.substr(dashPos + 1));
+-            for (auto i = start; i <= end; ++i) {
++            for (uint32_t i = start; i <= static_cast<uint32_t>(end); ++i) {
+                 cpus.push_back(i);
+             }
+         } else {
+-- 
+2.53.0.windows.3
+

@@ -1,0 +1,56 @@
+From dd2daa558aa94eb747a5bd4a6561c4606817cd79 Mon Sep 17 00:00:00 2001
+From: jamesricado <825511311@qq.com>
+Date: Tue, 16 Jun 2026 11:05:38 +0800
+Subject: [PATCH 36/71] fix:bugfix page pin
+
+---
+ plugins/ubdma/src/urma.c | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/plugins/ubdma/src/urma.c b/plugins/ubdma/src/urma.c
+index 026d079..fe9718a 100644
+--- a/plugins/ubdma/src/urma.c
++++ b/plugins/ubdma/src/urma.c
+@@ -45,6 +45,17 @@ const struct ubcore_seg_cfg default_seg_cfg = {
+ 	.flag.bs.pa = false,
+ };
+ 
++const struct ubcore_seg_cfg seg_pin_cfg = {
++	.flag.bs.token_policy = UBCORE_TOKEN_NONE,
++	.flag.bs.cacheable = UBCORE_CACHEABLE,
++	.flag.bs.dsva = false,
++	.flag.bs.access = UBCORE_ACCESS_READ | UBCORE_ACCESS_WRITE,
++	.flag.bs.non_pin = false,
++	.flag.bs.user_iova = false,
++	.flag.bs.token_id_valid = false,
++	.flag.bs.pa = false,
++};
++
+ const struct ubcore_jfc_cfg default_jfc_cfg = {
+ 	.depth = UB_DMA_JETTY_DEPTH,
+ 	.flag.bs.lock_free = false,
+@@ -238,8 +249,12 @@ int urma_register_tmp_segment(struct urma_trans_segment_info *info,
+ {
+ 	struct ubcore_target_seg *sge;
+ 	struct ubcore_target_seg *i_seg;
++	struct ubcore_seg_cfg cfg = seg_pin_cfg;
++	cfg.va = info->addr;
++	cfg.len = info->len;
++	cfg.eid_index = g_urma_jetty->eid_info.eid_index;
+ 
+-	sge = init_segment(info->addr, info->len, g_urma_jetty);
++	sge = ubcore_register_seg(g_urma_jetty->dev, &cfg, NULL);
+ 	if (IS_ERR_OR_NULL(sge)) {
+ 		ub_dma_log_err(
+ 			"urma register trans segment failed to init seg\n");
+@@ -491,6 +506,7 @@ free_cr:
+ 	kfree(g_urma_jetty->cr);
+ free_trans:
+ 	kfree(g_urma_jetty);
++	g_urma_jetty = NULL;
+ err_unregister:
+ 	ubcore_unregister_client(&urma_ubcore_client);
+ 	return ret;
+-- 
+2.53.0.windows.3
+

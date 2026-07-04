@@ -1,0 +1,164 @@
+From d65a243edc0146c7c11d934ef4bb5d3f078a1e80 Mon Sep 17 00:00:00 2001
+From: dszhu <2549951418@qq.com>
+Date: Tue, 30 Jun 2026 14:45:59 +0800
+Subject: [PATCH 68/71] =?UTF-8?q?=E4=BF=AE=E5=A4=8Dsmap=E7=A1=AC=E4=BB=B6?=
+ =?UTF-8?q?=E6=89=AB=E6=8F=8F=E8=BF=9C=E7=AB=AF=E5=86=85=E5=AD=98=E4=BF=A1?=
+ =?UTF-8?q?=E6=81=AF=E6=9C=AA=E6=9B=B4=E6=96=B0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ plugins/smap/src/drivers/access_ioctl.c  |  6 +++-
+ plugins/smap/src/drivers/hist_ops.c      | 35 ++++++++++++++----------
+ plugins/smap/src/drivers/hist_tracking.c |  2 +-
+ 3 files changed, 26 insertions(+), 17 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/access_ioctl.c b/plugins/smap/src/drivers/access_ioctl.c
+index fe84ebe..74deb59 100644
+--- a/plugins/smap/src/drivers/access_ioctl.c
++++ b/plugins/smap/src/drivers/access_ioctl.c
+@@ -18,6 +18,7 @@
+ #include "access_tracking.h"
+ #include "access_pid.h"
+ #include "access_ioctl.h"
++#include "hist_ops.h"
+ 
+ #undef pr_fmt
+ #define pr_fmt(fmt) "access_ioctl: " fmt
+@@ -524,7 +525,10 @@ static long smap_access_ioctl(struct file *file, unsigned int cmd,
+ 	case SMAP_ACCESS_GET_NR_LOCAL_NUMA:
+ 		return ioctl_get_nr_local_numa(argp);
+ 	case SMAP_ACCESS_REFRESH_REMOTE_RAM:
+-		return refresh_remote_ram();
++		rc = refresh_remote_ram();
++		if (!rc)
++			hist_set_iomem();
++		return rc;
+ 	case SMAP_ACCESS_SET_SCAN_CPU:
+ 		return ioctl_set_scan_cpu(argp);
+ 	default:
+diff --git a/plugins/smap/src/drivers/hist_ops.c b/plugins/smap/src/drivers/hist_ops.c
+index 1641a21..ea0aaed 100644
+--- a/plugins/smap/src/drivers/hist_ops.c
++++ b/plugins/smap/src/drivers/hist_ops.c
+@@ -27,6 +27,9 @@
+ #include "hist_tracking.h"
+ #include "hist_ops.h"
+ 
++#undef pr_fmt
++#define pr_fmt(fmt) "hist_ops: " fmt
++
+ #define HOT_WINDOW_RATIO (10)
+ #define SCAN_INTERVAL_RANGE_US 1000
+ 
+@@ -114,7 +117,8 @@ MODULE_PARM_DESC(hist_scan_duration_per_win,
+  * - Validate the value is positive
+  * - Update the global scan duration per window
+  */
+-static int hist_scan_duration_per_win_set(const char *val, const struct kernel_param *kp)
++static int hist_scan_duration_per_win_set(const char *val,
++					  const struct kernel_param *kp)
+ {
+ 	unsigned int new_duration;
+ 	int ret;
+@@ -452,7 +456,7 @@ static int generate_aligned_scan_wins_info(struct segs_info *win_info,
+  * Filter windows by BA tag and store qualified 4k windows back to win_info->segs
+  * @win_info: Windows set information structure containing all 4k scan windows
+  * @max_wins_4k_per_ba: Maximum 4k scan windows to keep per BA
+- * Return 0 on success, negative error code on failure 
++ * Return 0 on success, negative error code on failure
+  */
+ static int filter_4k_scan_hot_wins(struct segs_info *win_info,
+ 				   u32 max_wins_4k_per_ba)
+@@ -831,7 +835,13 @@ static int smap_hist_read_paral(struct segs_info *win_info,
+ 	 * - Other modes: start from -1 (scan from beginning)
+ 	 */
+ 	for (i = 0; i < dev->ba_cnt; ++i) {
+-		offset[i] = do_4k_seq_loop ? dev->seq_loop_ba_offset[i] : -1;
++		/* 越界保护 */
++		if (do_4k_seq_loop)
++			offset[i] = (dev->seq_loop_ba_offset[i] < win_info->cnt)
++					    ? dev->seq_loop_ba_offset[i]
++					    : -1;
++		else
++			offset[i] = -1;
+ 	}
+ 
+ 	while (1) {
+@@ -891,11 +901,11 @@ static int smap_hist_read_paral(struct segs_info *win_info,
+ 			}
+ 		}
+ 		/* Check abort_flag after saving scanned data */
+-		if (dev->abort_flag) {
++		if (ret == -EAGAIN) {
+ 			pr_debug("hist scan paused\n");
+ 			kfree(ba_result);
+ 			kfree(offset);
+-			return -EAGAIN;
++			return ret;
+ 		}
+ 		cond_resched();
+ 	}
+@@ -1109,7 +1119,7 @@ static int addr_segs_init(struct smap_hist_dev *dev, u32 pgsize)
+ 		dev->info.segs = NULL;
+ 		dev->pgcount = 0;
+ 		dev->pgsize = pgsize;
+-		pr_info("no page passed to address segment init\n");
++		pr_debug("no page passed to address segment init\n");
+ 		return 0;
+ 	}
+ 	tmp_addr_segs = vzalloc(nr_segs * sizeof(struct addr_seg));
+@@ -1139,7 +1149,7 @@ static int addr_segs_init(struct smap_hist_dev *dev, u32 pgsize)
+ 	sort(dev->info.segs, dev->info.cnt, sizeof(struct addr_seg),
+ 	     addr_seg_cmp_start, NULL);
+ 	dev->pgcount = pgcount;
+-	pr_info("page count has been updated to %u\n", pgcount);
++	pr_debug("page count has been updated to %u\n", pgcount);
+ 	dev->pgsize = pgsize;
+ 	return 0;
+ }
+@@ -1147,7 +1157,7 @@ static int addr_segs_init(struct smap_hist_dev *dev, u32 pgsize)
+ static void addr_segs_deinit(struct smap_hist_dev *dev)
+ {
+ 	if (dev->info.segs) {
+-		pr_info("deleting addr segs.\n");
++		pr_debug("deleting addr segs.\n");
+ 		vfree(dev->info.segs);
+ 		dev->info.segs = NULL;
+ 		dev->info.cnt = 0;
+@@ -1197,16 +1207,11 @@ static int scan_thread_run(void *data)
+ 		}
+ 		if (dev->status.status_all) {
+ 			u32 pgsize = dev->status.flag.new_pgsize ?: dev->pgsize;
+-			u32 j;
+ 
+-			pr_info("histogram tracking page info has been reinited, status: %#x\n",
++			pr_debug("histogram tracking page info has been reinited, status: %#x\n",
+ 				dev->status.status_all);
+ 
+-			/* Reset sequential loop scan offsets: start from beginning when memory updated or page size changed */
+-			for (j = 0; j < HIST_STS_DEV_CNT; ++j) {
+-				dev->seq_loop_ba_offset[j] = -1;
+-			}
+-
++			/* 由于周期性重建remote_ram_list，不需要重置seq_loop_ba_offset，会导致扫描不到靠后的地址段 */
+ 			ret = hist_pginfo_reinit(dev, pgsize);
+ 			if (ret) {
+ 				pr_err("failed to reinit histogram tracking page info, ret: %d\n",
+diff --git a/plugins/smap/src/drivers/hist_tracking.c b/plugins/smap/src/drivers/hist_tracking.c
+index d89df1d..d1ff840 100644
+--- a/plugins/smap/src/drivers/hist_tracking.c
++++ b/plugins/smap/src/drivers/hist_tracking.c
+@@ -105,7 +105,7 @@ static int actc_buffer_reinit(struct access_tracking_dev *hdev)
+ 	u64 page_count;
+ 	page_count = calc_access_len(hdev);
+ 	if (!page_count) {
+-		pr_info("no page found on node: %d\n", hdev->node);
++		pr_debug("no page found on node: %d\n", hdev->node);
+ 	}
+ 	if (hdev->page_count == page_count) {
+ 		reset_actc_data(hdev);
+-- 
+2.53.0.windows.3
+

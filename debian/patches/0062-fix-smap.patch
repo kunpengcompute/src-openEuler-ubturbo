@@ -1,0 +1,448 @@
+From 8f49829ab7e638bdf1f2eff80319e9bac0fab0b3 Mon Sep 17 00:00:00 2001
+From: jamesricado <825511311@qq.com>
+Date: Wed, 1 Jul 2026 09:31:12 +0800
+Subject: [PATCH 62/71] =?UTF-8?q?fix=EF=BC=9A=E4=BF=AE=E5=A4=8Dsmap?=
+ =?UTF-8?q?=E9=A6=96=E6=AC=A1=E9=AB=98=E9=A2=91=E6=89=AB=E6=8F=8F?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ plugins/smap/src/user/manage/manage.c         |   1 -
+ plugins/smap/src/user/strategy/migration.c    |  84 ++++++-----
+ .../test/user/strategy/test_migration.cpp     | 140 ++++++++++++++++++
+ plugins/smap/test/user/test_interface.cpp     |  75 +++++++++-
+ 4 files changed, 257 insertions(+), 43 deletions(-)
+
+diff --git a/plugins/smap/src/user/manage/manage.c b/plugins/smap/src/user/manage/manage.c
+index e8f3c84..3e08976 100644
+--- a/plugins/smap/src/user/manage/manage.c
++++ b/plugins/smap/src/user/manage/manage.c
+@@ -456,7 +456,6 @@ int VMPreprocess(pid_t pid, ProcessAttr *attr)
+ static void SetBasicProcessConfig(ProcessAttr *attr, ProcessParam *param)
+ {
+     attr->pid = param->pid;
+-    attr->scanTime = param->scanTime;
+     attr->duration = param->duration;
+     attr->scanType = param->scanType;
+     attr->migrateMode = param->numaParam[0].migrateMode;
+diff --git a/plugins/smap/src/user/strategy/migration.c b/plugins/smap/src/user/strategy/migration.c
+index c61bd85..c521a52 100644
+--- a/plugins/smap/src/user/strategy/migration.c
++++ b/plugins/smap/src/user/strategy/migration.c
+@@ -904,12 +904,16 @@ static int UpdateScanTime(ProcessAttr *process)
+     payload.numaNodes = process->numaAttr.numaNodes;
+     payload.type = process->scanType;
+     payload.duration = process->duration;
+-    if (GetFileConfSwitchConfig()) {
+-        payload.scanTime = GetScanPeriodConfig();
++    payload.scanTime = GetFileConfSwitchConfig() ? GetScanPeriodConfig() : process->sceneInfo.cycles.scanCycle;
++    int ret = AccessIoctlAddPid(1, &payload);
++    if (ret) {
++        SMAP_LOGGER_ERROR("Update scan time failed for pid %d, ret=%d.", process->pid, ret);
+     } else {
+-        payload.scanTime = process->sceneInfo.cycles.scanCycle;
++        process->scanTime = payload.scanTime;
++        SMAP_LOGGER_INFO("Update pid %d scan cycle to %dms.", process->pid, payload.scanTime);
+     }
+-    return AccessIoctlAddPid(1, &payload);
++
++    return ret;
+ }
+ 
+ static void UpdateScene(struct ProcessManager *manager)
+@@ -925,6 +929,16 @@ static void UpdateScene(struct ProcessManager *manager)
+     EnvMutexUnlock(&manager->lock);
+ }
+ 
++static inline void HandleHighScan(ProcessAttr *current)
++{
++    int ret = UpdateScanTime(current);
++    if (ret) {
++        SMAP_LOGGER_WARNING("Update scan time failed for pid %d.", current->pid);
++    } else {
++        current->isFirstScan = false;
++    }
++}
++
+ static int HandleScene(ThreadCtx *ctx)
+ {
+     int ret = 0;
+@@ -937,11 +951,15 @@ static int HandleScene(ThreadCtx *ctx)
+         // 更新进程的场景
+         SceneInfo *info = &current->sceneInfo;
+         GetProcessSceneAttr(info->currScene, info, current->type);
+-        if (info->currScene != info->lastScene) {
+-            ret = UpdateScanTime(current);
+-            SMAP_LOGGER_INFO("Update pid %d scan cycle to %dms.", current->pid, current->sceneInfo.cycles.scanCycle);
+-            if (ret) {
+-                SMAP_LOGGER_ERROR("Update scan time failed for pid %d.", current->pid);
++        if (current->isFirstScan) {
++            if (current->walkPage.nrPage == 0) {
++                current->scanTime = DEFAULT_SCAN_PERIOD;
++            } else {
++                HandleHighScan(current);
++            }
++        } else if (info->currScene != info->lastScene) {
++            if (UpdateScanTime(current)) {
++                SMAP_LOGGER_WARNING("Update scan time failed for pid %d.", current->pid);
+             }
+         }
+         scene = current->sceneInfo.currScene;
+@@ -966,49 +984,38 @@ static void UpdateAllProcessScanTime(ThreadCtx *ctx)
+ {
+     int ret;
+     struct ProcessManager *manager = ctx->processManager;
+-    ProcessAttr *current;
++
+     EnvMutexLock(&manager->lock);
+-    current = manager->processes;
+-    while (current) {
+-        // 更新虚机的场景
++    for (ProcessAttr *current = manager->processes; current; current = current->next) {
++        if (current->isFirstScan) {
++            continue;
++        }
+         if (current->scanType == NORMAL_SCAN) {
+             ret = UpdateScanTime(current);
+             if (ret) {
+                 SMAP_LOGGER_WARNING("Update pid %d scan cycle failed, ret=%d.", current->pid, ret);
+             }
+-            SMAP_LOGGER_INFO("Update pid %d scan cycle to %u.", current->pid, GetScanPeriodConfig());
+         }
+-        current = current->next;
+     }
+     EnvMutexUnlock(&manager->lock);
+ }
+ 
+-static void RestoreNewPidScanTime(ThreadCtx *ctx)
++static void RestoreProcessScanTime(ThreadCtx *ctx)
+ {
+     int ret;
+     struct ProcessManager *manager = ctx->processManager;
+-    ProcessAttr *current;
+-    uint32_t scanPeriod;
+-    struct AccessAddPidPayload payload;
+ 
+     EnvMutexLock(&manager->lock);
+-    for (current = manager->processes; current; current = current->next) {
+-        if (!current->isFirstScan) {
+-            continue;
+-        }
+-        scanPeriod = GetFileConfSwitchConfig() ? GetScanPeriodConfig() : current->sceneInfo.cycles.scanCycle;
+-        payload.pid = current->pid;
+-        payload.numaNodes = current->numaAttr.numaNodes;
+-        payload.type = current->scanType;
+-        payload.duration = current->duration;
+-        payload.scanTime = scanPeriod;
+-        ret = AccessIoctlAddPid(1, &payload);
+-        if (ret) {
+-            SMAP_LOGGER_WARNING("Restore pid %d scan cycle failed, ret=%d.", current->pid, ret);
+-        } else {
+-            current->scanTime = scanPeriod;
+-            SMAP_LOGGER_INFO("Restore pid %d scan cycle to %ums.", current->pid, scanPeriod);
+-            current->isFirstScan = false;
++    for (ProcessAttr *current = manager->processes; current; current = current->next) {
++        if (current->isFirstScan) {
++            if (current->walkPage.nrPage == 0) {
++                current->scanTime = DEFAULT_SCAN_PERIOD;
++                SMAP_LOGGER_INFO("Skip pid %d scan cycle restore, nrPages=0, keep high-freq scan.", current->pid);
++                continue;
++            }
++            if (current->scanType == NORMAL_SCAN) {
++                HandleHighScan(current);
++            }
+         }
+     }
+     EnvMutexUnlock(&manager->lock);
+@@ -1020,6 +1027,7 @@ static void UpdatePeriodFromConfig(ThreadCtx *ctx)
+         return;
+     }
+ 
++    RestoreProcessScanTime(ctx);
+     if (GetMigratePeriodChanged()) {
+         SMAP_LOGGER_INFO("Start update migrate period time from config to %u.", GetMigratePeriodConfig());
+         ctx->period = GetMigratePeriodConfig();
+@@ -1080,10 +1088,6 @@ int ScanMigrateWork(ThreadCtx *ctx)
+     }
+     ret = PerformMigration(manager);
+     SMAP_LOGGER_INFO("Migration result: %d.", ret);
+-    // 只在迁移成功时恢复新PID的扫描周期
+-    if (ret == 0) {
+-        RestoreNewPidScanTime(ctx);
+-    }
+ out:
+     RefreshRemoteRam(manager);
+     // 启动扫描
+diff --git a/plugins/smap/test/user/strategy/test_migration.cpp b/plugins/smap/test/user/strategy/test_migration.cpp
+index a5ff198..213c2f7 100644
+--- a/plugins/smap/test/user/strategy/test_migration.cpp
++++ b/plugins/smap/test/user/strategy/test_migration.cpp
+@@ -756,24 +756,164 @@ TEST_F(MigrationTest, TestUpdateAllProcessScanTime)
+     UpdateAllProcessScanTime(&ctx);
+ }
+ 
++extern "C" int HandleScene(ThreadCtx *ctx);
++TEST_F(MigrationTest, TestHandleSceneFirstScanNoPages)
++{
++    struct ProcessManager manager = { 0 };
++    ProcessAttr current = {};
++    ThreadCtx ctx = {};
++    manager.processes = &current;
++    ctx.processManager = &manager;
++    current.next = nullptr;
++    current.isFirstScan = true;
++    current.walkPage.nrPage = 0;
++    current.scanTime = 0;
++
++    MOCKER(EnvMutexLock).stubs().will(ignoreReturnValue());
++    MOCKER(EnvMutexUnlock).stubs().will(ignoreReturnValue());
++
++    int ret = HandleScene(&ctx);
++    EXPECT_EQ(0, ret);
++    EXPECT_EQ(DEFAULT_SCAN_PERIOD, current.scanTime);
++}
++
++TEST_F(MigrationTest, TestHandleSceneFirstScanWithPages)
++{
++    struct ProcessManager manager = { 0 };
++    ProcessAttr current = {};
++    ThreadCtx ctx = {};
++    manager.processes = &current;
++    ctx.processManager = &manager;
++    current.next = nullptr;
++    current.isFirstScan = true;
++    current.walkPage.nrPage = 1;
++    current.scanType = NORMAL_SCAN;
++
++    MOCKER(EnvMutexLock).stubs().will(ignoreReturnValue());
++    MOCKER(EnvMutexUnlock).stubs().will(ignoreReturnValue());
++    MOCKER(UpdateScanTime).stubs().will(returnValue(0));
++
++    int ret = HandleScene(&ctx);
++    EXPECT_EQ(0, ret);
++    EXPECT_FALSE(current.isFirstScan);
++}
++
++TEST_F(MigrationTest, TestHandleSceneFirstScanUpdateScanTimeFail)
++{
++    struct ProcessManager manager = { 0 };
++    ProcessAttr current = {};
++    ThreadCtx ctx = {};
++    manager.processes = &current;
++    ctx.processManager = &manager;
++    current.next = nullptr;
++    current.isFirstScan = true;
++    current.walkPage.nrPage = 1;
++    current.scanType = NORMAL_SCAN;
++
++    MOCKER(EnvMutexLock).stubs().will(ignoreReturnValue());
++    MOCKER(EnvMutexUnlock).stubs().will(ignoreReturnValue());
++    MOCKER(UpdateScanTime).stubs().will(returnValue(-1));
++
++    int ret = HandleScene(&ctx);
++    EXPECT_EQ(0, ret);
++    EXPECT_TRUE(current.isFirstScan);
++}
++
++TEST_F(MigrationTest, TestUpdateAllProcessScanTimeFirstScanSkip)
++{
++    struct ProcessManager manager = { 0 };
++    ProcessAttr current = {};
++    ThreadCtx ctx = {};
++    manager.processes = &current;
++    ctx.processManager = &manager;
++    current.next = nullptr;
++    current.isFirstScan = true;
++    current.scanType = NORMAL_SCAN;
++
++    MOCKER(EnvMutexLock).stubs().will(ignoreReturnValue());
++    MOCKER(EnvMutexUnlock).stubs().will(ignoreReturnValue());
++    MOCKER(UpdateScanTime).expects(never());
++
++    UpdateAllProcessScanTime(&ctx);
++}
++
+ extern "C" bool GetFileConfSwitchConfig(void);
+ extern "C" bool GetMigratePeriodChanged(void);
+ extern "C" uint32_t GetMigratePeriodConfig(void);
+ extern "C" bool GetScanPeriodChanged(void);
+ extern "C" void UpdatePeriodFromConfig(ThreadCtx *ctx);
++extern "C" void IoctlUpdateUbDmaAvail(uint32_t value);
++extern "C" uint32_t GetMigrateModeConfig(void);
+ TEST_F(MigrationTest, TestUodatePeriodFromConfig)
+ {
++    struct ProcessManager manager = { 0 };
+     ThreadCtx ctx = {};
++    ctx.processManager = &manager;
+     ctx.period = 500;
+     MOCKER(GetFileConfSwitchConfig).stubs().will(returnValue(true));
+     MOCKER(GetScanPeriodChanged).stubs().will(returnValue(false));
+     MOCKER(GetMigratePeriodChanged).stubs().will(returnValue(true));
+     MOCKER(GetMigratePeriodConfig).stubs().will(returnValue(1000));
++    MOCKER(IoctlUpdateUbDmaAvail).stubs();
++    MOCKER(GetMigrateModeConfig).stubs().will(returnValue(0));
++    MOCKER(EnvMutexLock).stubs().will(ignoreReturnValue());
++    MOCKER(EnvMutexUnlock).stubs().will(ignoreReturnValue());
+ 
+     UpdatePeriodFromConfig(&ctx);
+     EXPECT_EQ(1000, ctx.period);
+ }
+ 
++TEST_F(MigrationTest, TestUpdatePeriodFromConfigRestoreFirstScanNoPages)
++{
++    struct ProcessManager manager = { 0 };
++    ProcessAttr current = {};
++    ThreadCtx ctx = {};
++    manager.processes = &current;
++    ctx.processManager = &manager;
++    ctx.period = 500;
++    current.next = nullptr;
++    current.isFirstScan = true;
++    current.walkPage.nrPage = 0;
++    current.scanTime = 0;
++
++    MOCKER(GetFileConfSwitchConfig).stubs().will(returnValue(true));
++    MOCKER(GetScanPeriodChanged).stubs().will(returnValue(false));
++    MOCKER(GetMigratePeriodChanged).stubs().will(returnValue(false));
++    MOCKER(IoctlUpdateUbDmaAvail).stubs();
++    MOCKER(GetMigrateModeConfig).stubs().will(returnValue(0));
++    MOCKER(EnvMutexLock).stubs().will(ignoreReturnValue());
++    MOCKER(EnvMutexUnlock).stubs().will(ignoreReturnValue());
++
++    UpdatePeriodFromConfig(&ctx);
++    EXPECT_EQ(DEFAULT_SCAN_PERIOD, current.scanTime);
++}
++
++TEST_F(MigrationTest, TestUpdatePeriodFromConfigRestoreFirstScanWithPages)
++{
++    struct ProcessManager manager = { 0 };
++    ProcessAttr current = {};
++    ThreadCtx ctx = {};
++    manager.processes = &current;
++    ctx.processManager = &manager;
++    ctx.period = 500;
++    current.next = nullptr;
++    current.isFirstScan = true;
++    current.walkPage.nrPage = 1;
++    current.scanType = NORMAL_SCAN;
++
++    MOCKER(GetFileConfSwitchConfig).stubs().will(returnValue(true));
++    MOCKER(GetScanPeriodChanged).stubs().will(returnValue(false));
++    MOCKER(GetMigratePeriodChanged).stubs().will(returnValue(false));
++    MOCKER(IoctlUpdateUbDmaAvail).stubs();
++    MOCKER(GetMigrateModeConfig).stubs().will(returnValue(0));
++    MOCKER(EnvMutexLock).stubs().will(ignoreReturnValue());
++    MOCKER(EnvMutexUnlock).stubs().will(ignoreReturnValue());
++    MOCKER(UpdateScanTime).stubs().will(returnValue(0));
++
++    UpdatePeriodFromConfig(&ctx);
++    EXPECT_FALSE(current.isFirstScan);
++}
++
+ extern "C" void UpdateMigResult(struct MigrateMsg *mMsg, struct ProcessManager *manager);
+ TEST_F(MigrationTest, TestUpdateMigResultLocalToRemote)
+ {
+diff --git a/plugins/smap/test/user/test_interface.cpp b/plugins/smap/test/user/test_interface.cpp
+index ca3d36d..2ceccbd 100644
+--- a/plugins/smap/test/user/test_interface.cpp
++++ b/plugins/smap/test/user/test_interface.cpp
+@@ -698,7 +698,7 @@ extern "C" int IoctlHandler(const void *msg, int pidType, const unsigned long *i
+ extern "C" int AddProcessNumaBitMap(struct MigrateOutMsg *msg, uint32_t *nodeBitmap, int pidType);
+ extern "C" int AddProcessesToGlobalManager(struct MigrateOutMsg *msg, int pidType, uint32_t *nodeBitmap,
+                                            bool *hasInvalidPid);
+-extern "C" int ProcessAddTrackingManage(struct MigrateOutMsg *msg, int pidType);
++extern "C" int ProcessAddTrackingManage(struct MigrateOutMsg *msg, int pidType, uint32_t *nodeBitmap);
+ TEST_F(InterfaceTest, TestSmapMigrateOut)
+ {
+     int ret;
+@@ -1085,6 +1085,77 @@ static int CheckGroupedAccessAddPidPayload(int len, struct AccessAddPidPayload *
+     return 0;
+ }
+ 
++extern "C" int ProcessAddTrackingManage(struct MigrateOutMsg *msg, int pidType, uint32_t *nodeBitmap);
++static int CheckTrackingAccessAddPidPayload(int len, struct AccessAddPidPayload *payload)
++{
++    EXPECT_EQ(2, len);
++    EXPECT_EQ(1234, payload[0].pid);
++    EXPECT_EQ((uint32_t)200, payload[0].scanTime);
++    EXPECT_EQ((uint32_t)60, payload[0].duration);
++    EXPECT_EQ(NON_EXIST_PID, payload[1].pid);
++    return 0;
++}
++
++TEST_F(InterfaceTest, TestProcessAddTrackingManageExistingProcess)
++{
++    struct MigrateOutMsg msg = {};
++    ProcessAttr current = {};
++    current.pid = 1234;
++    current.scanTime = 200;
++    current.duration = 60;
++    current.next = nullptr;
++    g_processManager.processes = &current;
++    g_processManager.nrLocalNuma = 4;
++
++    msg.count = 2;
++    msg.payload[0].pid = 1234;
++    msg.payload[0].count = 1;
++    msg.payload[0].inner[0].destNid = 4;
++    msg.payload[1].pid = 5678;
++    MOCKER(PidIsValid).stubs().will(returnValue(true)).then(returnValue(false));
++    MOCKER(SetProcessLocalNuma).stubs().will(returnValue(0));
++    MOCKER(GetProcessAttrLocked).stubs().will(returnValue(&current)).then(returnValue((ProcessAttr *)nullptr));
++    MOCKER(AccessIoctlAddPid).expects(once()).will(invoke(CheckTrackingAccessAddPidPayload));
++
++    int ret = ProcessAddTrackingManage(&msg, VM_TYPE, nullptr);
++    EXPECT_EQ(0, ret);
++    g_processManager.processes = nullptr;
++}
++
++TEST_F(InterfaceTest, TestProcessAddTrackingManageNewProcess)
++{
++    struct MigrateOutMsg msg = {};
++    msg.count = 0;
++
++    MOCKER(AccessIoctlAddPid).stubs().will(returnValue(0));
++
++    int ret = ProcessAddTrackingManage(&msg, VM_TYPE, nullptr);
++    EXPECT_EQ(0, ret);
++}
++
++TEST_F(InterfaceTest, TestProcessAddTrackingManageNewProcessReturnsEbadf)
++{
++    struct MigrateOutMsg msg = {};
++    ProcessAttr current = {};
++    current.pid = 1234;
++    current.next = nullptr;
++    g_processManager.processes = &current;
++    g_processManager.nrLocalNuma = 4;
++
++    msg.count = 1;
++    msg.payload[0].pid = 1234;
++    msg.payload[0].count = 1;
++    msg.payload[0].inner[0].destNid = 4;
++    MOCKER(PidIsValid).stubs().will(returnValue(true));
++    MOCKER(SetProcessLocalNuma).stubs().will(returnValue(0));
++    MOCKER(GetProcessAttrLocked).stubs().will(returnValue((ProcessAttr *)nullptr));
++    MOCKER(AccessIoctlAddPid).stubs().will(returnValue(-EBADF));
++
++    int ret = ProcessAddTrackingManage(&msg, VM_TYPE, nullptr);
++    EXPECT_EQ(-EBADF, ret);
++    g_processManager.processes = nullptr;
++}
++
+ TEST_F(InterfaceTest, TestProcessAddGroupedTrackingManageBuildsPayload)
+ {
+     struct GroupedMigrateOutMsg msg = {};
+@@ -3608,7 +3679,7 @@ TEST_F(InterfaceTest, TestSmapQueryProcessConfigNormal)
+ 
+ TEST_F(InterfaceTest, TestProcessAddTrackingManageNullMsg)
+ {
+-    int ret = ProcessAddTrackingManage(nullptr, VM_TYPE);
++    int ret = ProcessAddTrackingManage(nullptr, VM_TYPE, nullptr);
+     EXPECT_EQ(-EINVAL, ret);
+ }
+ 
+-- 
+2.53.0.windows.3
+

@@ -1,0 +1,606 @@
+From 99fd380a5526b4cc2a91522b64d1a3575106eda1 Mon Sep 17 00:00:00 2001
+From: jamesricado <825511311@qq.com>
+Date: Mon, 22 Jun 2026 19:53:44 +0800
+Subject: [PATCH 54/71] fix:ubdma dt
+
+---
+ plugins/ubdma/src/urma.c                      |  2 +-
+ plugins/ubdma/test/CMakeLists.txt             | 35 +++++++------
+ .../test/depends/include/linux/numa_remote.h  | 11 ++++
+ .../test/depends/include/linux/rwlock_rt.h    |  8 +++
+ plugins/ubdma/test/drivers/stub_struct.h      | 12 +----
+ plugins/ubdma/test/drivers/stub_ubcore.c      |  7 ++-
+ .../ubdma/test/drivers/test_memory_notify.cpp | 37 ++++++++++++-
+ plugins/ubdma/test/drivers/test_segment.cpp   | 45 ++++++++++++----
+ .../test/drivers/test_ub_dma_feature.cpp      | 14 ++++-
+ .../ubdma/test/drivers/test_ub_dma_iomem.cpp  | 24 ++++++++-
+ .../ubdma/test/drivers/test_ub_virt_dma.cpp   | 41 +++++++++++++--
+ plugins/ubdma/test/run_dt.sh                  | 52 +++++++++++++------
+ 12 files changed, 224 insertions(+), 64 deletions(-)
+ create mode 100644 plugins/ubdma/test/depends/include/linux/numa_remote.h
+
+diff --git a/plugins/ubdma/src/urma.c b/plugins/ubdma/src/urma.c
+index fe9718a..e7035f2 100644
+--- a/plugins/ubdma/src/urma.c
++++ b/plugins/ubdma/src/urma.c
+@@ -489,7 +489,7 @@ int init_urma_mem_trans(ubcore_comp_callback_t jfce_handler)
+ 		goto delete_server_jfr;
+ 	}
+ 
+-	ub_dma_log_info("udma is %s, eid index is %d",
++	ub_dma_log_info("udma is %s, eid index is %d\n",
+ 			g_urma_jetty->dev->dev_name,
+ 			g_urma_jetty->eid_info.eid_index);
+ 	return 0;
+diff --git a/plugins/ubdma/test/CMakeLists.txt b/plugins/ubdma/test/CMakeLists.txt
+index b8525c6..4a5432f 100644
+--- a/plugins/ubdma/test/CMakeLists.txt
++++ b/plugins/ubdma/test/CMakeLists.txt
+@@ -4,7 +4,8 @@ project(UB_DMA VERSION 0.1.0 LANGUAGES C CXX)
+ 
+ set(CMAKE_CXX_STANDARD 11)
+ 
+-set(UB_DMA_SRC ${CMAKE_CURRENT_LIST_DIR}/../)
++set(UB_DMA_SRC ${CMAKE_CURRENT_LIST_DIR}/dt_src)
++set(TEST_DIR ${CMAKE_CURRENT_LIST_DIR})
+ set(CMAKE_CXX_FLAGS " ${CMAKE_CXX_FLAGS} -fprofile-arcs -ftest-coverage -DACPI_NOT_READY -Wno-all")
+ set(CMAKE_C_FLAGS " ${CMAKE_C_FLAGS} -fprofile-arcs -ftest-coverage -DACPI_NOT_READY -Wno-all")
+ add_link_options(-lgcov --coverage)
+@@ -16,19 +17,19 @@ add_subdirectory(3rdparty)
+ 
+ add_compile_definitions(USE_DT)
+ 
+-# include all source files
+-aux_source_directory(${UB_DMA_SRC}/test/drivers TEST_SRC)
++# include all test source files
++aux_source_directory(${TEST_DIR}/drivers TEST_SRC)
+ 
+ # stub c files
+-aux_source_directory(${UB_DMA_SRC}/test/depends/drivers/base TEST_SRC)
+-aux_source_directory(${UB_DMA_SRC}/test/depends/drivers/mm TEST_SRC)
+-aux_source_directory(${UB_DMA_SRC}/test/depends/drivers/dma TEST_SRC)
+-aux_source_directory(${UB_DMA_SRC}/test/depends/kernel TEST_SRC)
+-aux_source_directory(${UB_DMA_SRC}/test/depends/kernel/time TEST_SRC)
+-aux_source_directory(${UB_DMA_SRC}/test/depends/kernel/locking TEST_SRC)
+-list(APPEND TEST_SRC ${UB_DMA_SRC}/test/main.cpp)
++aux_source_directory(${TEST_DIR}/depends/drivers/base TEST_SRC)
++aux_source_directory(${TEST_DIR}/depends/drivers/mm TEST_SRC)
++aux_source_directory(${TEST_DIR}/depends/drivers/dma TEST_SRC)
++aux_source_directory(${TEST_DIR}/depends/kernel TEST_SRC)
++aux_source_directory(${TEST_DIR}/depends/kernel/time TEST_SRC)
++aux_source_directory(${TEST_DIR}/depends/kernel/locking TEST_SRC)
++list(APPEND TEST_SRC ${TEST_DIR}/main.cpp)
+ 
+-# ub-dma
++# ub-dma source files (from dt_src copy)
+ list(APPEND TEST_SRC ${UB_DMA_SRC}/src/urma.c)
+ list(APPEND TEST_SRC ${UB_DMA_SRC}/src/ub_dma_main.c)
+ list(APPEND TEST_SRC ${UB_DMA_SRC}/src/ub_virt_dma.c)
+@@ -41,11 +42,11 @@ add_executable(ubdma_dt ${TEST_SRC})
+ # include headers
+ target_include_directories(ubdma_dt PUBLIC
+     ${UB_DMA_SRC}/src
+-    ${UB_DMA_SRC}/test/3rdparty/umdk
+-    ${UB_DMA_SRC}/test/user_depends/include
+-    ${UB_DMA_SRC}/test/depends/include
+-    ${UB_DMA_SRC}/test/depends/lib
+-    ${UB_DMA_SRC}/test/depends/arch/arm64/include
++    ${TEST_DIR}/3rdparty/umdk
++    ${TEST_DIR}/user_depends/include
++    ${TEST_DIR}/depends/include
++    ${TEST_DIR}/depends/lib
++    ${TEST_DIR}/depends/arch/arm64/include
+ )
+ 
+ target_compile_definitions(ubdma_dt PUBLIC
+@@ -77,4 +78,4 @@ message(STATUS "Compile flags: ${COMPILE_FLAGS}")
+ message(STATUS "Link flags: ${LINK_FLAGS}")
+ message(STATUS "Build Type: ${CMAKE_BUILD_TYPE}")
+ TARGET_MOCKCPP(ubdma_dt)
+-TARGET_GTEST(ubdma_dt)
+\ No newline at end of file
++TARGET_GTEST(ubdma_dt)
+diff --git a/plugins/ubdma/test/depends/include/linux/numa_remote.h b/plugins/ubdma/test/depends/include/linux/numa_remote.h
+new file mode 100644
+index 0000000..d148ead
+--- /dev/null
++++ b/plugins/ubdma/test/depends/include/linux/numa_remote.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (C) 2024  Huawei Technologies Co., Ltd.
++ * Author: Liu Shixin <liushixin2@huawei.com>
++ */
++#ifndef _LINUX_REMOTE_MEMORY_H_
++#define _LINUX_REMOTE_MEMORY_H_
++
++bool numa_is_remote_node(int nid);
++
++#endif /* _LINUX_REMOTE_MEMORY_H_ */
+diff --git a/plugins/ubdma/test/depends/include/linux/rwlock_rt.h b/plugins/ubdma/test/depends/include/linux/rwlock_rt.h
+index 17acbad..889f66f 100644
+--- a/plugins/ubdma/test/depends/include/linux/rwlock_rt.h
++++ b/plugins/ubdma/test/depends/include/linux/rwlock_rt.h
+@@ -11,4 +11,12 @@ static __always_inline void write_unlock(rwlock_t *rwlock)
+ {
+     return;
+ }
++static __always_inline void read_lock(rwlock_t *rwlock)
++{
++    return;
++}
++static __always_inline void read_unlock(rwlock_t *rwlock)
++{
++    return;
++}
+ #endif
+\ No newline at end of file
+diff --git a/plugins/ubdma/test/drivers/stub_struct.h b/plugins/ubdma/test/drivers/stub_struct.h
+index 4ddf7a9..b660929 100644
+--- a/plugins/ubdma/test/drivers/stub_struct.h
++++ b/plugins/ubdma/test/drivers/stub_struct.h
+@@ -72,19 +72,9 @@ struct dma_channel_work {
+ 
+ struct ub_dma_dev {
+     struct dma_device slave;
+-    struct urma_mem_trans *urma_handler;
+     struct ub_dma_vchan *vchans;
+     uint32_t vchan_num;
+-    spinlock_t lock;
+-    struct tasklet_struct task;
+-    struct list_head pending;
+     struct device_driver driver;
+ };
+ 
+-struct urma_trans_segment_info {
+-    uint64_t addr;
+-    uint32_t len;
+-    struct ubcore_target_seg *sge;
+-};
+-
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/plugins/ubdma/test/drivers/stub_ubcore.c b/plugins/ubdma/test/drivers/stub_ubcore.c
+index 0e533d1..c27719b 100644
+--- a/plugins/ubdma/test/drivers/stub_ubcore.c
++++ b/plugins/ubdma/test/drivers/stub_ubcore.c
+@@ -138,7 +138,7 @@ int pfn_valid(unsigned long pfn)
+ }
+ struct page *pfn_to_online_page(unsigned long pfn)
+ {
+-    return 1;
++    return (struct page *)1;
+ }
+ 
+ void complete(struct completion *x)
+@@ -266,6 +266,11 @@ void unregister_memory_notifier(struct notifier_block *nb)
+ }
+ 
+ bool cancel_work_sync(struct work_struct *work)
++{
++    return true;
++}
++
++bool numa_is_remote_node(int nid)
+ {
+     return true;
+ }
+\ No newline at end of file
+diff --git a/plugins/ubdma/test/drivers/test_memory_notify.cpp b/plugins/ubdma/test/drivers/test_memory_notify.cpp
+index 4a9d835..cbeda88 100644
+--- a/plugins/ubdma/test/drivers/test_memory_notify.cpp
++++ b/plugins/ubdma/test/drivers/test_memory_notify.cpp
+@@ -51,6 +51,12 @@ void mem_nf_unregister_sge(struct work_struct *w __always_unused);
+ int pre_offline_notifier_cb(struct memory_notify *mnb, unsigned long action);
+ struct page *pfn_to_online_page(unsigned long pfn);
+ int ub_dma_memory_notifier(struct notifier_block *self, unsigned long action, void *arg);
++int memory_notifier_init(void);
++void memory_notifier_exit(void);
++struct workqueue_struct *alloc_workqueue(const char *fmt, unsigned int flags, int max_active);
++int register_memory_notifier(struct notifier_block *nb);
++void destroy_workqueue(struct workqueue_struct *wq);
++void unregister_memory_notifier(struct notifier_block *nb);
+ }
+ 
+ TEST_F(TestMemoryNotify, mem_nf_register_sge_test)
+@@ -111,4 +117,33 @@ TEST_F(TestMemoryNotify, ub_dma_memory_notifier_test)
+     MOCKER(pre_offline_notifier_cb).stubs().will(returnValue(1));
+     ret = ub_dma_memory_notifier(&self, MEM_GOING_OFFLINE, (void*)&mnb);
+     EXPECT_EQ(ret, NOTIFY_OK);
+-}
+\ No newline at end of file
++}
++
++TEST_F(TestMemoryNotify, memory_notifier_init_test)
++{
++    workqueue_struct wq;
++    MOCKER(alloc_workqueue).stubs().will(returnValue(&wq));
++    MOCKER(register_memory_notifier).stubs().will(returnValue(0));
++    int ret = memory_notifier_init();
++    EXPECT_EQ(ret, 0);
++
++    GlobalMockObject::verify();
++    MOCKER(alloc_workqueue).stubs().will(returnValue((workqueue_struct*)nullptr));
++    MOCKER(register_memory_notifier).stubs().will(returnValue(0));
++    ret = memory_notifier_init();
++    EXPECT_EQ(ret, 0);
++
++    GlobalMockObject::verify();
++    MOCKER(alloc_workqueue).stubs().will(returnValue(&wq));
++    MOCKER(register_memory_notifier).stubs().will(returnValue(1));
++    ret = memory_notifier_init();
++    EXPECT_EQ(ret, 1);
++}
++
++TEST_F(TestMemoryNotify, memory_notifier_exit_test)
++{
++    workqueue_struct wq;
++    MOCKER(destroy_workqueue).stubs();
++    MOCKER(unregister_memory_notifier).stubs();
++    memory_notifier_exit();
++}
+diff --git a/plugins/ubdma/test/drivers/test_segment.cpp b/plugins/ubdma/test/drivers/test_segment.cpp
+index d76d8e8..6027ad2 100644
+--- a/plugins/ubdma/test/drivers/test_segment.cpp
++++ b/plugins/ubdma/test/drivers/test_segment.cpp
+@@ -22,10 +22,6 @@
+ #include "urma.h"
+ #include "ubcore_opcode.h"
+ 
+-#define SMAP_MIG_MAGIC 0xbe
+-#define SMAP_MIG_MIGRATE _IOW(SMAP_MIG_MAGIC, 0, struct migrate_msg)
+-#define SMAP_MIG_FOLIO_MIGRATE _IOW(SMAP_MIG_MAGIC, 1, struct migrate_msg)
+-
+ using namespace std;
+ 
+ class TestSegment : public ::testing::Test {
+@@ -49,18 +45,20 @@ extern "C" {
+     int check_mem_info(u64 pa_start, u64 pa_end);
+     int pfn_valid(unsigned long pfn);
+     int pfn_to_nid(unsigned long pfn);
++    struct page *pfn_to_online_page(unsigned long pfn);
+     int ub_dma_register_segment(u64 pa_start, u64 pa_end);
+     void unregister_urma_segment(struct urma_sge_info *sge_info);
+-    void ub_dma_unregister_segment(void);
++    int ub_dma_unregister_segment(u64 start_pa, u64 end_pa);
+     int urma_meta_sge_init(void);
++    int get_single_urma_trans_segment(struct urma_trans_segment_info *info, bool is_i_seg);
++    void ub_dma_unregister_all_segment(void);
++    int urma_register_segment(uint64_t start_va, uint64_t end_va, struct urma_sge_info *sge_info);
+ }
+ 
+ TEST_F(TestSegment, check_mem_info_test)
+ {
+     u64 pa_start = 0;
+     u64 pa_end = 0;
+-    struct urma_trans_segment_info src_info;
+-    struct urma_trans_segment_info dst_info;
+ 
+     pa_start = 2; // 2
+     pa_end = 0;
+@@ -104,7 +102,7 @@ TEST_F(TestSegment, ub_dma_register_segment_test)
+ 
+     GlobalMockObject::verify();
+     MOCKER(unregister_urma_segment).stubs();
+-    ub_dma_unregister_segment();
++    ub_dma_unregister_segment(0, 3);
+ }
+ 
+ TEST_F(TestSegment, get_urma_trans_segment_test)
+@@ -113,4 +111,33 @@ TEST_F(TestSegment, get_urma_trans_segment_test)
+     struct urma_trans_segment_info *dst_info;
+     int ret = get_urma_trans_segment(src_info, dst_info);
+     EXPECT_EQ(0, ret);
+-}
+\ No newline at end of file
++}
++
++TEST_F(TestSegment, get_single_urma_trans_segment_test)
++{
++    urma_meta_sge_init();
++    struct urma_trans_segment_info info;
++    info.addr = 0x1000;
++    info.len = 0x100;
++    info.sge = nullptr;
++    int ret = get_single_urma_trans_segment(&info, true);
++    EXPECT_EQ(ret, -ENOENT);
++
++    GlobalMockObject::verify();
++    ret = get_single_urma_trans_segment(&info, false);
++    EXPECT_EQ(ret, -ENOENT);
++}
++
++TEST_F(TestSegment, ub_dma_unregister_segment_not_found_test)
++{
++    urma_meta_sge_init();
++    int ret = ub_dma_unregister_segment(0, 3);
++    EXPECT_EQ(ret, -ENOENT);
++}
++
++TEST_F(TestSegment, ub_dma_unregister_all_segment_test)
++{
++    urma_meta_sge_init();
++    MOCKER(unregister_urma_segment).stubs();
++    ub_dma_unregister_all_segment();
++}
+diff --git a/plugins/ubdma/test/drivers/test_ub_dma_feature.cpp b/plugins/ubdma/test/drivers/test_ub_dma_feature.cpp
+index 6e678f3..383ba81 100644
+--- a/plugins/ubdma/test/drivers/test_ub_dma_feature.cpp
++++ b/plugins/ubdma/test/drivers/test_ub_dma_feature.cpp
+@@ -17,9 +17,19 @@
+ #include "mockcpp/mokc.h"
+ #include "stub_struct.h"
+ #include "urma.h"
++#include "ubcore_types.h"
++#include "ubcore_opcode.h"
+ 
+ using namespace std;
+ 
++struct ub_dma_desc_full {
++    struct ub_virt_dma_desc vd;
++    uint64_t src_addr;
++    uint64_t dest_addr;
++    size_t len;
++    struct tmp_urma_segment_info tmp_sge;
++};
++
+ class TestUbDmaFeature : public ::testing::Test {
+ protected:
+     void SetUp() override
+@@ -168,7 +178,7 @@ TEST_F(TestUbDmaFeature, test_ub_dma_client_comp_callback)
+         break;
+     }
+     ub_dma_vchan *vchan = container_of(chan, struct ub_dma_vchan, vc.chan);
+-    struct ub_dma_desc txd;
++    struct ub_dma_desc_full txd = {};
+     dma_device dmaDev;
+     device dev;
+     txd.vd.tx.cookie = 2; // 2
+@@ -193,4 +203,4 @@ TEST_F(TestUbDmaFeature, test_ub_dma_client_comp_callback)
+     EXPECT_TRUE(vchan->vc.desc_submitted.next == &vchan->vc.desc_submitted);
+     EXPECT_TRUE(vchan->vc.desc_allocated.next == &vchan->vc.desc_allocated);
+     EXPECT_TRUE(vchan->vc.desc_completed.next != &vchan->vc.desc_completed);
+-}
+\ No newline at end of file
++}
+diff --git a/plugins/ubdma/test/drivers/test_ub_dma_iomem.cpp b/plugins/ubdma/test/drivers/test_ub_dma_iomem.cpp
+index da6ffd3..67a499f 100644
+--- a/plugins/ubdma/test/drivers/test_ub_dma_iomem.cpp
++++ b/plugins/ubdma/test/drivers/test_ub_dma_iomem.cpp
+@@ -44,13 +44,24 @@ protected:
+ extern "C" {
+     int insert_remote_ram(u64 pa_start, u64 pa_end, struct list_head *head);
+     int pfn_valid(unsigned long pfn);
++    struct page *pfn_to_online_page(unsigned long pfn);
+     int page_to_nid(const struct page *page);
+     int update_resource(struct resource *r, void *arg);
++    int iomem_urma_sge_init(void);
++    void destory_iomem_workqueue(void);
++    int walk_iomem_res_desc(unsigned long desc, unsigned long flags, u64 start, u64 end, void *arg,
++                            int (*func)(struct resource *, void *));
++    void destroy_workqueue(struct workqueue_struct *wq);
++    void flush_workqueue(struct workqueue_struct *wq);
++    bool cancel_work_sync(struct work_struct *work);
++    extern struct list_head remote_ram_list;
++    int ub_dma_register_segment(u64 pa_start, u64 pa_end);
+ }
+ 
+ TEST_F(TestUbDmaIomem, insert_remote_ram_test)
+ {
+     list_head head;
++    INIT_LIST_HEAD(&head);
+     MOCKER(pfn_valid).stubs().will(returnValue(0));
+     int ret = insert_remote_ram(0, 1, &head);
+     EXPECT_EQ(ret, 0);
+@@ -87,4 +98,15 @@ TEST_F(TestUbDmaIomem, update_resource_test)
+     MOCKER(insert_remote_ram).stubs().will(returnValue(0));
+     ret = update_resource(&rsc, &head);
+     EXPECT_EQ(ret, 0);
+-}
+\ No newline at end of file
++}
++
++TEST_F(TestUbDmaIomem, iomem_urma_sge_init_test)
++{
++    int ret = iomem_urma_sge_init();
++    EXPECT_EQ(ret, 0);
++}
++
++TEST_F(TestUbDmaIomem, destory_iomem_workqueue_test)
++{
++    destory_iomem_workqueue();
++}
+diff --git a/plugins/ubdma/test/drivers/test_ub_virt_dma.cpp b/plugins/ubdma/test/drivers/test_ub_virt_dma.cpp
+index ad72287..58e2602 100644
+--- a/plugins/ubdma/test/drivers/test_ub_virt_dma.cpp
++++ b/plugins/ubdma/test/drivers/test_ub_virt_dma.cpp
+@@ -10,10 +10,16 @@
+ #include "stub_struct.h"
+ 
+ using namespace std;
++
++size_t ub_vchan_complete_free_count = 0;
++size_t ub_vchan_free_list_count = 0;
++
+ class TestUbVirtDma : public testing::Test {
+     void SetUp() override
+     {
+         cout << "[Phase SetUp Begin]" << endl;
++        ub_vchan_complete_free_count = 0;
++        ub_vchan_free_list_count = 0;
+         cout << "[Phase SetUp End]" << endl;
+     }
+     void TearDown() override
+@@ -32,7 +38,6 @@ TEST_F(TestUbVirtDma, ub_dma_vchan_tx_submit)
+     desc.tx.chan = &chan.chan;
+     chan.chan.cookie = 1;
+     chan.desc_submitted = LIST_HEAD_INIT(chan.desc_submitted);
+-    list_head test = {};
+     auto cookie = ub_dma_vchan_tx_submit(&desc.tx);
+     ASSERT_EQ(cookie, desc.tx.cookie);
+     ASSERT_EQ(desc.node.prev, &chan.desc_submitted);
+@@ -45,13 +50,15 @@ TEST_F(TestUbVirtDma, vchan_tx_desc_free)
+     desc.node = LIST_HEAD_INIT(desc.node);
+     desc.tx.chan = &chan.chan;
+     chan.chan.cookie = 1;
+-    chan.desc_free = +[](struct ub_virt_dma_desc *) {};
++    chan.desc_free = +[](struct ub_virt_dma_desc *) {
++        ub_vchan_complete_free_count++;
++    };
+     vchan_tx_desc_free(&desc.tx);
+     ASSERT_NE(desc.node.next, &desc.node);
+     ASSERT_NE(desc.node.prev, &desc.node);
++    ASSERT_EQ(ub_vchan_complete_free_count, 1);
+ }
+ 
+-size_t ub_vchan_complete_free_count = 0;
+ extern "C" void ub_vchan_complete(struct tasklet_struct *t);
+ TEST_F(TestUbVirtDma, ub_vchan_complete)
+ {
+@@ -79,4 +86,30 @@ TEST_F(TestUbVirtDma, vchan_init)
+     ASSERT_EQ(chan.desc_terminated.next, &chan.desc_terminated);
+     ASSERT_EQ(chan.desc_issued.next, &chan.desc_issued);
+     ASSERT_EQ(chan.chan.device_node.next, &dmadev.channels);
+-}
+\ No newline at end of file
++}
++
++extern "C" void vchan_dma_desc_free_list(struct ub_virt_dma_chan *vc, struct list_head *head);
++TEST_F(TestUbVirtDma, vchan_dma_desc_free_list)
++{
++    ub_virt_dma_chan chan = {};
++    dma_device dmadev = {};
++    dmadev.channels = LIST_HEAD_INIT(dmadev.channels);
++    vchan_init(&chan, &dmadev);
++
++    ub_virt_dma_desc desc1 = {};
++    ub_virt_dma_desc desc2 = {};
++    desc1.tx.chan = &chan.chan;
++    desc2.tx.chan = &chan.chan;
++    desc1.node = LIST_HEAD_INIT(desc1.node);
++    desc2.node = LIST_HEAD_INIT(desc2.node);
++    chan.desc_free = +[](struct ub_virt_dma_desc *) {
++        ub_vchan_free_list_count++;
++    };
++
++    LIST_HEAD(head);
++    list_add_tail(&desc1.node, &head);
++    list_add_tail(&desc2.node, &head);
++
++    vchan_dma_desc_free_list(&chan, &head);
++    ASSERT_EQ(ub_vchan_free_list_count, 2);
++}
+diff --git a/plugins/ubdma/test/run_dt.sh b/plugins/ubdma/test/run_dt.sh
+index 6ec71be..791f0c0 100644
+--- a/plugins/ubdma/test/run_dt.sh
++++ b/plugins/ubdma/test/run_dt.sh
+@@ -3,6 +3,9 @@
+ # Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ # Description: ub-dma run dt script
+ #******************************************************************
++
++set -euo pipefail
++
+ remove_static()
+ {
+     local dir=$1
+@@ -30,17 +33,17 @@ rename_min()
+ replace_string() {
+     filename="$1"
+     search_string="$2"
+-    replace_srting="$3"
+-    replace_without_exist="$4"
++    replace_string="$3"
++    replace_without_exist="${4:-true}"
+ 
+-    grep "$replace_srting" "$filename"
+-    if [ $? -eq 0]; then
++    count=$(grep -c "$replace_string" "$filename" || true)
++    if [ $count -gt 0 ]; then
+         if [[ "$replace_without_exist" == "true" ]]; then
+             return 0
+         fi
+     fi
+ 
+-    sed -i "s/\b$search_string\b/$replace_srting/g" "$filename"
++    sed -i "s/\b$search_string\b/$replace_string/g" "$filename"
+ }
+ 
+ add_extern()
+@@ -76,7 +79,17 @@ add_extern()
+ CURRENT_PATH=$(cd "$(dirname "$0")"; pwd)
+ echo "${CURRENT_PATH:?}"
+ cd "${CURRENT_PATH:?}"
+-code_dir=$(cd ${CURRENT_PATH}/../ && pwd)
++
++DT_SRC_DIR=$CURRENT_PATH/dt_src
++if [[ ! -d "$DT_SRC_DIR" ]]
++then
++    mkdir -p $DT_SRC_DIR
++else
++    rm -rf ${DT_SRC_DIR}/*
++fi
++cp -r ${CURRENT_PATH}/../src $DT_SRC_DIR
++
++code_dir=$(cd ${DT_SRC_DIR} && pwd)
+ 
+ remove_static ${code_dir}/src
+ remove_inline ${code_dir}/src
+@@ -100,22 +113,27 @@ cd $BUILD_DIR || {
+     exit 1;
+ }
+ 
+-cd $CURRENT_PATH/3rdparty/mockcpp
+-dos2unix ../mockcpp_support_arm64.patch
+-dos2unix src/UnixCodeModifier.cpp
+-git apply ../mockcpp_support_arm64.patch
++mock_patch_path=$CURRENT_PATH/3rdparty/mockcpp/mockcpp_support_arm64.patch
++if [[ ! -e "$mock_patch_path" ]]
++then
++    dos2unix $CURRENT_PATH/3rdparty/mockcpp_support_arm64.patch
++    cp -r $CURRENT_PATH/3rdparty/mockcpp_support_arm64.patch $CURRENT_PATH/3rdparty/mockcpp
++    cd $CURRENT_PATH/3rdparty/mockcpp
++    dos2unix src/UnixCodeModifier.cpp
++    git apply mockcpp_support_arm64.patch
++fi
+ cd $CURRENT_PATH/build
+- 
++
+ N_CPUS=$(grep processor /proc/cpuinfo | wc -l)
+ echo "$N_CPUS processors detected."
+- 
++
+ CMAKE_CMD="cmake -DCMAKE_BUILD_TYPE=Debug $CURRENT_PATH"
+ BUILD_CMD="make -j $((N_CPUS-2))"
+- 
++
+ echo $CMAKE_CMD
+ $CMAKE_CMD || {
+     echo "Failed to configure ubdma_dt build!"
+-    exit 1
++    exit 1;
+ }
+ echo
+ echo "Done configuring ubdma_dt build"
+@@ -123,7 +141,7 @@ echo
+ echo $BUILD_CMD
+ $BUILD_CMD || {
+     echo "Failed to build ubdma_dt"
+-    exit 1
++    exit 1;
+ }
+ echo
+ echo Success
+@@ -132,5 +150,5 @@ echo Success
+ 
+ mkdir -p build/gcovr_report
+ lcov --d ./ --c --output-file test.info --rc lcov_branch_coverage=1
+-lcov -e test.info "*/ubturbo/plugins/ubdma/src/*" -output-file coverage.info --rc lcov_branch_coverage=1
+-genhtml -o gcovr_report coverage.info --show-details --legend --rc lcov_branch_coverage=1
+\ No newline at end of file
++lcov -e test.info "*/dt_src/src/*" -output-file coverage.info --rc lcov_branch_coverage=1
++genhtml -o gcovr_report coverage.info --show-details --legend --rc lcov_branch_coverage=1
+-- 
+2.53.0.windows.3
+

@@ -9,26 +9,13 @@ export DEB_CXXFLAGS_MAINT_APPEND = -Wno-format-security
 
 override_dh_auto_build:
 	# Apply quilt patches (needed when source is extracted + debian/ copied manually)
-	if [ -f $(CURDIR)/debian/patches/remove-openEuler-release-dependency.patch ]; then \
-		cd $(CURDIR) && patch -p1 -l --forward --dry-run < debian/patches/remove-openEuler-release-dependency.patch > /dev/null 2>&1 && \
-		patch -p1 -l --forward < debian/patches/remove-openEuler-release-dependency.patch || \
-		echo "Patch already applied or not needed" ; \
-	fi
-	if [ -f $(CURDIR)/debian/patches/0001-smap-feat-adapt-to-different-kernels.patch ]; then \
-		cd $(CURDIR) && patch -p1 -l --forward --dry-run < debian/patches/0001-smap-feat-adapt-to-different-kernels.patch > /dev/null 2>&1 && \
-		patch -p1 -l --forward < debian/patches/0001-smap-feat-adapt-to-different-kernels.patch || \
-		echo "Patch already applied or not needed" ; \
-	fi
-	if [ -f $(CURDIR)/debian/patches/0002-smap-chore-increase-MAX_2M_PROCESSES_CNT-from-100-to-500.patch ]; then \
-		cd $(CURDIR) && patch -p1 -l --forward --dry-run < debian/patches/0002-smap-chore-increase-MAX_2M_PROCESSES_CNT-from-100-to-500.patch > /dev/null 2>&1 && \
-		patch -p1 -l --forward < debian/patches/0002-smap-chore-increase-MAX_2M_PROCESSES_CNT-from-100-to-500.patch || \
-		echo "Patch already applied or not needed" ; \
-	fi
-	if [ -f $(CURDIR)/debian/patches/0003-smap-fix-compile.patch ]; then \
-		cd $(CURDIR) && patch -p1 -l --forward --dry-run < debian/patches/0003-smap-fix-compile.patch > /dev/null 2>&1 && \
-		patch -p1 -l --forward < debian/patches/0003-smap-fix-compile.patch || \
-		echo "Patch already applied or not needed" ; \
-	fi
+	while read patchfile; do \
+		if [ -f $(CURDIR)/debian/patches/$$patchfile ]; then \
+			cd $(CURDIR) && patch -p1 -l --forward --dry-run < debian/patches/$$patchfile > /dev/null 2>&1 && \
+			patch -p1 -l --forward < debian/patches/$$patchfile || \
+			echo "Patch already applied or not needed" ; \
+		fi; \
+	done < $(CURDIR)/debian/patches/series
 
 	# ============================================================
 	# 1. libboundscheck — Debian installs to multiarch path,

@@ -1,0 +1,358 @@
+From 75b7aa765866b714a8bc7df6fdcb09053a7a1cac Mon Sep 17 00:00:00 2001
+From: woquzhao12138 <1825369014@qq.com>
+Date: Tue, 9 Jun 2026 21:04:04 +0800
+Subject: [PATCH 23/71] fix(smap): sync grouped target used pages
+
+---
+ .../smap/src/user/strategy/grouped_strategy.c | 153 ++++++++++++++++++
+ .../user/strategy/test_grouped_strategy.cpp   | 124 ++++++++++++++
+ .../user/strategy/test_strategy_config.cpp    |   6 +-
+ 3 files changed, 281 insertions(+), 2 deletions(-)
+
+diff --git a/plugins/smap/src/user/strategy/grouped_strategy.c b/plugins/smap/src/user/strategy/grouped_strategy.c
+index 687877c..21440a1 100644
+--- a/plugins/smap/src/user/strategy/grouped_strategy.c
++++ b/plugins/smap/src/user/strategy/grouped_strategy.c
+@@ -26,6 +26,7 @@
+ #define GROUP_SWAP_DEFAULT_FREQ_WT 1
+ #define GROUP_SWAP_DEFAULT_SLOW_THRED 2
+ #define GROUP_SWAP_SLOW_THRED_FACTOR 2
++#define MAX_GROUP_TARGET_ENTRY (MAX_MIGRATION_GROUP_NUM * MAX_GROUP_REMOTE_NUMA)
+ 
+ typedef struct {
+     uint64_t addr;
+@@ -51,6 +52,12 @@ typedef struct {
+     int toNid;
+ } RebalancePair;
+ 
++typedef struct {
++    int groupIdx;
++    int targetIdx;
++    uint64_t oldUsedPages;
++} GroupTargetEntry;
++
+ static int GroupPageAscFunc(const void *data1, const void *data2)
+ {
+     const GroupPageData *p1 = (const GroupPageData *)data1;
+@@ -227,6 +234,150 @@ static uint64_t CalcRemoteRemaining(const MigrationGroupAttr *group, int targetI
+     return target->quotaPages - target->usedPages;
+ }
+ 
++/*
++ * Collect all group target entries that point to the same remote NUMA.
++ * A single entry means the target is private to one group; multiple entries
++ * mean this remote NUMA is shared and must be split by quota.
++ */
++static int CollectTargetEntriesByNid(GroupMigrationPolicy *policy, int nid, GroupTargetEntry entries[], int maxEntries)
++{
++    int count = 0;
++
++    for (int i = 0; i < policy->groupCount; i++) {
++        MigrationGroupAttr *group = &policy->groups[i];
++        for (int j = 0; j < group->targetCount; j++) {
++            if (group->targets[j].nid != nid) {
++                continue;
++            }
++            if (count >= maxEntries) {
++                SMAP_LOGGER_WARNING("grouped target entry count exceeds limit on numa %d.", nid);
++                return count;
++            }
++            entries[count].groupIdx = i;
++            entries[count].targetIdx = j;
++            entries[count].oldUsedPages = group->targets[j].usedPages;
++            count++;
++        }
++    }
++    return count;
++}
++
++/* Calculate the total quota for entries sharing one remote NUMA. */
++static uint64_t CalcTargetQuotaSum(GroupMigrationPolicy *policy, const GroupTargetEntry entries[], int entryCount)
++{
++    uint64_t quotaSum = 0;
++
++    for (int i = 0; i < entryCount; i++) {
++        GroupTargetAttr *target = &policy->groups[entries[i].groupIdx].targets[entries[i].targetIdx];
++        if (UINT64_MAX - quotaSum < target->quotaPages) {
++            return UINT64_MAX;
++        }
++        quotaSum += target->quotaPages;
++    }
++    return quotaSum;
++}
++
++/*
++ * For a non-shared target, ACTC resident pages can be mapped directly to the
++ * only owning group target.
++ */
++static void SyncSingleTargetUsedPages(ProcessAttr *process, GroupTargetEntry *entry, uint64_t residentPages)
++{
++    MigrationGroupAttr *group = &process->groupPolicy.groups[entry->groupIdx];
++    GroupTargetAttr *target = &group->targets[entry->targetIdx];
++
++    target->usedPages = residentPages;
++    if (entry->oldUsedPages != residentPages) {
++        SMAP_LOGGER_INFO("grouped pid %d group %d target %d sync used pages %llu from actc, old %llu.", process->pid,
++                         entry->groupIdx, target->nid, residentPages, entry->oldUsedPages);
++    }
++    if (residentPages > target->quotaPages) {
++        SMAP_LOGGER_WARNING("grouped pid %d group %d target %d resident pages %llu exceed quota %llu.", process->pid,
++                            entry->groupIdx, target->nid, residentPages, target->quotaPages);
++    }
++}
++
++/*
++ * For a shared target, split ACTC resident pages by configured quota. This is
++ * capacity accounting only; it does not imply page-level ownership.
++ */
++static void AssignSharedTargetUsedPages(ProcessAttr *process, const GroupTargetEntry entries[], int entryCount,
++                                        uint64_t residentPages, uint64_t quotaSum)
++{
++    uint64_t assignedPages = 0;
++    GroupMigrationPolicy *policy = &process->groupPolicy;
++
++    for (int i = 0; i < entryCount; i++) {
++        GroupTargetAttr *target = &policy->groups[entries[i].groupIdx].targets[entries[i].targetIdx];
++        /* Use 128-bit multiplication to avoid overflow before division. */
++        target->usedPages = (__uint128_t)residentPages * target->quotaPages / quotaSum;
++        assignedPages += target->usedPages;
++    }
++
++    uint64_t remainingPages = residentPages - assignedPages;
++    /* Distribute truncation remainder in configuration order. */
++    for (int i = 0; i < entryCount && remainingPages > 0; i++) {
++        GroupTargetAttr *target = &policy->groups[entries[i].groupIdx].targets[entries[i].targetIdx];
++        target->usedPages++;
++        remainingPages--;
++    }
++}
++
++/* Validate shared-target quota accounting and publish the split usedPages. */
++static void SyncSharedTargetUsedPages(ProcessAttr *process, const GroupTargetEntry entries[], int entryCount,
++                                      uint64_t residentPages, uint64_t quotaSum)
++{
++    GroupMigrationPolicy *policy = &process->groupPolicy;
++    int nid = policy->groups[entries[0].groupIdx].targets[entries[0].targetIdx].nid;
++
++    if (quotaSum == 0 || quotaSum == UINT64_MAX) {
++        SMAP_LOGGER_WARNING("grouped pid %d target %d invalid quota sum %llu, skip used pages sync.", process->pid, nid,
++                            quotaSum);
++        return;
++    }
++    if (residentPages > quotaSum) {
++        SMAP_LOGGER_WARNING("grouped pid %d shared target %d resident pages %llu exceed quota sum %llu.", process->pid,
++                            nid, residentPages, quotaSum);
++    }
++
++    AssignSharedTargetUsedPages(process, entries, entryCount, residentPages, quotaSum);
++    for (int i = 0; i < entryCount; i++) {
++        GroupTargetAttr *target = &policy->groups[entries[i].groupIdx].targets[entries[i].targetIdx];
++        if (entries[i].oldUsedPages != target->usedPages) {
++            SMAP_LOGGER_INFO("grouped pid %d group %d shared target %d sync used pages %llu from actc, old %llu.",
++                             process->pid, entries[i].groupIdx, nid, target->usedPages, entries[i].oldUsedPages);
++        }
++    }
++}
++
++/*
++ * Refresh grouped target usedPages from the current ACTC scan before planning.
++ * This captures remote pages that were allocated by VM growth instead of SMAP
++ * demote, so promote can migrate them back when local reserves are below
++ * waterline.
++ */
++static void SyncGroupedTargetUsedPages(ProcessAttr *process)
++{
++    GroupMigrationPolicy *policy = &process->groupPolicy;
++
++    for (int nid = 0; nid < MAX_NODES; nid++) {
++        GroupTargetEntry entries[MAX_GROUP_TARGET_ENTRY] = { 0 };
++        int entryCount = CollectTargetEntriesByNid(policy, nid, entries, MAX_GROUP_TARGET_ENTRY);
++        if (entryCount <= 0) {
++            continue;
++        }
++
++        uint64_t residentPages = process->scanAttr.actcLen[nid];
++        if (entryCount == 1) {
++            SyncSingleTargetUsedPages(process, &entries[0], residentPages);
++            continue;
++        }
++
++        uint64_t quotaSum = CalcTargetQuotaSum(policy, entries, entryCount);
++        SyncSharedTargetUsedPages(process, entries, entryCount, residentPages, quotaSum);
++    }
++}
++
+ static bool IsSharedTarget(const GroupMigrationPolicy *policy, int groupIdx)
+ {
+     const MigrationGroupAttr *group = &policy->groups[groupIdx];
+@@ -977,6 +1128,8 @@ int GroupedMigrationStrategy(ProcessAttr *process, struct MigList mlist[MAX_NODE
+     if (!process || !process->groupPolicy.enabled) {
+         return -EINVAL;
+     }
++    /* Promote/demote/swap all depend on target usedPages accounting. */
++    SyncGroupedTargetUsedPages(process);
+     WarnUngroupedPages(process);
+     int ret = RunPromoteStage(process, mlist);
+     if (ret) {
+diff --git a/plugins/smap/test/user/strategy/test_grouped_strategy.cpp b/plugins/smap/test/user/strategy/test_grouped_strategy.cpp
+index e72b71e..907fabd 100644
+--- a/plugins/smap/test/user/strategy/test_grouped_strategy.cpp
++++ b/plugins/smap/test/user/strategy/test_grouped_strategy.cpp
+@@ -105,6 +105,130 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategyPromoteByLocalDeficit)
+     FreeMigList(mlist);
+ }
+ 
++TEST_F(GroupedStrategyTest, TestGroupedStrategySyncRemoteUsedPagesPromotesRuntimeRemotePages)
++{
++    ProcessAttr process = {};
++    struct MigList mlist[MAX_NODES][MAX_NODES] = {};
++    ActcData localPages[1] = {};
++    ActcData remotePages[2] = {};
++
++    process.pid = 113;
++    process.groupPolicy.enabled = true;
++    process.groupPolicy.groupCount = 1;
++    process.groupPolicy.groups[0].localCount = 1;
++    process.groupPolicy.groups[0].locals[0].nid = 0;
++    process.groupPolicy.groups[0].locals[0].localReservePages = 3;
++    process.groupPolicy.groups[0].targetCount = 1;
++    process.groupPolicy.groups[0].targets[0].nid = 4;
++    process.groupPolicy.groups[0].targets[0].quotaPages = 10;
++    process.groupPolicy.groups[0].targets[0].usedPages = 0;
++
++    localPages[0].addr = 0x1000;
++    process.scanAttr.actcData[0] = localPages;
++    process.scanAttr.actcLen[0] = 1;
++    remotePages[0].addr = 0x4000;
++    remotePages[0].freq = 4;
++    remotePages[1].addr = 0x5000;
++    remotePages[1].freq = 5;
++    process.scanAttr.actcData[4] = remotePages;
++    process.scanAttr.actcLen[4] = 2;
++
++    MOCKER(GetNrFreeHugePagesByNode).stubs().will(returnValue((uint64_t)10));
++
++    EXPECT_EQ(0, GroupedMigrationStrategy(&process, mlist));
++    EXPECT_EQ((uint64_t)2, process.groupPolicy.groups[0].targets[0].usedPages);
++    EXPECT_EQ(2, mlist[4][0].nr);
++    EXPECT_EQ(0x5000, mlist[4][0].addr[0]);
++    EXPECT_EQ(0x4000, mlist[4][0].addr[1]);
++
++    FreeMigList(mlist);
++}
++
++TEST_F(GroupedStrategyTest, TestGroupedStrategySyncRemoteUsedPagesAllowsOverQuotaPromote)
++{
++    ProcessAttr process = {};
++    struct MigList mlist[MAX_NODES][MAX_NODES] = {};
++    ActcData remotePages[3] = {};
++
++    process.pid = 114;
++    process.groupPolicy.enabled = true;
++    process.groupPolicy.groupCount = 1;
++    process.groupPolicy.groups[0].localCount = 1;
++    process.groupPolicy.groups[0].locals[0].nid = 0;
++    process.groupPolicy.groups[0].locals[0].localReservePages = 3;
++    process.groupPolicy.groups[0].targetCount = 1;
++    process.groupPolicy.groups[0].targets[0].nid = 4;
++    process.groupPolicy.groups[0].targets[0].quotaPages = 1;
++
++    remotePages[0].addr = 0x4000;
++    remotePages[0].freq = 4;
++    remotePages[1].addr = 0x5000;
++    remotePages[1].freq = 6;
++    remotePages[2].addr = 0x6000;
++    remotePages[2].freq = 5;
++    process.scanAttr.actcData[4] = remotePages;
++    process.scanAttr.actcLen[4] = 3;
++
++    MOCKER(GetNrFreeHugePagesByNode).stubs().will(returnValue((uint64_t)10));
++
++    EXPECT_EQ(0, GroupedMigrationStrategy(&process, mlist));
++    EXPECT_EQ((uint64_t)3, process.groupPolicy.groups[0].targets[0].usedPages);
++    EXPECT_EQ(3, mlist[4][0].nr);
++    EXPECT_EQ(0x5000, mlist[4][0].addr[0]);
++    EXPECT_EQ(0x6000, mlist[4][0].addr[1]);
++    EXPECT_EQ(0x4000, mlist[4][0].addr[2]);
++
++    FreeMigList(mlist);
++}
++
++TEST_F(GroupedStrategyTest, TestGroupedStrategySyncSharedTargetUsedPagesByQuota)
++{
++    ProcessAttr process = {};
++    struct MigList mlist[MAX_NODES][MAX_NODES] = {};
++    ActcData remotePages[4] = {};
++
++    process.pid = 115;
++    process.groupPolicy.enabled = true;
++    process.groupPolicy.groupCount = 2;
++    process.groupPolicy.groups[0].localCount = 1;
++    process.groupPolicy.groups[0].locals[0].nid = 0;
++    process.groupPolicy.groups[0].locals[0].localReservePages = 1;
++    process.groupPolicy.groups[0].targetCount = 1;
++    process.groupPolicy.groups[0].targets[0].nid = 4;
++    process.groupPolicy.groups[0].targets[0].quotaPages = 1;
++    process.groupPolicy.groups[1].localCount = 1;
++    process.groupPolicy.groups[1].locals[0].nid = 1;
++    process.groupPolicy.groups[1].locals[0].localReservePages = 3;
++    process.groupPolicy.groups[1].targetCount = 1;
++    process.groupPolicy.groups[1].targets[0].nid = 4;
++    process.groupPolicy.groups[1].targets[0].quotaPages = 3;
++
++    remotePages[0].addr = 0x4000;
++    remotePages[0].freq = 10;
++    remotePages[1].addr = 0x5000;
++    remotePages[1].freq = 20;
++    remotePages[2].addr = 0x6000;
++    remotePages[2].freq = 30;
++    remotePages[3].addr = 0x7000;
++    remotePages[3].freq = 40;
++    process.scanAttr.actcData[4] = remotePages;
++    process.scanAttr.actcLen[4] = 4;
++
++    MOCKER(GetNrFreeHugePagesByNode).stubs().will(returnValue((uint64_t)10));
++
++    EXPECT_EQ(0, GroupedMigrationStrategy(&process, mlist));
++    EXPECT_EQ((uint64_t)1, process.groupPolicy.groups[0].targets[0].usedPages);
++    EXPECT_EQ((uint64_t)3, process.groupPolicy.groups[1].targets[0].usedPages);
++    EXPECT_EQ(1, mlist[4][0].nr);
++    EXPECT_EQ(3, mlist[4][1].nr);
++    EXPECT_EQ(0x4000, mlist[4][0].addr[0]);
++    EXPECT_EQ(0x7000, mlist[4][1].addr[0]);
++    EXPECT_EQ(0x6000, mlist[4][1].addr[1]);
++    EXPECT_EQ(0x5000, mlist[4][1].addr[2]);
++
++    FreeMigList(mlist);
++}
++
+ TEST_F(GroupedStrategyTest, TestGroupedStrategyPromoteTakesPriorityWhenAnyLocalBelowReserve)
+ {
+     ProcessAttr process = {};
+diff --git a/plugins/smap/test/user/strategy/test_strategy_config.cpp b/plugins/smap/test/user/strategy/test_strategy_config.cpp
+index 05d4913..fc521e3 100644
+--- a/plugins/smap/test/user/strategy/test_strategy_config.cpp
++++ b/plugins/smap/test/user/strategy/test_strategy_config.cpp
+@@ -264,7 +264,9 @@ extern "C" int32_t ConfigSlowThreshold(char *substr, char *value);
+ TEST_F(PeriodConfigTest, ConfigSlowThresholdTest)
+ {
+     char *substr = "smap.slow.threshold";
+-    char *value = "1201";
++    constexpr uint32_t invalidSlowThreshold = MAX_MIGRATE_PERIOD / MIN_SCAN_PERIOD + 1;
++    char value[16] = {};
++    (void)snprintf(value, sizeof(value), "%u", invalidSlowThreshold);
+     MOCKER(ConfigReadValueToInt).stubs().will(returnValue(-1));
+     int32_t ret = ConfigSlowThreshold(substr, value);
+     EXPECT_EQ(-1, ret);
+@@ -273,7 +275,7 @@ TEST_F(PeriodConfigTest, ConfigSlowThresholdTest)
+     GlobalMockObject::verify();
+     ret = ConfigSlowThreshold(substr, value);
+     EXPECT_EQ(RETURN_ERROR, ret);
+-    EXPECT_EQ(1201, g_tmpStrategyConfig.slowThreshold);
++    EXPECT_EQ(invalidSlowThreshold, g_tmpStrategyConfig.slowThreshold);
+ 
+     GlobalMockObject::verify();
+     char *value1 = "40";
+-- 
+2.53.0.windows.3
+

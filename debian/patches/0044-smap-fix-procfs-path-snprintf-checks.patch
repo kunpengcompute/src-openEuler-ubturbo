@@ -1,0 +1,34 @@
+From 27a1e74a82759106c08d0317414e1c6d45bc8df6 Mon Sep 17 00:00:00 2001
+From: woquzhao12138 <1825369014@qq.com>
+Date: Wed, 17 Jun 2026 10:14:51 +0800
+Subject: [PATCH 44/71] smap: fix procfs path snprintf checks
+
+---
+ plugins/smap/src/drivers/access_pid.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/access_pid.c b/plugins/smap/src/drivers/access_pid.c
+index d408656..c0ec653 100644
+--- a/plugins/smap/src/drivers/access_pid.c
++++ b/plugins/smap/src/drivers/access_pid.c
+@@ -433,7 +433,7 @@ static bool pid_procfs_exists(pid_t pid)
+ 	struct path p;
+ 	char path[AP_PROCFS_DIR_LEN] = { 0 };
+ 	ret = snprintf(path, sizeof(path), "/proc/%s/%d", SMAP_PROC_ROOT, pid);
+-	if (ret == 0)
++	if (ret < 0 || ret >= sizeof(path))
+ 		return false;
+ 
+ 	ret = kern_path(path, LOOKUP_DIRECTORY, &p);
+@@ -455,7 +455,7 @@ static int create_procfs(struct access_pid *ap)
+ 		return -EINVAL;
+ 
+ 	ret = snprintf(dirname, sizeof(dirname), "%d", pid);
+-	if (ret == 0)
++	if (ret < 0 || ret >= sizeof(dirname))
+ 		return -EINVAL;
+ 
+ 	if (pid_procfs_exists(pid)) {
+-- 
+2.53.0.windows.3
+

@@ -1,0 +1,151 @@
+From 6c304be3142a4d864177407e2c874b846eca676e Mon Sep 17 00:00:00 2001
+From: dszhu <2549951418@qq.com>
+Date: Thu, 2 Jul 2026 13:01:50 +0800
+Subject: [PATCH 65/71] =?UTF-8?q?smap:=20=E4=BF=AE=E5=A4=8Dprior=E7=9B=B8?=
+ =?UTF-8?q?=E5=85=B3UT=E7=BC=96=E8=AF=91=E5=92=8C=E8=BF=90=E8=A1=8C?=
+ =?UTF-8?q?=E9=97=AE=E9=A2=98?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+access_pid.h增加smap_page_flags.h头文件引用以解决SMAP_ACC_CNT_MAX未声明；
+测试依赖添加LAST_CPUPID_PGSHIFT/MASK、cmpxchg、NR_PAGEFLAGS等内核常量stub；
+FillActcDataByBitmapWithDev和MemFreqReadSuccess测试添加get_page_prior_flag mock；
+TestGetNumaNodesForPid测试添加sched_getaffinity mock以修复断言失败。
+---
+ plugins/smap/src/drivers/access_pid.h            |  1 +
+ .../depends/arch/arm64/include/asm/cmpxchg.h     |  8 ++++++++
+ plugins/smap/test/depends/include/linux/atomic.h |  5 +++++
+ .../depends/include/linux/page-flags-layout.h    | 16 +++++++++-------
+ .../smap/test/depends/include/linux/page-flags.h |  1 +
+ plugins/smap/test/drivers/test_access_pid.cpp    |  3 +++
+ plugins/smap/test/user/manage/test_manage.cpp    |  3 +++
+ 7 files changed, 30 insertions(+), 7 deletions(-)
+ create mode 100644 plugins/smap/test/depends/arch/arm64/include/asm/cmpxchg.h
+
+diff --git a/plugins/smap/src/drivers/access_pid.h b/plugins/smap/src/drivers/access_pid.h
+index f99724f..eb31320 100644
+--- a/plugins/smap/src/drivers/access_pid.h
++++ b/plugins/smap/src/drivers/access_pid.h
+@@ -13,6 +13,7 @@
+ #include "access_ioctl.h"
+ #include "bus.h"
+ #include "drv_common.h"
++#include "smap_page_flags.h"
+ 
+ #define MAX_PATH_LENGTH 64
+ #define AP_PROCFS_DIR_LEN 32
+diff --git a/plugins/smap/test/depends/arch/arm64/include/asm/cmpxchg.h b/plugins/smap/test/depends/arch/arm64/include/asm/cmpxchg.h
+new file mode 100644
+index 0000000..845739e
+--- /dev/null
++++ b/plugins/smap/test/depends/arch/arm64/include/asm/cmpxchg.h
+@@ -0,0 +1,8 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _ASM_CMPXCHG_H
++#define _ASM_CMPXCHG_H
++
++/* Stub cmpxchg for UT environment */
++#define cmpxchg(ptr, old, new) (old)
++
++#endif /* _ASM_CMPXCHG_H */
+diff --git a/plugins/smap/test/depends/include/linux/atomic.h b/plugins/smap/test/depends/include/linux/atomic.h
+index adbb638..ab88b63 100644
+--- a/plugins/smap/test/depends/include/linux/atomic.h
++++ b/plugins/smap/test/depends/include/linux/atomic.h
+@@ -6,4 +6,9 @@
+ #include <linux/atomic/atomic-long.h>
+ #include <asm/atomic.h>
+ 
++/* Stub cmpxchg for UT environment */
++#ifndef cmpxchg
++#define cmpxchg(ptr, old, new) (old)
++#endif
++
+ #endif /* _LINUX_ATOMIC_H */
+diff --git a/plugins/smap/test/depends/include/linux/page-flags-layout.h b/plugins/smap/test/depends/include/linux/page-flags-layout.h
+index 3f5b992..230f77f 100644
+--- a/plugins/smap/test/depends/include/linux/page-flags-layout.h
++++ b/plugins/smap/test/depends/include/linux/page-flags-layout.h
+@@ -11,13 +11,15 @@
+ #define ZONES_SHIFT 2
+ #define ZONES_WIDTH		ZONES_SHIFT
+ 
+-#if SECTIONS_WIDTH + ZONES_WIDTH + NODES_SHIFT <= BITS_PER_LONG - NR_PAGEFLAGS
+ #define NODES_WIDTH		NODES_SHIFT
+-#else
+-#ifdef CONFIG_SPARSEMEM_VMEMMAP
+-#error "[Depends] Vmemmap: No space for nodes field in page flags"
+-#endif
+-#define NODES_WIDTH		0
+-#endif
++
++/* SMAP uses LAST_CPUPID field for accumulated access count */
++#define NR_PAGEFLAGS		56
++#define ZONES_PGOFF		(BITS_PER_LONG - ZONES_WIDTH)
++#define LAST_CPUPID_SHIFT	8
++#define LAST_CPUPID_WIDTH	LAST_CPUPID_SHIFT
++#define LAST_CPUPID_PGOFF	(ZONES_PGOFF - LAST_CPUPID_WIDTH)
++#define LAST_CPUPID_PGSHIFT	(LAST_CPUPID_PGOFF)
++#define LAST_CPUPID_MASK	((1UL << LAST_CPUPID_SHIFT) - 1)
+ 
+ #endif
+diff --git a/plugins/smap/test/depends/include/linux/page-flags.h b/plugins/smap/test/depends/include/linux/page-flags.h
+index 7481128..0a783d9 100644
+--- a/plugins/smap/test/depends/include/linux/page-flags.h
++++ b/plugins/smap/test/depends/include/linux/page-flags.h
+@@ -8,6 +8,7 @@
+ 
+ #include <linux/mm_types.h>
+ #include <linux/pfn.h>
++#include <asm/cmpxchg.h>
+ 
+ #define PageReserved(p) 0
+ 
+diff --git a/plugins/smap/test/drivers/test_access_pid.cpp b/plugins/smap/test/drivers/test_access_pid.cpp
+index c37b23e..5054716 100644
+--- a/plugins/smap/test/drivers/test_access_pid.cpp
++++ b/plugins/smap/test/drivers/test_access_pid.cpp
+@@ -1208,6 +1208,7 @@ TEST_F(DriversAccessPidTest, FillActcDataByBitmapPaddrBmNull)
+     EXPECT_EQ(0u, actc_len);
+ }
+ 
++extern "C" u8 get_page_prior_flag(int nid, size_t acidx);
+ TEST_F(DriversAccessPidTest, FillActcDataByBitmapWithDev)
+ {
+     struct access_pid ap;
+@@ -1227,6 +1228,7 @@ TEST_F(DriversAccessPidTest, FillActcDataByBitmapWithDev)
+     for (int i = 0; i < 64; i++) adev.access_bit_actc_data[i] = (actc_t)i;
+     init_rwsem(&adev.buffer_lock);
+     list_add(&adev.list, &access_dev);
++    MOCKER(get_page_prior_flag).stubs().will(returnValue((u8)0));
+     fill_actc_data_by_bitmap(&ap, 0, actc, &actc_len, 0);
+     EXPECT_GT(actc_len, 0u);
+     list_del(&adev.list);
+@@ -1288,6 +1290,7 @@ TEST_F(DriversAccessPidTest, MemFreqReadSuccess)
+     MOCKER(kvmalloc).stubs().will(returnValue((void *)malloc(1024)));
+     MOCKER(kvfree).stubs();
+     MOCKER(copy_to_user).stubs().will(returnValue((unsigned long)0));
++    MOCKER(get_page_prior_flag).stubs().will(returnValue((u8)0));
+     ssize_t ret = mem_freq_read(&filp, buf, expected_len, &ppos);
+     EXPECT_EQ((ssize_t)expected_len, ret);
+     list_del(&adev.list);
+diff --git a/plugins/smap/test/user/manage/test_manage.cpp b/plugins/smap/test/user/manage/test_manage.cpp
+index 8139a38..db3c602 100644
+--- a/plugins/smap/test/user/manage/test_manage.cpp
++++ b/plugins/smap/test/user/manage/test_manage.cpp
+@@ -1005,8 +1005,11 @@ TEST_F(ManageTest, TestGetNumaNodesForPid)
+ {
+     int pid = 1234;
+     int node = 0;
++    MOCKER(sched_getaffinity).stubs().will(returnValue(-1));
+     int ret = GetNumaNodesForPid(pid, &node);
+     EXPECT_EQ(ret, -EINVAL);
++
++    GlobalMockObject::verify();
+     MOCKER(sched_getaffinity).stubs().will(returnValue(0));
+     MOCKER(GetNodeFromCpu).stubs().will(returnValue(-EINVAL)).then(returnValue(0));
+     ret = GetNumaNodesForPid(pid, &node);
+-- 
+2.53.0.windows.3
+
