@@ -1,0 +1,139 @@
+From 3f6145192513be2caac799aa16c34174dd3732eb Mon Sep 17 00:00:00 2001
+From: dszhu <2549951418@qq.com>
+Date: Fri, 3 Jul 2026 11:46:37 +0800
+Subject: [PATCH 70/71] =?UTF-8?q?smap:=20=E4=BF=AE=E5=A4=8DUT=20ioctl?=
+ =?UTF-8?q?=E5=B8=83=E5=B1=80=E9=94=99=E8=AF=AF=EF=BC=8C=E8=B0=83=E9=80=9A?=
+ =?UTF-8?q?=E5=85=A8=E9=83=A81653=E4=B8=AAUT=E6=B5=8B=E8=AF=95?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+depends/include/linux/io.h 使用了MIPS架构的ioctl布局参数
+(_IOC_SIZEBITS=13, _IOC_DIRBITS=3, _IOC_WRITE=4U)，
+导致编译后的ioctl命令码值与aarch64实际值不匹配，
+AccessIoctlTestKernel的3个测试用例因此失败。
+
+修复内容：
+- linux/io.h: 改为aarch64正确的ioctl布局参数(SIZEBITS=14,
+  DIRBITS=2, WRITE=1U)，并添加#ifndef保护避免覆盖系统定义
+- uapi/asm-generic/ioctl.h: 修正_IOR宏从_IOC_WRITE改为_IOC_READ，
+  添加_IOC_READ定义
+- test_access_ioctl.cpp: 用宏名替代硬编码ioctl命令码值
+- run_dt.sh: lcov使用branch_coverage参数名(非已弃用的
+  lcov_branch_coverage)，添加--ignore-errors inconsistent
+---
+ plugins/smap/test/depends/include/linux/io.h  | 27 ++++++++++++++++---
+ .../depends/include/uapi/asm-generic/ioctl.h  |  6 ++++-
+ .../smap/test/drivers/test_access_ioctl.cpp   |  4 +--
+ plugins/smap/test/run_dt.sh                   |  6 ++---
+ 4 files changed, 33 insertions(+), 10 deletions(-)
+
+diff --git a/plugins/smap/test/depends/include/linux/io.h b/plugins/smap/test/depends/include/linux/io.h
+index baf85e5..b7d7954 100644
+--- a/plugins/smap/test/depends/include/linux/io.h
++++ b/plugins/smap/test/depends/include/linux/io.h
+@@ -6,14 +6,29 @@
+ #ifndef _LINUX_IO_H
+ #define _LINUX_IO_H
+ 
+-#define _IOC_DIRBITS	3
+-#define _IOC_SIZEBITS	13
++/* Use aarch64 ioctl layout (same as asm-generic with SIZEBITS=14, DIRBITS=2) */
++#ifndef _IOC_DIRBITS
++#define _IOC_DIRBITS	2
++#endif
++#ifndef _IOC_SIZEBITS
++#define _IOC_SIZEBITS	14
++#endif
++#ifndef _IOC_TYPEBITS
+ #define _IOC_TYPEBITS	8
++#endif
++#ifndef _IOC_NRBITS
+ #define _IOC_NRBITS	8
++#endif
+ 
+-#define _IOC_WRITE	4U
++#ifndef _IOC_WRITE
++#define _IOC_WRITE	1U
++#endif
++#ifndef _IOC_READ
+ #define _IOC_READ	2U
+-#define _IOC_NONE	1U
++#endif
++#ifndef _IOC_NONE
++#define _IOC_NONE	0U
++#endif
+ 
+ #define _IOC_NRMASK	((1 << _IOC_NRBITS) - 1)
+ #define _IOC_TYPEMASK	((1 << _IOC_TYPEBITS) - 1)
+@@ -30,8 +45,12 @@
+ 	 (((direction) << _IOC_DIRSHIFT) |	((type) << _IOC_TYPESHIFT) |	\
+ 	  ((number) << _IOC_NRSHIFT) | ((size) << _IOC_SIZESHIFT)))
+ 
++#ifndef _IOW
+ #define _IOW(type, number, size) _IOC(_IOC_WRITE, (type), (number), sizeof(size))
++#endif
++#ifndef _IOR
+ #define _IOR(type, number, size) _IOC(_IOC_READ, (type), (number), sizeof(size))
++#endif
+ 
+ void memunmap(void *addr);
+ void *memremap(resource_size_t offset, size_t size, unsigned long flags);
+diff --git a/plugins/smap/test/depends/include/uapi/asm-generic/ioctl.h b/plugins/smap/test/depends/include/uapi/asm-generic/ioctl.h
+index 5c3e165..c6aa11b 100644
+--- a/plugins/smap/test/depends/include/uapi/asm-generic/ioctl.h
++++ b/plugins/smap/test/depends/include/uapi/asm-generic/ioctl.h
+@@ -10,6 +10,10 @@
+ # define _IOC_SIZEBITS	14
+ #endif
+ 
++#ifndef _IOC_READ
++# define _IOC_READ	2U
++#endif
++
+ #ifndef _IOC_WRITE
+ # define _IOC_WRITE	1U
+ #endif
+@@ -31,7 +35,7 @@
+ 
+ #define _IOC_TYPECHECK(t) (sizeof(t))
+ #define _IOW(type, nr, size)	_IOC(_IOC_WRITE, (type), (nr), (_IOC_TYPECHECK(size)))
+-#define _IOR(type, nr, size)	_IOC(_IOC_WRITE, (type), (nr), (_IOC_TYPECHECK(size)))
++#define _IOR(type, nr, size)	_IOC(_IOC_READ, (type), (nr), (_IOC_TYPECHECK(size)))
+ #define _IO(type, nr)		_IOC(_IOC_NONE, (type), (nr), 0)
+ #define _IOC_NR(nr)		(((nr) >> _IOC_NRSHIFT) & _IOC_NRMASK)
+ #define _IOC_TYPE(nr)		(((nr) >> _IOC_TYPESHIFT) & _IOC_TYPEMASK)
+diff --git a/plugins/smap/test/drivers/test_access_ioctl.cpp b/plugins/smap/test/drivers/test_access_ioctl.cpp
+index ddcd06d..b1da382 100644
+--- a/plugins/smap/test/drivers/test_access_ioctl.cpp
++++ b/plugins/smap/test/drivers/test_access_ioctl.cpp
+@@ -728,10 +728,10 @@ TEST_F(AccessIoctlTestKernel, SmapAccessIoctlThree)
+     long ret;
+ 
+     MOCKER(ioctl_walk_pagemap).stubs().will(returnValue(4));
+-    ret = smap_access_ioctl(NULL, 0x4008BB04, NULL);
++    ret = smap_access_ioctl(NULL, SMAP_ACCESS_WALK_PAGEMAP, NULL);
+     EXPECT_EQ(4, ret);
+ 
+-    ret = smap_access_ioctl(NULL, 0x4324BB05, NULL);
++    ret = smap_access_ioctl(NULL, SMAP_ACCESS_GET_TRACKING + 1, NULL);
+     EXPECT_EQ(-ENOTTY, ret);
+ }
+ 
+diff --git a/plugins/smap/test/run_dt.sh b/plugins/smap/test/run_dt.sh
+index 8c6d62e..2992df1 100644
+--- a/plugins/smap/test/run_dt.sh
++++ b/plugins/smap/test/run_dt.sh
+@@ -274,6 +274,6 @@ echo Success
+ ./smap_dt
+ 
+ mkdir -p build/gcovr_report
+-lcov --d ./ --c --output-file test.info --rc lcov_branch_coverage=1
+-lcov -e test.info "*/dt_src/src/*" -output-file coverage.info --rc lcov_branch_coverage=1
+-genhtml -o gcovr_report coverage.info --show-details --legend --rc lcov_branch_coverage=1
++lcov --d ./ --c --output-file test.info --rc branch_coverage=1 --ignore-errors inconsistent
++lcov -e test.info "*/dt_src/src/*" -output-file coverage.info --rc branch_coverage=1 --ignore-errors inconsistent
++genhtml -o gcovr_report coverage.info --show-details --legend --rc branch_coverage=1
+-- 
+2.53.0.windows.3
+

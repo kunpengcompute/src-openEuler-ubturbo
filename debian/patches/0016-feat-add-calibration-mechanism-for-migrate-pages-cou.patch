@@ -1,0 +1,245 @@
+From bf37e6a5a2e79801738e34051b7255e33221a72d Mon Sep 17 00:00:00 2001
+From: discrete_brain <discrete_brain@163.com>
+Date: Mon, 8 Jun 2026 14:25:58 +0800
+Subject: [PATCH 16/71] feat: add calibration mechanism for migrate pages count
+
+---
+ plugins/smap/src/user/manage/manage.c        |  60 +++++++-
+ plugins/smap/test/user/manage/ManageTest.cpp | 139 +++++++++++++++++++
+ 2 files changed, 196 insertions(+), 3 deletions(-)
+
+diff --git a/plugins/smap/src/user/manage/manage.c b/plugins/smap/src/user/manage/manage.c
+index ec9d8e0..5c67437 100644
+--- a/plugins/smap/src/user/manage/manage.c
++++ b/plugins/smap/src/user/manage/manage.c
+@@ -1298,9 +1298,9 @@ static void CalcActcStats(ProcessAttr *attr)
+             count->freqMin = MIN(count->freqMin, freq);
+         }
+ 
+-        SMAP_LOGGER_INFO("Node%d actcLen %llu, freqMax %u, freqMin %u, freqNum %llu, "
+-                         "freqSum %llu, remoteHotNum %llu, whiteNum %llu",
+-                         nid, actcLen, count->freqMax, count->freqMin, count->freqNum, count->freqSum,
++        SMAP_LOGGER_INFO("[pid_stats] pid=%d node=%d actcLen=%llu freqMax=%u freqMin=%u freqNum=%llu freqSum=%llu "
++                         "remoteHotNum=%llu whiteNum=%llu",
++                         attr->pid, nid, actcLen, count->freqMax, count->freqMin, count->freqNum, count->freqSum,
+                          count->remoteHotNum, count->whiteNum);
+ 
+         /* 打印各频次桶的页面数（仅本地NUMA，跳过页面数为零的） */
+@@ -1314,6 +1314,55 @@ static void CalcActcStats(ProcessAttr *attr)
+     }
+ }
+ 
++/**
++ * CalibrateMigratePages - 根据最新统计的远端页面数量校准迁移量
++ */
++static void CalibrateMigratePages(ProcessAttr *attr)
++{
++    StrategyAttribute *sa = &attr->strategyAttr;
++    WalkPage *wp = &attr->walkPage;
++    int nrLocalNuma = GetNrLocalNuma();
++
++    for (int l2Index = 0; l2Index < REMOTE_NUMA_NUM; l2Index++) {
++        uint64_t remotePages = 0;
++        uint32_t arr[LOCAL_NUMA_NUM] = { 0 };
++        int arrLen = 0;
++        int local;
++        int remote = l2Index + nrLocalNuma;
++
++        for (local = 0; local < LOCAL_NUMA_NUM; local++) {
++            uint32_t nrMig = sa->remoteNrPagesAfterMigrate[local][l2Index];
++            if (nrMig) {
++                remotePages += nrMig;
++                arr[arrLen++] = local;
++                SMAP_LOGGER_INFO("[nr_mig] pid=%d local=%d remote=%d pages=%u", attr->pid, local, remote, nrMig);
++            }
++        }
++
++        if (remotePages == wp->nrPages[remote]) {
++            continue;
++        }
++
++        double ratio;
++        uint32_t nrLeft = wp->nrPages[remote];
++        uint32_t nrChunk;
++
++        for (int i = 0; i < arrLen; i++) {
++            local = arr[i];
++            if (i == arrLen - 1) {
++                sa->remoteNrPagesAfterMigrate[local][l2Index] = nrLeft;
++                SMAP_LOGGER_INFO("[cali_mig] pid=%d local=%d remote=%d pages=%u", attr->pid, local, remote, nrLeft);
++            } else {
++                ratio = (double)sa->remoteNrPagesAfterMigrate[local][l2Index] / remotePages;
++                nrChunk = wp->nrPages[remote] * ratio;
++                sa->remoteNrPagesAfterMigrate[local][l2Index] = nrChunk;
++                nrLeft -= nrChunk;
++                SMAP_LOGGER_INFO("[cali_mig] pid=%d local=%d remote=%d pages=%u", attr->pid, local, remote, nrChunk);
++            }
++        }
++    }
++}
++
+ /**
+  * DistributeActcData - 将读取的数据分配到各node的actcData
+  * @attr: ProcessAttr结构体指针
+@@ -1424,6 +1473,11 @@ static int FillPidData(ProcessAttr *attr, struct ProcessMemBitmap *pmb)
+     }
+ 
+     CalcActcStats(attr);
++
++    if (GetRunMode() == WATERLINE_MODE) {
++        CalibrateMigratePages(attr);
++    }
++
+     return 0;
+ }
+ 
+diff --git a/plugins/smap/test/user/manage/ManageTest.cpp b/plugins/smap/test/user/manage/ManageTest.cpp
+index 7fb355a..486e3b4 100644
+--- a/plugins/smap/test/user/manage/ManageTest.cpp
++++ b/plugins/smap/test/user/manage/ManageTest.cpp
+@@ -2278,3 +2278,142 @@ TEST_F(ManageTest, TestAllocBorrowPagesForMemsizeHugePage)
+     EXPECT_EQ((uint32_t)4, availPrivatePages[0][0]);
+     EXPECT_EQ((uint64_t)2048, attr.strategyAttr.memSize[0][0]);
+ }
++
++extern "C" void CalibrateMigratePages(ProcessAttr *attr);
++
++TEST_F(ManageTest, TestCalibrateMigratePagesNoChange)
++{
++    g_processManager.nrLocalNuma = 4;
++
++    ProcessAttr attr = {};
++    attr.pid = 1234;
++    attr.strategyAttr.remoteNrPagesAfterMigrate[0][0] = 100;
++    attr.strategyAttr.remoteNrPagesAfterMigrate[1][0] = 50;
++    attr.walkPage.nrPages[4] = 150;  // remotePages(150) == wp->nrPages[4](150), skip
++
++    CalibrateMigratePages(&attr);
++
++    // No change: values stay as-is
++    EXPECT_EQ((uint32_t)100, attr.strategyAttr.remoteNrPagesAfterMigrate[0][0]);
++    EXPECT_EQ((uint32_t)50, attr.strategyAttr.remoteNrPagesAfterMigrate[1][0]);
++}
++
++TEST_F(ManageTest, TestCalibrateMigratePagesSingleLocal)
++{
++    g_processManager.nrLocalNuma = 4;
++
++    ProcessAttr attr = {};
++    attr.pid = 1234;
++    attr.strategyAttr.remoteNrPagesAfterMigrate[0][0] = 100;
++    attr.walkPage.nrPages[4] = 50;  // actual pages dropped from 100 to 50
++
++    CalibrateMigratePages(&attr);
++
++    // arrLen=1, last(only) gets nrLeft=50
++    EXPECT_EQ((uint32_t)50, attr.strategyAttr.remoteNrPagesAfterMigrate[0][0]);
++}
++
++TEST_F(ManageTest, TestCalibrateMigratePagesMultiLocal)
++{
++    g_processManager.nrLocalNuma = 4;
++
++    ProcessAttr attr = {};
++    attr.pid = 1234;
++    // Two local NUMAs contribute to remote NUMA 4 (l2Index=0)
++    attr.strategyAttr.remoteNrPagesAfterMigrate[0][0] = 100;
++    attr.strategyAttr.remoteNrPagesAfterMigrate[1][0] = 100;
++    attr.walkPage.nrPages[4] = 150;  // actual dropped from 200 to 150
++
++    CalibrateMigratePages(&attr);
++
++    // remotePages=200, arr=[0,1], nrLeft=150
++    // i=0: ratio=100/200=0.5, nrChunk=150*0.5=75, nrLeft=75
++    // i=1 (last): gets nrLeft=75
++    EXPECT_EQ((uint32_t)75, attr.strategyAttr.remoteNrPagesAfterMigrate[0][0]);
++    EXPECT_EQ((uint32_t)75, attr.strategyAttr.remoteNrPagesAfterMigrate[1][0]);
++}
++
++TEST_F(ManageTest, TestCalibrateMigratePagesSkipZeroEntries)
++{
++    g_processManager.nrLocalNuma = 4;
++
++    ProcessAttr attr = {};
++    attr.pid = 1234;
++    // Local NUMA 0 has 0 entries — excluded from arr[]
++    attr.strategyAttr.remoteNrPagesAfterMigrate[0][0] = 0;
++    attr.strategyAttr.remoteNrPagesAfterMigrate[1][0] = 100;
++    attr.strategyAttr.remoteNrPagesAfterMigrate[2][0] = 100;
++    attr.walkPage.nrPages[4] = 300;  // actual increased from 200 to 300
++
++    CalibrateMigratePages(&attr);
++
++    // remotePages=200, arr=[1,2], nrLeft=300
++    // i=0 (arr[0]=1): ratio=100/200=0.5, nrChunk=300*0.5=150, nrLeft=150
++    // i=1 (arr[1]=2, last): gets nrLeft=150
++    EXPECT_EQ((uint32_t)0, attr.strategyAttr.remoteNrPagesAfterMigrate[0][0]);   // unchanged (was 0)
++    EXPECT_EQ((uint32_t)150, attr.strategyAttr.remoteNrPagesAfterMigrate[1][0]);
++    EXPECT_EQ((uint32_t)150, attr.strategyAttr.remoteNrPagesAfterMigrate[2][0]);
++}
++
++TEST_F(ManageTest, TestCalibrateMigratePagesMultiRemote)
++{
++    g_processManager.nrLocalNuma = 4;
++
++    ProcessAttr attr = {};
++    attr.pid = 1234;
++    // l2Index=0: remotePages=100, actual=100 → skip
++    attr.strategyAttr.remoteNrPagesAfterMigrate[0][0] = 100;
++    attr.walkPage.nrPages[4] = 100;
++    // l2Index=1: remotePages=200, actual=100 → calibrate
++    attr.strategyAttr.remoteNrPagesAfterMigrate[0][1] = 200;
++    attr.walkPage.nrPages[5] = 100;  // l2Index=1, remote=5
++
++    CalibrateMigratePages(&attr);
++
++    // l2Index=0: unchanged (remotePages==actual)
++    EXPECT_EQ((uint32_t)100, attr.strategyAttr.remoteNrPagesAfterMigrate[0][0]);
++    // l2Index=1: arrLen=1, last gets nrLeft=100
++    EXPECT_EQ((uint32_t)100, attr.strategyAttr.remoteNrPagesAfterMigrate[0][1]);
++}
++
++TEST_F(ManageTest, TestCalibrateMigratePagesToZero)
++{
++    g_processManager.nrLocalNuma = 4;
++
++    ProcessAttr attr = {};
++    attr.pid = 1234;
++    attr.strategyAttr.remoteNrPagesAfterMigrate[0][0] = 100;
++    attr.strategyAttr.remoteNrPagesAfterMigrate[1][0] = 50;
++    attr.walkPage.nrPages[4] = 0;  // all pages gone from remote NUMA 4
++
++    CalibrateMigratePages(&attr);
++
++    // remotePages=150, arr=[0,1], nrLeft=0
++    // i=0: ratio=100/150≈0.667, nrChunk=0*0.667=0, nrLeft=0
++    // i=1 (last): gets nrLeft=0
++    EXPECT_EQ((uint32_t)0, attr.strategyAttr.remoteNrPagesAfterMigrate[0][0]);
++    EXPECT_EQ((uint32_t)0, attr.strategyAttr.remoteNrPagesAfterMigrate[1][0]);
++}
++
++TEST_F(ManageTest, TestCalibrateMigratePagesThreeLocals)
++{
++    g_processManager.nrLocalNuma = 4;
++
++    ProcessAttr attr = {};
++    attr.pid = 1234;
++    // Three local NUMAs with different proportions
++    attr.strategyAttr.remoteNrPagesAfterMigrate[0][0] = 10;   // 10%
++    attr.strategyAttr.remoteNrPagesAfterMigrate[1][0] = 30;   // 30%
++    attr.strategyAttr.remoteNrPagesAfterMigrate[2][0] = 60;   // 60%
++    attr.walkPage.nrPages[4] = 200;  // actual doubled from 100 to 200
++
++    CalibrateMigratePages(&attr);
++
++    // remotePages=100, arr=[0,1,2], nrLeft=200
++    // i=0 (arr[0]=0): ratio=10/100=0.1, nrChunk=200*0.1=20, nrLeft=180
++    // i=1 (arr[1]=1): ratio=30/100=0.3, nrChunk=200*0.3=60, nrLeft=120
++    // i=2 (arr[2]=2, last): gets nrLeft=120
++    EXPECT_EQ((uint32_t)20, attr.strategyAttr.remoteNrPagesAfterMigrate[0][0]);
++    EXPECT_EQ((uint32_t)60, attr.strategyAttr.remoteNrPagesAfterMigrate[1][0]);
++    EXPECT_EQ((uint32_t)120, attr.strategyAttr.remoteNrPagesAfterMigrate[2][0]);
++}
+-- 
+2.53.0.windows.3
+

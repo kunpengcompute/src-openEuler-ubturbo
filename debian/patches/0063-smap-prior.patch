@@ -1,0 +1,248 @@
+From 6c18b36586918a7d308b3d66942c87b1d92506eb Mon Sep 17 00:00:00 2001
+From: dszhu <2549951418@qq.com>
+Date: Wed, 1 Jul 2026 20:07:29 +0800
+Subject: [PATCH 63/71] =?UTF-8?q?smap:=20=E6=99=AE=E9=80=9A=E8=BF=9B?=
+ =?UTF-8?q?=E7=A8=8B=E5=9C=BA=E6=99=AF=E5=88=A9=E7=94=A8prior=E4=BC=98?=
+ =?UTF-8?q?=E5=8C=96=E8=BF=81=E7=A7=BB=E9=80=89=E6=8B=A9?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+内核态：
+- 新增 smap_page_flags.h，使用 page->flags 位25-32 存储累计访问频次
+- check_pte_young 中页面young时累计频次加一（非大页场景）
+- fill_actc_data_by_bitmap 区分场景填充prior：2M虚机从mapping获取，普通进程从page->flags获取
+
+用户态：
+- CollectPages 在阈值频次页面中按prior排序后选取
+- 迁出场景：prior小的页面优先迁出（升序排列）
+- 迁回场景：prior大的页面优先迁回（降序排列）
+---
+ plugins/smap/src/drivers/access_pid.c      | 34 +++++++++--
+ plugins/smap/src/drivers/access_pid.h      |  9 ++-
+ plugins/smap/src/drivers/access_tracking.c |  3 +
+ plugins/smap/src/drivers/accessed_bit.c    |  6 ++
+ plugins/smap/src/drivers/smap_page_flags.h | 65 ++++++++++++++++++++++
+ 5 files changed, 110 insertions(+), 7 deletions(-)
+ create mode 100644 plugins/smap/src/drivers/smap_page_flags.h
+
+diff --git a/plugins/smap/src/drivers/access_pid.c b/plugins/smap/src/drivers/access_pid.c
+index 5b8850a..7395408 100644
+--- a/plugins/smap/src/drivers/access_pid.c
++++ b/plugins/smap/src/drivers/access_pid.c
+@@ -21,6 +21,8 @@
+ #include "access_tracking.h"
+ #include "access_mmu.h"
+ #include "access_pid.h"
++#include "access_acpi_mem.h"
++#include "smap_page_flags.h"
+ 
+ #undef pr_fmt
+ #define pr_fmt(fmt) "access_pid: " fmt
+@@ -236,6 +238,28 @@ static int mem_freq_release(struct inode *inode, struct file *file)
+ 	return 0;
+ }
+ 
++static u8 get_page_prior_flag(int nid, size_t acidx)
++{
++	u64 paddr = 0;
++	unsigned long pfn;
++	struct page *page;
++	if (nid < nr_local_numa) {
++		if (calc_acidx_paddr_acpi(nid, acidx, &paddr, PAGE_SIZE))
++			return 0;
++	}
++	else {
++		if (calc_acidx_paddr_iomem(nid, acidx, &paddr, PAGE_SIZE))
++			return 0;
++
++	}
++	pfn = PHYS_PFN(paddr);
++	if (pfn_valid(pfn)) {
++		page = pfn_to_page(pfn);
++		return get_smap_acc_cnt(page);
++	}
++	return 0;
++}
++
+ /**
+  * fill_actc_data_by_bitmap - 根据bitmap生成actc_data数组
+  * @ap: access_pid结构体指针
+@@ -288,13 +312,11 @@ static void fill_actc_data_by_bitmap(struct access_pid *ap, int nid,
+ 		actc[len_cnt].freq = adev->access_bit_actc_data[acidx];
+ 
+ 		/* 填充prior - 从mapping获取 */
+-		if (ap->info.vm_size && ap->info.mapping &&
+-		    (mapping_offset + len_cnt) < ap->info.vm_size) {
+-			actc[len_cnt].prior =
+-				ap->info.mapping[mapping_offset + len_cnt] &
+-				0xff;
++		if (ap->info.vm_size && ap->info.mapping) {
++			actc[len_cnt].prior = (mapping_offset + len_cnt) < ap->info.vm_size ?
++				(ap->info.mapping[mapping_offset + len_cnt] & 0xff) : 0;
+ 		} else {
+-			actc[len_cnt].prior = 0;
++			actc[len_cnt].prior = get_page_prior_flag(nid, acidx);
+ 		}
+ 
+ 		/* 填充is_white_list */
+diff --git a/plugins/smap/src/drivers/access_pid.h b/plugins/smap/src/drivers/access_pid.h
+index d489c71..f99724f 100644
+--- a/plugins/smap/src/drivers/access_pid.h
++++ b/plugins/smap/src/drivers/access_pid.h
+@@ -63,6 +63,8 @@ struct access_pid {
+ 	u32 scan_time;
+ 	u32 ntimes;
+ 	u32 cur_times;
++	u32 acc_times;
++	bool prior_decay;
+ 	struct delayed_work scan_work;
+ 	struct completion work_done;
+ 	u32 scan_count[SMAP_MAX_NUMNODES];
+@@ -136,7 +138,12 @@ static inline bool access_pid_is_scanning(pid_t pid)
+ 
+ static inline bool access_pid_cur_last_scanning(struct access_pid *ap)
+ {
+-	return ap->type == NORMAL_SCAN && ap->cur_times + 1 >= ap->ntimes;
++	return ap->type == NORMAL_SCAN && (ap->cur_times + 1 >= ap->ntimes);
++}
++
++static inline bool access_pid_cur_prior_decay(struct access_pid *ap)
++{
++	return ap->type == NORMAL_SCAN && (ap->acc_times >= SMAP_ACC_CNT_MAX);
+ }
+ 
+ static inline void clear_vm_mapping(u32 *mapping, u32 len)
+diff --git a/plugins/smap/src/drivers/access_tracking.c b/plugins/smap/src/drivers/access_tracking.c
+index 314f338..d149e64 100644
+--- a/plugins/smap/src/drivers/access_tracking.c
++++ b/plugins/smap/src/drivers/access_tracking.c
+@@ -31,6 +31,7 @@
+ #include "access_pid.h"
+ #include "hist_ops.h"
+ #include "access_tracking.h"
++#include "smap_page_flags.h"
+ 
+ #define MAX_SCAN_TIME 100000 /* 100s */
+ #define MS_TO_US 1000
+@@ -443,6 +444,7 @@ static void work_func(struct work_struct *work)
+ 	if (access_pid_cur_last_scanning(ap))
+ 		access_walk_pagemap_prepare(ap);
+ 
++	ap->prior_decay = access_pid_cur_prior_decay(ap);
+ 	adev_buffer_down_read();
+ 	down_read(&ap_data.lock);
+ 	page_size = get_page_size(adev);
+@@ -460,6 +462,7 @@ static void work_func(struct work_struct *work)
+ 		       adev->page_count, page_size, adev->node);
+ 	}
+ 	ap->cur_times++;
++	ap->acc_times = ap->prior_decay ? 0 : (ap->acc_times + 1);
+ 	pr_debug("pid[%d] cpu[%d], scan took %lldus for %dth time\n", ap->pid,
+ 		 raw_smp_processor_id(), scan_time, ap->cur_times);
+ 
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index adc751b..f08876e 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -35,6 +35,7 @@
+ #include "access_mmu.h"
+ #include "access_tracking.h"
+ #include "accessed_bit.h"
++#include "smap_page_flags.h"
+ 
+ #define DECIMAL 10
+ #define DEFAULT_REF_COUNT 0
+@@ -1369,6 +1370,9 @@ static int check_pte_young(pte_t *pte, unsigned long addr, unsigned long next,
+ 			pte_walk->group_hot = is_young;
+ 		else if (pte_walk->group_hot) {
+ 			pte_walk->group_hot_skip_cnt++;
++			if (!is_file_or_shared_page(page) && is_young) {
++				inc_smap_acc_cnt(page, pte_walk->ap->prior_decay);
++			}
+ 			goto save_res;
+ 		}
+ 	}
+@@ -1383,6 +1387,8 @@ static int check_pte_young(pte_t *pte, unsigned long addr, unsigned long next,
+ #else
+ 			__ptep_test_and_clear_young(NULL, 0, pte);
+ #endif
++			if (pte_walk->type == NORMAL_SCAN)
++				inc_smap_acc_cnt(page, pte_walk->ap->prior_decay);
+ 		}
+ 		pte_walk->flag = true;
+ 	}
+diff --git a/plugins/smap/src/drivers/smap_page_flags.h b/plugins/smap/src/drivers/smap_page_flags.h
+new file mode 100644
+index 0000000..c1a4d34
+--- /dev/null
++++ b/plugins/smap/src/drivers/smap_page_flags.h
+@@ -0,0 +1,65 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
++ * Description: SMAP page flags for accumulated access count
++ */
++
++#ifndef _SMAP_PAGE_FLAGS_H
++#define _SMAP_PAGE_FLAGS_H
++
++#include <linux/mm.h>
++#include <linux/mmzone.h>
++
++/*
++ * 使用LAST_CPUPID字段存储累计访问频次
++ * SMAP插件禁用了numa_balance，因此LAST_CPUPID是闲置的
++ * 页面释放时LAST_CPUPID会自动重置为全1
++ * 衰减机制：每SMAP_ACC_CNT_MAX次扫描周期执行一次衰减，
++ * acc_times达到SMAP_ACC_CNT_MAX时归零，当前扫描周期标记为衰减周期。
++ * 衰减时先右移再递增，保证prior值在SMAP_ACC_CNT_MAX以内。
++ */
++
++#define SMAP_ACC_CNT_MAX       254			/* 8位字段最大可用值 */
++#define SMAP_ACC_CNT_INIT    LAST_CPUPID_MASK	/* 0xFF=255, 哨兵值 */
++
++/*
++ * 获取累计访问频次
++ */
++static inline u8 get_smap_acc_cnt(struct page *page)
++{
++	unsigned long flags = READ_ONCE(page->flags);
++	u8 cnt = (flags >> LAST_CPUPID_PGSHIFT) & LAST_CPUPID_MASK;
++	if (cnt == SMAP_ACC_CNT_INIT)
++		return 0;
++
++	return min_t(u8, cnt, SMAP_ACC_CNT_MAX);
++}
++
++/*
++ * inc_smap_acc_cnt - 累计访问频次加一
++ * @page: 目标页面
++ * @decay: 是否执行衰减（当前扫描周期为衰减周期时为true）
++ *
++ * decay为true时，先右移衰减再递增：stored=N → (N>>1)+1
++ * decay为false时，直接递增：stored=N → N+1
++ * 使用cmpxchg实现原子更新，失败则跳过（不重试）。
++ */
++static inline void inc_smap_acc_cnt(struct page *page, bool decay)
++{
++	unsigned long old_flags, new_flags;
++	u8 cnt, new_cnt;
++
++	old_flags = READ_ONCE(page->flags);
++	cnt = (old_flags >> LAST_CPUPID_PGSHIFT) & LAST_CPUPID_MASK;
++	if (cnt == SMAP_ACC_CNT_INIT)
++		cnt = 0;
++	new_cnt = (cnt >> decay);
++	if (new_cnt >= SMAP_ACC_CNT_MAX)
++		return;
++
++	new_flags = old_flags & ~(LAST_CPUPID_MASK << LAST_CPUPID_PGSHIFT);
++	new_flags |= ((unsigned long)(++new_cnt) << LAST_CPUPID_PGSHIFT);
++	cmpxchg(&page->flags, old_flags, new_flags);
++}
++
++#endif /* _SMAP_PAGE_FLAGS_H */
+-- 
+2.53.0.windows.3
+

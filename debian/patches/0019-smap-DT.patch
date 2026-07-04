@@ -1,0 +1,117 @@
+From 124b88573d764c9def16dc656ce685221cf9d517 Mon Sep 17 00:00:00 2001
+From: dszhu <2549951418@qq.com>
+Date: Tue, 9 Jun 2026 17:13:44 +0800
+Subject: [PATCH 19/71] =?UTF-8?q?smap:DT=E4=BB=A3=E7=A0=81=E6=96=87?=
+ =?UTF-8?q?=E4=BB=B6=E9=87=8D=E5=91=BD=E5=90=8D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../test/user/advanced-strategy/{SceneTest.cpp => test_scene.cpp} | 0
+ .../user/manage/{AccessIoctlTest.cpp => test_access_ioctl.cpp}    | 0
+ plugins/smap/test/user/manage/{DeviceTest.cpp => test_device.cpp} | 0
+ plugins/smap/test/user/manage/{ManageTest.cpp => test_manage.cpp} | 0
+ .../test/user/manage/{OomMigrateTest.cpp => test_oom_migrate.cpp} | 0
+ .../test/user/manage/{SmapConfigTest.cpp => test_smap_config.cpp} | 0
+ plugins/smap/test/user/manage/{ThreadTest.cpp => test_thread.cpp} | 0
+ .../{GroupedStrategyTest.cpp => test_grouped_strategy.cpp}        | 0
+ .../test/user/strategy/{MigrationTest.cpp => test_migration.cpp}  | 0
+ .../{SeparateStrategyTest.cpp => test_separate_strategy.cpp}      | 0
+ .../test/user/strategy/{StrategyTest.cpp => test_strategy.cpp}    | 0
+ .../strategy/{strategy_config.cpp => test_strategy_config.cpp}    | 0
+ plugins/smap/test/user/strategy/{VirtTest.cpp => test_virt.cpp}   | 0
+ .../user/{InnerInterfaceTest.cpp => test_inner_interface.cpp}     | 0
+ plugins/smap/test/user/{InterfaceTest.cpp => test_interface.cpp}  | 0
+ .../test/user/{SmapLogCoreTest.cpp => test_smap_log_core.cpp}     | 0
+ .../test/user/{SmapUserLogTest.cpp => test_smap_user_log.cpp}     | 0
+ 17 files changed, 0 insertions(+), 0 deletions(-)
+ rename plugins/smap/test/user/advanced-strategy/{SceneTest.cpp => test_scene.cpp} (100%)
+ rename plugins/smap/test/user/manage/{AccessIoctlTest.cpp => test_access_ioctl.cpp} (100%)
+ rename plugins/smap/test/user/manage/{DeviceTest.cpp => test_device.cpp} (100%)
+ rename plugins/smap/test/user/manage/{ManageTest.cpp => test_manage.cpp} (100%)
+ rename plugins/smap/test/user/manage/{OomMigrateTest.cpp => test_oom_migrate.cpp} (100%)
+ rename plugins/smap/test/user/manage/{SmapConfigTest.cpp => test_smap_config.cpp} (100%)
+ rename plugins/smap/test/user/manage/{ThreadTest.cpp => test_thread.cpp} (100%)
+ rename plugins/smap/test/user/strategy/{GroupedStrategyTest.cpp => test_grouped_strategy.cpp} (100%)
+ rename plugins/smap/test/user/strategy/{MigrationTest.cpp => test_migration.cpp} (100%)
+ rename plugins/smap/test/user/strategy/{SeparateStrategyTest.cpp => test_separate_strategy.cpp} (100%)
+ rename plugins/smap/test/user/strategy/{StrategyTest.cpp => test_strategy.cpp} (100%)
+ rename plugins/smap/test/user/strategy/{strategy_config.cpp => test_strategy_config.cpp} (100%)
+ rename plugins/smap/test/user/strategy/{VirtTest.cpp => test_virt.cpp} (100%)
+ rename plugins/smap/test/user/{InnerInterfaceTest.cpp => test_inner_interface.cpp} (100%)
+ rename plugins/smap/test/user/{InterfaceTest.cpp => test_interface.cpp} (100%)
+ rename plugins/smap/test/user/{SmapLogCoreTest.cpp => test_smap_log_core.cpp} (100%)
+ rename plugins/smap/test/user/{SmapUserLogTest.cpp => test_smap_user_log.cpp} (100%)
+
+diff --git a/plugins/smap/test/user/advanced-strategy/SceneTest.cpp b/plugins/smap/test/user/advanced-strategy/test_scene.cpp
+similarity index 100%
+rename from plugins/smap/test/user/advanced-strategy/SceneTest.cpp
+rename to plugins/smap/test/user/advanced-strategy/test_scene.cpp
+diff --git a/plugins/smap/test/user/manage/AccessIoctlTest.cpp b/plugins/smap/test/user/manage/test_access_ioctl.cpp
+similarity index 100%
+rename from plugins/smap/test/user/manage/AccessIoctlTest.cpp
+rename to plugins/smap/test/user/manage/test_access_ioctl.cpp
+diff --git a/plugins/smap/test/user/manage/DeviceTest.cpp b/plugins/smap/test/user/manage/test_device.cpp
+similarity index 100%
+rename from plugins/smap/test/user/manage/DeviceTest.cpp
+rename to plugins/smap/test/user/manage/test_device.cpp
+diff --git a/plugins/smap/test/user/manage/ManageTest.cpp b/plugins/smap/test/user/manage/test_manage.cpp
+similarity index 100%
+rename from plugins/smap/test/user/manage/ManageTest.cpp
+rename to plugins/smap/test/user/manage/test_manage.cpp
+diff --git a/plugins/smap/test/user/manage/OomMigrateTest.cpp b/plugins/smap/test/user/manage/test_oom_migrate.cpp
+similarity index 100%
+rename from plugins/smap/test/user/manage/OomMigrateTest.cpp
+rename to plugins/smap/test/user/manage/test_oom_migrate.cpp
+diff --git a/plugins/smap/test/user/manage/SmapConfigTest.cpp b/plugins/smap/test/user/manage/test_smap_config.cpp
+similarity index 100%
+rename from plugins/smap/test/user/manage/SmapConfigTest.cpp
+rename to plugins/smap/test/user/manage/test_smap_config.cpp
+diff --git a/plugins/smap/test/user/manage/ThreadTest.cpp b/plugins/smap/test/user/manage/test_thread.cpp
+similarity index 100%
+rename from plugins/smap/test/user/manage/ThreadTest.cpp
+rename to plugins/smap/test/user/manage/test_thread.cpp
+diff --git a/plugins/smap/test/user/strategy/GroupedStrategyTest.cpp b/plugins/smap/test/user/strategy/test_grouped_strategy.cpp
+similarity index 100%
+rename from plugins/smap/test/user/strategy/GroupedStrategyTest.cpp
+rename to plugins/smap/test/user/strategy/test_grouped_strategy.cpp
+diff --git a/plugins/smap/test/user/strategy/MigrationTest.cpp b/plugins/smap/test/user/strategy/test_migration.cpp
+similarity index 100%
+rename from plugins/smap/test/user/strategy/MigrationTest.cpp
+rename to plugins/smap/test/user/strategy/test_migration.cpp
+diff --git a/plugins/smap/test/user/strategy/SeparateStrategyTest.cpp b/plugins/smap/test/user/strategy/test_separate_strategy.cpp
+similarity index 100%
+rename from plugins/smap/test/user/strategy/SeparateStrategyTest.cpp
+rename to plugins/smap/test/user/strategy/test_separate_strategy.cpp
+diff --git a/plugins/smap/test/user/strategy/StrategyTest.cpp b/plugins/smap/test/user/strategy/test_strategy.cpp
+similarity index 100%
+rename from plugins/smap/test/user/strategy/StrategyTest.cpp
+rename to plugins/smap/test/user/strategy/test_strategy.cpp
+diff --git a/plugins/smap/test/user/strategy/strategy_config.cpp b/plugins/smap/test/user/strategy/test_strategy_config.cpp
+similarity index 100%
+rename from plugins/smap/test/user/strategy/strategy_config.cpp
+rename to plugins/smap/test/user/strategy/test_strategy_config.cpp
+diff --git a/plugins/smap/test/user/strategy/VirtTest.cpp b/plugins/smap/test/user/strategy/test_virt.cpp
+similarity index 100%
+rename from plugins/smap/test/user/strategy/VirtTest.cpp
+rename to plugins/smap/test/user/strategy/test_virt.cpp
+diff --git a/plugins/smap/test/user/InnerInterfaceTest.cpp b/plugins/smap/test/user/test_inner_interface.cpp
+similarity index 100%
+rename from plugins/smap/test/user/InnerInterfaceTest.cpp
+rename to plugins/smap/test/user/test_inner_interface.cpp
+diff --git a/plugins/smap/test/user/InterfaceTest.cpp b/plugins/smap/test/user/test_interface.cpp
+similarity index 100%
+rename from plugins/smap/test/user/InterfaceTest.cpp
+rename to plugins/smap/test/user/test_interface.cpp
+diff --git a/plugins/smap/test/user/SmapLogCoreTest.cpp b/plugins/smap/test/user/test_smap_log_core.cpp
+similarity index 100%
+rename from plugins/smap/test/user/SmapLogCoreTest.cpp
+rename to plugins/smap/test/user/test_smap_log_core.cpp
+diff --git a/plugins/smap/test/user/SmapUserLogTest.cpp b/plugins/smap/test/user/test_smap_user_log.cpp
+similarity index 100%
+rename from plugins/smap/test/user/SmapUserLogTest.cpp
+rename to plugins/smap/test/user/test_smap_user_log.cpp
+-- 
+2.53.0.windows.3
+

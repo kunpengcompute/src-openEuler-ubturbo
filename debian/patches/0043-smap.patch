@@ -1,0 +1,801 @@
+From 5fcb16fcaed5c204309c285e83d29d7fd8119f70 Mon Sep 17 00:00:00 2001
+From: yuyuanxun <2972982755@qq.com>
+Date: Tue, 16 Jun 2026 15:34:25 +0800
+Subject: [PATCH 43/71] =?UTF-8?q?smap:=20=E5=8F=96=E6=B6=88=E5=86=85?=
+ =?UTF-8?q?=E5=AD=98=E5=9B=9E=E8=B0=83=E5=87=BD=E6=95=B0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ plugins/smap/src/drivers/Makefile             |   2 +-
+ plugins/smap/src/drivers/access_ioctl.c       |   2 +
+ plugins/smap/src/drivers/access_ioctl.h       |   1 +
+ plugins/smap/src/drivers/access_iomem.c       |   3 -
+ plugins/smap/src/drivers/access_iomem.h       |   1 -
+ plugins/smap/src/drivers/access_tracking.c    |  32 +---
+ plugins/smap/src/drivers/accessed_bit.h       |   1 -
+ plugins/smap/src/drivers/hist_tracking.c      |  25 +---
+ plugins/smap/src/drivers/hist_tracking.h      |   1 -
+ plugins/smap/src/drivers/memory_notifier.c    | 119 ---------------
+ plugins/smap/src/drivers/memory_notifier.h    |  14 --
+ plugins/smap/src/drivers/tracking_ioctl.h     |   2 +
+ plugins/smap/src/tiering/iomem.c              |   2 -
+ plugins/smap/src/user/manage/access_ioctl.h   |   1 +
+ plugins/smap/src/user/manage/device.c         |  13 ++
+ plugins/smap/src/user/manage/device.h         |   2 +
+ plugins/smap/src/user/strategy/migration.c    |   1 +
+ plugins/smap/test/CMakeLists.txt              |   2 -
+ .../smap/test/drivers/test_access_iomem.cpp   |   7 -
+ .../test/drivers/test_access_tracking.cpp     |   6 +-
+ .../test/drivers/test_memory_notifier.cpp     | 140 ------------------
+ plugins/smap/test/run_dt.sh                   |   3 -
+ .../test/tiering/test_smap_migrate_pages.cpp  |   1 +
+ 23 files changed, 39 insertions(+), 342 deletions(-)
+ delete mode 100644 plugins/smap/src/drivers/memory_notifier.c
+ delete mode 100644 plugins/smap/src/drivers/memory_notifier.h
+ delete mode 100644 plugins/smap/test/drivers/test_memory_notifier.cpp
+
+diff --git a/plugins/smap/src/drivers/Makefile b/plugins/smap/src/drivers/Makefile
+index fbbe947..dea2b9b 100644
+--- a/plugins/smap/src/drivers/Makefile
++++ b/plugins/smap/src/drivers/Makefile
+@@ -7,7 +7,7 @@ obj-m += smap_histogram_tracking.o
+ 
+ smap_tracking_core-objs := core.o
+ smap_tracking_core-objs += bus.o
+-smap_access_tracking-objs := access_iomem.o access_acpi_helper.o access_acpi_mem.o hist_ops.o hist_tracking.o accessed_bit.o access_ioctl.o access_pid.o access_mmu.o access_tracking.o kvm_pgtable.o access_tracking_wrapper.o memory_notifier.o
++smap_access_tracking-objs := access_iomem.o access_acpi_helper.o access_acpi_mem.o hist_ops.o hist_tracking.o accessed_bit.o access_ioctl.o access_pid.o access_mmu.o access_tracking.o kvm_pgtable.o access_tracking_wrapper.o
+ smap_histogram_tracking-objs := ub_hist.o
+ 
+ ccflags-y += -DACPI_NOT_READY
+diff --git a/plugins/smap/src/drivers/access_ioctl.c b/plugins/smap/src/drivers/access_ioctl.c
+index 4feebbc..65feb66 100644
+--- a/plugins/smap/src/drivers/access_ioctl.c
++++ b/plugins/smap/src/drivers/access_ioctl.c
+@@ -501,6 +501,8 @@ static long smap_access_ioctl(struct file *file, unsigned int cmd,
+ 		return ioctl_create_smap_procfs(argp);
+ 	case SMAP_ACCESS_GET_NR_LOCAL_NUMA:
+ 		return ioctl_get_nr_local_numa(argp);
++	case SMAP_ACCESS_REFRESH_REMOTE_RAM:
++		return refresh_remote_ram();
+ 	default:
+ 		rc = -ENOTTY;
+ 	}
+diff --git a/plugins/smap/src/drivers/access_ioctl.h b/plugins/smap/src/drivers/access_ioctl.h
+index 6eb07e2..1e6c7df 100644
+--- a/plugins/smap/src/drivers/access_ioctl.h
++++ b/plugins/smap/src/drivers/access_ioctl.h
+@@ -92,6 +92,7 @@ extern struct proc_dir_entry *smap_procfs_root;
+ 	_IOW(SMAP_ACCESS_MAGIC, 5, struct tracking_info_payload)
+ #define SMAP_ACCESS_CREATE_PROCFS _IOW(SMAP_ACCESS_MAGIC, 6, struct user_info)
+ #define SMAP_ACCESS_GET_NR_LOCAL_NUMA _IOR(SMAP_ACCESS_MAGIC, 7, int)
++#define SMAP_ACCESS_REFRESH_REMOTE_RAM _IO(SMAP_ACCESS_MAGIC, 8)
+ 
+ void access_ioctl_exit(void);
+ int access_ioctl_init(void);
+diff --git a/plugins/smap/src/drivers/access_iomem.c b/plugins/smap/src/drivers/access_iomem.c
+index 09ddc25..c6c8618 100644
+--- a/plugins/smap/src/drivers/access_iomem.c
++++ b/plugins/smap/src/drivers/access_iomem.c
+@@ -27,7 +27,6 @@ EXPORT_SYMBOL(remote_ram_list);
+ 
+ DEFINE_RWLOCK(rem_ram_list_lock);
+ EXPORT_SYMBOL(rem_ram_list_lock);
+-bool remote_ram_changed; /* Protected by rem_ram_list_lock */
+ 
+ static void free_remote_ram(struct list_head *head)
+ {
+@@ -180,8 +179,6 @@ int refresh_remote_ram(void)
+ 	free_remote_ram(&remote_ram_list);
+ 	move_remote_ram(&remote_ram_list, &tmp_head);
+ 	free_remote_ram(&tmp_head);
+-	remote_ram_changed = true;
+-	pr_info("remote ram was changed\n");
+ 	write_unlock(&rem_ram_list_lock);
+ 	return 0;
+ }
+diff --git a/plugins/smap/src/drivers/access_iomem.h b/plugins/smap/src/drivers/access_iomem.h
+index 630da00..5cf1311 100644
+--- a/plugins/smap/src/drivers/access_iomem.h
++++ b/plugins/smap/src/drivers/access_iomem.h
+@@ -19,7 +19,6 @@
+ extern struct list_head remote_ram_list;
+ extern int nr_local_numa;
+ extern rwlock_t rem_ram_list_lock;
+-extern bool remote_ram_changed;
+ extern unsigned int smap_scene;
+ struct ram_segment {
+ 	struct list_head node;
+diff --git a/plugins/smap/src/drivers/access_tracking.c b/plugins/smap/src/drivers/access_tracking.c
+index b44ca67..b5d4e61 100644
+--- a/plugins/smap/src/drivers/access_tracking.c
++++ b/plugins/smap/src/drivers/access_tracking.c
+@@ -26,7 +26,6 @@
+ #include "access_iomem.h"
+ #include "access_ioctl.h"
+ #include "access_tracking_wrapper.h"
+-#include "memory_notifier.h"
+ #include "access_pid.h"
+ #include "accessed_bit.h"
+ #include "access_pid.h"
+@@ -221,18 +220,16 @@ static int actc_buffer_reinit(struct access_tracking_dev *adev)
+ static void access_tracking_enable(struct device *ldev)
+ {
+ 	struct access_tracking_dev *adev = to_accessbit_dev(ldev);
++	int ret;
++
+ 	if (adev->is_hist)
+ 		return;
+ 	down_write(&adev->buffer_lock);
+-	if (adev->need_reinit_actc) {
+-		if (actc_buffer_reinit(adev)) {
+-			pr_err("unable to reinit ACTC buffer\n");
+-			up_write(&adev->buffer_lock);
+-			return;
+-		}
+-		adev->need_reinit_actc = false;
+-	} else {
+-		init_actc_data(adev);
++	ret = actc_buffer_reinit(adev);
++	if (ret) {
++		pr_err("unable to reinit ACTC buffer\n");
++		up_write(&adev->buffer_lock);
++		return;
+ 	}
+ 	up_write(&adev->buffer_lock);
+ 	submit_scan_works(adev);
+@@ -283,23 +280,11 @@ static int access_tracking_set_page_size(struct device *ldev,
+ 	return 0;
+ }
+ 
+-static void access_tracking_set_reinit_pending(struct device *ldev)
+-{
+-	struct access_tracking_dev *adev = to_accessbit_dev(ldev);
+-	if (adev->is_hist)
+-		return;
+-	down_write(&adev->buffer_lock);
+-	adev->need_reinit_actc = true;
+-	up_write(&adev->buffer_lock);
+-	pr_debug("set reinit pending flag for node %d\n", adev->node);
+-}
+-
+ static struct tracking_operations access_tracking_ops = {
+ 	.tracking_enable = access_tracking_enable,
+ 	.tracking_disable = access_tracking_disable,
+ 	.tracking_set_page_size = access_tracking_set_page_size,
+ 	.tracking_mode_set = access_tracking_mode_set,
+-	.tracking_set_reinit_pending = access_tracking_set_reinit_pending,
+ };
+ 
+ int calc_access_len(struct access_tracking_dev *adev)
+@@ -544,7 +529,6 @@ static int __init access_tracking_init(void)
+ 	if (ret) {
+ 		goto err_remote_ram;
+ 	}
+-	memory_notifier_init();
+ 
+ 	ret = access_ioctl_init();
+ 	if (ret) {
+@@ -578,7 +562,6 @@ err_tracking_add:
+ 	release_adev();
+ 	access_ioctl_exit();
+ err_ioctl:
+-	memory_notifier_exit();
+ 	release_remote_ram();
+ err_remote_ram:
+ 	reset_acpi_mem();
+@@ -594,7 +577,6 @@ static void __exit access_tracking_exit(void)
+ 	release_adev();
+ 	release_remote_ram();
+ 	reset_acpi_mem();
+-	memory_notifier_exit();
+ 	pr_info("access tracking exit successfully\n");
+ }
+ 
+diff --git a/plugins/smap/src/drivers/accessed_bit.h b/plugins/smap/src/drivers/accessed_bit.h
+index 6c0fc56..2001a8b 100644
+--- a/plugins/smap/src/drivers/accessed_bit.h
++++ b/plugins/smap/src/drivers/accessed_bit.h
+@@ -23,7 +23,6 @@
+ extern struct list_head remote_ram_list;
+ extern int nr_local_numa;
+ extern struct access_pid_struct ap_data;
+-extern bool remote_ram_changed;
+ 
+ struct statistics_tracking_info {
+ 	pid_t pid;
+diff --git a/plugins/smap/src/drivers/hist_tracking.c b/plugins/smap/src/drivers/hist_tracking.c
+index fd0bed4..d89df1d 100644
+--- a/plugins/smap/src/drivers/hist_tracking.c
++++ b/plugins/smap/src/drivers/hist_tracking.c
+@@ -126,18 +126,15 @@ static int actc_buffer_reinit(struct access_tracking_dev *hdev)
+ static void hist_tracking_enable(struct device *ldev)
+ {
+ 	struct access_tracking_dev *hdev;
++	int ret;
+ 
+ 	hdev = to_access_tracking_dev(ldev);
+ 	down_write(&hdev->buffer_lock);
+-	if (hdev->need_reinit_actc) {
+-		if (actc_buffer_reinit(hdev)) {
+-			pr_err("unable to reinit ACTC buffer\n");
+-			up_write(&hdev->buffer_lock);
+-			return;
+-		}
+-		hdev->need_reinit_actc = false;
+-	} else {
+-		reset_actc_data(hdev);
++	ret = actc_buffer_reinit(hdev);
++	if (ret) {
++		pr_err("unable to reinit ACTC buffer\n");
++		up_write(&hdev->buffer_lock);
++		return;
+ 	}
+ 	up_write(&hdev->buffer_lock);
+ 	hdev->enable_on = true;
+@@ -168,20 +165,10 @@ static int hist_tracking_set_page_size(struct device *ldev, u8 pgsize)
+ 	return ret;
+ }
+ 
+-static void hist_tracking_set_reinit_pending(struct device *ldev)
+-{
+-	struct access_tracking_dev *hdev = to_access_tracking_dev(ldev);
+-	down_write(&hdev->buffer_lock);
+-	hdev->need_reinit_actc = true;
+-	up_write(&hdev->buffer_lock);
+-	pr_debug("set reinit pending flag for node %d\n", hdev->node);
+-}
+-
+ static struct tracking_operations g_hist_tracking_ops = {
+ 	.tracking_enable = hist_tracking_enable,
+ 	.tracking_disable = hist_tracking_disable,
+ 	.tracking_set_page_size = hist_tracking_set_page_size,
+-	.tracking_set_reinit_pending = hist_tracking_set_reinit_pending,
+ };
+ 
+ static int actc_buffer_init(struct access_tracking_dev *hdev)
+diff --git a/plugins/smap/src/drivers/hist_tracking.h b/plugins/smap/src/drivers/hist_tracking.h
+index cd1f2a2..e56976a 100644
+--- a/plugins/smap/src/drivers/hist_tracking.h
++++ b/plugins/smap/src/drivers/hist_tracking.h
+@@ -41,7 +41,6 @@ struct access_tracking_dev {
+ 	struct delayed_work scan_work;
+ 	struct rw_semaphore buffer_lock;
+ 	struct completion work_done;
+-	bool need_reinit_actc;
+ } __attribute__((aligned(8)));
+ 
+ void access_tracking_dev_release(struct device *dev);
+diff --git a/plugins/smap/src/drivers/memory_notifier.c b/plugins/smap/src/drivers/memory_notifier.c
+deleted file mode 100644
+index fb85d85..0000000
+--- a/plugins/smap/src/drivers/memory_notifier.c
++++ /dev/null
+@@ -1,119 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0-only
+-/*
+- * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+- * Description: smap memory notifier
+- */
+-
+-#include <linux/kernel.h>
+-#include <linux/module.h>
+-#include <linux/notifier.h>
+-#include <linux/memory.h>
+-
+-#include "bus.h"
+-#include "check.h"
+-#include "access_acpi_mem.h"
+-#include "access_iomem.h"
+-#include "access_tracking.h"
+-#include "memory_notifier.h"
+-
+-#undef pr_fmt
+-#define pr_fmt(fmt) "SMAP_memory_notifier: " fmt
+-
+-#define SMAP_MN_CALLBACK_PRI 100
+-
+-static int memory_notifier_cb(struct memory_notify *mnb, unsigned long action)
+-{
+-	int ret;
+-	int nid;
+-	struct page *page;
+-	unsigned long start_pfn = mnb->start_pfn;
+-
+-	pr_debug("remote memory %s detected\n",
+-		 (action == MEM_ONLINE ? "online" : "offline"));
+-
+-	if (smap_scene == UB_QEMU_SCENE)
+-		return 0;
+-
+-	/* Find the node which the memory block belongs to */
+-	if (action == MEM_ONLINE) {
+-		if (!pfn_valid(start_pfn)) {
+-			pr_err("invalid start pfn has passed to SMAP memory notifier\n");
+-			return -EINVAL;
+-		}
+-		page = pfn_to_online_page(start_pfn);
+-		if (!page) {
+-			pr_err("unable to find page according to pfn\n");
+-			return -EINVAL;
+-		}
+-		nid = page_to_nid(page);
+-	} else {
+-		nid = get_numa_by_pfn(start_pfn);
+-	}
+-	if (nid == NUMA_NO_NODE) {
+-		pr_warn("unable to find NUMA node according to pfn\n");
+-	}
+-
+-	ret = refresh_remote_ram();
+-	if (ret) {
+-		pr_err("unable to update remote memory info, ret: %d\n", ret);
+-		return ret;
+-	}
+-	pr_debug(
+-		"update remote memory info on remote NUMA node: %d successfully\n",
+-		nid);
+-
+-	/* set delayed reinit flag instead of immediate reinit */
+-	set_reinit_pending_flag(nid);
+-	pr_debug("set reinit pending flag for NUMA node: %d\n", nid);
+-
+-	return 0;
+-}
+-
+-static int pre_offline_notifier_cb(struct memory_notify *mnb,
+-				   unsigned long action)
+-{
+-	pr_info("memory is going offline\n");
+-
+-	if (smap_scene == UB_QEMU_SCENE)
+-		return 0;
+-
+-	return 0;
+-}
+-
+-static int smap_memory_notifier(struct notifier_block *self,
+-				unsigned long action, void *arg)
+-{
+-	struct memory_notify *mnb = (struct memory_notify *)arg;
+-	int ret = 0;
+-
+-	switch (action) {
+-	case MEM_ONLINE:
+-	case MEM_OFFLINE:
+-		ret = memory_notifier_cb(mnb, action);
+-		break;
+-	case MEM_GOING_OFFLINE:
+-		ret = pre_offline_notifier_cb(mnb, action);
+-		break;
+-	default:
+-		break;
+-	}
+-
+-	pr_debug("handle memory notify, ret: %d\n", ret);
+-	return NOTIFY_OK;
+-}
+-
+-static struct notifier_block smap_nb = {
+-	.notifier_call = smap_memory_notifier,
+-	.priority = SMAP_MN_CALLBACK_PRI,
+-};
+-
+-int memory_notifier_init(void)
+-{
+-	int ret = register_memory_notifier(&smap_nb);
+-	return ret;
+-}
+-
+-void memory_notifier_exit(void)
+-{
+-	unregister_memory_notifier(&smap_nb);
+-}
+diff --git a/plugins/smap/src/drivers/memory_notifier.h b/plugins/smap/src/drivers/memory_notifier.h
+deleted file mode 100644
+index 74f4283..0000000
+--- a/plugins/smap/src/drivers/memory_notifier.h
++++ /dev/null
+@@ -1,14 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0 */
+-/*
+- * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+- * Description: smap memory notifier
+- */
+-
+-#ifndef _MEMORY_NOTIFIER_H
+-#define _MEMORY_NOTIFIER_H
+-
+-extern int tracking_core_reinit_actc_buffer(int nid);
+-int memory_notifier_init(void);
+-void memory_notifier_exit(void);
+-
+-#endif /* _MEMORY_NOTIFIER_H */
+diff --git a/plugins/smap/src/drivers/tracking_ioctl.h b/plugins/smap/src/drivers/tracking_ioctl.h
+index 9300dbf..bbe405e 100644
+--- a/plugins/smap/src/drivers/tracking_ioctl.h
++++ b/plugins/smap/src/drivers/tracking_ioctl.h
+@@ -21,6 +21,8 @@
+ 
+ #define SMAP_IOCTL_PAGE_SIZE_SET_CMD _IOW('N', 4, unsigned long)
+ 
++#define SMAP_IOCTL_REFRESH_REMOTE_RAM_CMD _IO('N', 5)
++
+ enum node_tracking_cmd {
+ 	TRACKING_DISABLED,
+ 	TRACKING_ENABLED,
+diff --git a/plugins/smap/src/tiering/iomem.c b/plugins/smap/src/tiering/iomem.c
+index b3ace89..e397d20 100644
+--- a/plugins/smap/src/tiering/iomem.c
++++ b/plugins/smap/src/tiering/iomem.c
+@@ -35,7 +35,6 @@
+ #define HEX 16
+ 
+ LIST_HEAD(remote_ram_list);
+-static bool remote_ram_changed;
+ 
+ struct obmm_dev_info {
+ 	struct list_head list;
+@@ -480,7 +479,6 @@ int refresh_remote_ram(void)
+ 	free_remote_ram(&remote_ram_list);
+ 	copy_remote_ram(&remote_ram_list, &tmp_head);
+ 	free_remote_ram(&tmp_head);
+-	remote_ram_changed = false;
+ 	ret = iterate_obmm_dev();
+ 	if (ret) {
+ 		pr_err("failed to interate obmm_dev, ret: %d\n", ret);
+diff --git a/plugins/smap/src/user/manage/access_ioctl.h b/plugins/smap/src/user/manage/access_ioctl.h
+index dfbd973..49f02d7 100644
+--- a/plugins/smap/src/user/manage/access_ioctl.h
++++ b/plugins/smap/src/user/manage/access_ioctl.h
+@@ -69,6 +69,7 @@ struct UserInfo {
+ #define SMAP_ACCESS_GET_TRACKING _IOW(SMAP_ACCESS_MAGIC, 5, struct TrakingInfoPayload)
+ #define SMAP_ACCESS_CREATE_PROCFS _IOW(SMAP_ACCESS_MAGIC, 6, struct UserInfo)
+ #define SMAP_ACCESS_GET_NR_LOCAL_NUMA _IOR(SMAP_ACCESS_MAGIC, 7, int)
++#define SMAP_ACCESS_REFRESH_REMOTE_RAM _IO(SMAP_ACCESS_MAGIC, 8)
+ 
+ int AccessIoctlAddPid(int len, struct AccessAddPidPayload *payload);
+ int AccessIoctlRemovePid(int len, struct AccessRemovePidPayload *payload);
+diff --git a/plugins/smap/src/user/manage/device.c b/plugins/smap/src/user/manage/device.c
+index 9f2ddc5..7b7ed31 100644
+--- a/plugins/smap/src/user/manage/device.c
++++ b/plugins/smap/src/user/manage/device.c
+@@ -92,6 +92,19 @@ int DisableTracking(struct ProcessManager *manager)
+     return ret;
+ }
+ 
++int RefreshRemoteRam(struct ProcessManager *manager)
++{
++    if (manager->fds.access < 0) {
++        SMAP_LOGGER_ERROR("access device fd is invalid: %d", manager->fds.access);
++        return -EINVAL;
++    }
++    if (ioctl(manager->fds.access, SMAP_ACCESS_REFRESH_REMOTE_RAM, 0) < 0) {
++        SMAP_LOGGER_ERROR("refresh_remote_ram ioctl failed: %s.", strerror(errno));
++        return -errno;
++    }
++    return 0;
++}
++
+ static int ConfigTrackingDev(int *trackingFds, uint32_t pageSize)
+ {
+     int ret = 0;
+diff --git a/plugins/smap/src/user/manage/device.h b/plugins/smap/src/user/manage/device.h
+index a43236a..460db9f 100644
+--- a/plugins/smap/src/user/manage/device.h
++++ b/plugins/smap/src/user/manage/device.h
+@@ -31,6 +31,8 @@ int EnableTracking(struct ProcessManager *manager);
+ 
+ int DisableTracking(struct ProcessManager *manager);
+ 
++int RefreshRemoteRam(struct ProcessManager *manager);
++
+ int InitTrackingDev(struct ProcessManager *manager);
+ 
+ void DeinitTrackingDev(struct ProcessManager *manager);
+diff --git a/plugins/smap/src/user/strategy/migration.c b/plugins/smap/src/user/strategy/migration.c
+index 8e9dd9e..31a36d5 100644
+--- a/plugins/smap/src/user/strategy/migration.c
++++ b/plugins/smap/src/user/strategy/migration.c
+@@ -747,6 +747,7 @@ int ScanMigrateWork(ThreadCtx *ctx)
+         RestoreNewPidScanTime(ctx);
+     }
+ out:
++    RefreshRemoteRam(manager);
+     // 启动扫描
+     EnableTracking(manager);
+     SMAP_LOGGER_DEBUG("Tracking enabled.");
+diff --git a/plugins/smap/test/CMakeLists.txt b/plugins/smap/test/CMakeLists.txt
+index e3c0645..6fed2d5 100644
+--- a/plugins/smap/test/CMakeLists.txt
++++ b/plugins/smap/test/CMakeLists.txt
+@@ -114,8 +114,6 @@ list(APPEND TEST_SRC ${SMAP_SRC}/src/drivers/access_pid.c)
+ list(APPEND TEST_SRC ${SMAP_SRC}/src/drivers/access_tracking.c)
+ list(APPEND TEST_SRC ${SMAP_SRC}/src/drivers/access_tracking_wrapper.c)
+ 
+-list(APPEND TEST_SRC ${SMAP_SRC}/src/drivers/memory_notifier.c)
+-
+ list(APPEND TEST_SRC ${SMAP_SRC}/src/drivers/ub_hist.c)
+ list(APPEND TEST_SRC ${SMAP_SRC}/src/drivers/hist_ops.c)
+ 
+diff --git a/plugins/smap/test/drivers/test_access_iomem.cpp b/plugins/smap/test/drivers/test_access_iomem.cpp
+index 384ea5a..10f0201 100644
+--- a/plugins/smap/test/drivers/test_access_iomem.cpp
++++ b/plugins/smap/test/drivers/test_access_iomem.cpp
+@@ -183,17 +183,14 @@ TEST_F(AccessIomemTest, release_remote_ram)
+     drivers_release_remote_ram();
+ }
+ 
+-extern bool drivers_remote_ram_changed;
+ extern unsigned int drivers_smap_scene;
+ TEST_F(AccessIomemTest, refresh_remote_ram_normal_scene)
+ {
+     int ret;
+-    drivers_remote_ram_changed = false;
+     drivers_smap_scene = NORMAL_SCENE;
+     MOCKER(drivers_walk_system_ram_remote_range).stubs().will(returnValue(-EINVAL));
+     ret = drivers_refresh_remote_ram();
+     EXPECT_EQ(-EINVAL, ret);
+-    EXPECT_FALSE(drivers_remote_ram_changed);
+ 
+     GlobalMockObject::reset();
+     MOCKER(drivers_walk_system_ram_remote_range).stubs().will(returnValue(0));
+@@ -201,18 +198,15 @@ TEST_F(AccessIomemTest, refresh_remote_ram_normal_scene)
+     MOCKER(move_remote_ram).stubs().will(ignoreReturnValue());
+     ret = drivers_refresh_remote_ram();
+     EXPECT_EQ(0, ret);
+-    EXPECT_TRUE(drivers_remote_ram_changed);
+ }
+ 
+ TEST_F(AccessIomemTest, refresh_remote_ram_ub_qemu_scene)
+ {
+     int ret;
+-    drivers_remote_ram_changed = false;
+     drivers_smap_scene = UB_QEMU_SCENE;
+     MOCKER(drivers_fixed_remote_ram).stubs().will(returnValue(-EINVAL));
+     ret = drivers_refresh_remote_ram();
+     EXPECT_EQ(-EINVAL, ret);
+-    EXPECT_FALSE(drivers_remote_ram_changed);
+ 
+     GlobalMockObject::reset();
+     MOCKER(drivers_fixed_remote_ram).stubs().will(returnValue(0));
+@@ -220,7 +214,6 @@ TEST_F(AccessIomemTest, refresh_remote_ram_ub_qemu_scene)
+     MOCKER(move_remote_ram).stubs().will(ignoreReturnValue());
+     ret = drivers_refresh_remote_ram();
+     EXPECT_EQ(0, ret);
+-    EXPECT_TRUE(drivers_remote_ram_changed);
+ }
+ 
+ TEST_F(AccessIomemTest, get_numa_by_pfn)
+diff --git a/plugins/smap/test/drivers/test_access_tracking.cpp b/plugins/smap/test/drivers/test_access_tracking.cpp
+index e1e976b..dd69685 100644
+--- a/plugins/smap/test/drivers/test_access_tracking.cpp
++++ b/plugins/smap/test/drivers/test_access_tracking.cpp
+@@ -51,10 +51,11 @@ TEST_F(AccessTrackingTest, is_access_hugepage)
+ 
+ extern "C" void drivers_init_actc_data(struct access_tracking_dev *adev);
+ extern "C" void access_tracking_enable(struct device *ldev);
++extern "C" int actc_buffer_reinit(struct access_tracking_dev *adev);
+ TEST_F(AccessTrackingTest, access_tracking_enable)
+ {
+         struct access_tracking_dev dev;
+-        MOCKER(drivers_init_actc_data).stubs().will(ignoreReturnValue());
++        MOCKER(actc_buffer_reinit).stubs().will(ignoreReturnValue());
+         (void)access_tracking_enable(&dev.ldev);
+ }
+ 
+@@ -119,7 +120,6 @@ TEST_F(AccessTrackingTest, access_print_acpi_mem)
+     access_print_acpi_mem();
+ }
+ 
+-extern "C" int actc_buffer_reinit(struct access_tracking_dev *adev);
+ TEST_F(AccessTrackingTest, actc_buffer_reinit)
+ {
+     struct access_tracking_dev adev;
+@@ -322,7 +322,6 @@ TEST_F(AccessTrackingTest, access_tracking_init_two)
+ }
+ 
+ extern "C" void release_remote_ram(void);
+-extern "C" void memory_notifier_exit(void);
+ extern "C" void __exit access_tracking_exit(void);
+ extern "C" void destroy_scan_workqueue(void);
+ TEST_F(AccessTrackingTest, access_tracking_exit)
+@@ -335,7 +334,6 @@ TEST_F(AccessTrackingTest, access_tracking_exit)
+     MOCKER(kfree).stubs();
+     MOCKER(release_remote_ram).stubs();
+     MOCKER(reset_acpi_mem).stubs();
+-    MOCKER(memory_notifier_exit).stubs();
+     access_tracking_exit();
+     list_del(&adev.list);
+ }
+\ No newline at end of file
+diff --git a/plugins/smap/test/drivers/test_memory_notifier.cpp b/plugins/smap/test/drivers/test_memory_notifier.cpp
+deleted file mode 100644
+index e3a5a10..0000000
+--- a/plugins/smap/test/drivers/test_memory_notifier.cpp
++++ /dev/null
+@@ -1,140 +0,0 @@
+-/*
+- * Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
+- * Description: SMAP5.0 远端内存监控模块测试代码
+- */
+-
+-#include "gtest/gtest.h"
+-#include "mockcpp/mokc.h"
+-
+-#include <linux/kernel.h>
+-#include <linux/module.h>
+-#include <linux/notifier.h>
+-#include <linux/memory.h>
+-
+-#include "check.h"
+-#include "access_acpi_mem.h"
+-#include "access_iomem.h"
+-#include "access_tracking.h"
+-#include "memory_notifier.h"
+-
+-using namespace std;
+-extern "C" unsigned int drivers_smap_scene;
+-
+-class MemNotifierTest : public ::testing::Test {
+-protected:
+-    void SetUp() override
+-    {
+-        std::cout << "[Phase SetUp Begin]" << std::endl;
+-        std::cout << "[Phase SetUp End]" << std::endl;
+-    }
+-    void TearDown() override
+-    {
+-        std::cout << "[Phase TearDown Begin]" << std::endl;
+-        GlobalMockObject::reset();
+-        std::cout << "[Phase TearDown End]" << std::endl;
+-    }
+-};
+-
+-extern "C" struct page *pfn_to_online_page(unsigned long pfn);
+-extern "C" bool pfn_valid(unsigned long pfn);
+-extern "C" int refresh_remote_ram(void);
+-extern "C" int memory_notifier_cb(struct memory_notify *mnb, unsigned long action);
+-TEST_F(MemNotifierTest, memory_notifier_cb)
+-{
+-    int ret;
+-    struct page page;
+-    struct memory_notify mnb = {
+-        .start_pfn = 0,
+-        .nr_pages = 10,
+-    };
+-    drivers_smap_scene = UB_QEMU_SCENE;
+-    ret = memory_notifier_cb(&mnb, MEM_ONLINE);
+-    EXPECT_EQ(0, ret);
+-
+-    drivers_smap_scene = NORMAL_SCENE;
+-    MOCKER(pfn_valid).stubs().will(returnValue(false));
+-    ret = memory_notifier_cb(&mnb, MEM_ONLINE);
+-    EXPECT_EQ(-EINVAL, ret);
+-
+-    GlobalMockObject::reset();
+-    MOCKER(pfn_to_online_page).stubs().will(returnValue(&page));
+-    MOCKER(page_to_nid).stubs().will(returnValue(0));
+-    MOCKER(refresh_remote_ram).stubs().will(returnValue(0));
+-    MOCKER(set_reinit_pending_flag).stubs().will(ignoreReturnValue());
+-    ret = memory_notifier_cb(&mnb, MEM_ONLINE);
+-    EXPECT_EQ(0, ret);
+-
+-    GlobalMockObject::reset();
+-    MOCKER(pfn_to_online_page).stubs().will(returnValue(static_cast<struct page *>(nullptr)));
+-    ret = memory_notifier_cb(&mnb, MEM_ONLINE);
+-    EXPECT_EQ(-EINVAL, ret);
+-}
+-
+-TEST_F(MemNotifierTest, memory_notifier_cb_two)
+-{
+-    int ret;
+-    struct page page;
+-    struct memory_notify mnb = {
+-        .start_pfn = 0,
+-        .nr_pages = 10,
+-    };
+-    drivers_smap_scene = NORMAL_SCENE;
+-    MOCKER(get_numa_by_pfn).stubs().will(returnValue(NUMA_NO_NODE));
+-    MOCKER(pfn_to_online_page).stubs().will(returnValue(&page));
+-    MOCKER(page_to_nid).stubs().will(returnValue(0));
+-    MOCKER(refresh_remote_ram).stubs()
+-        .will(returnValue(-EINVAL))
+-        .then(returnValue(0));
+-    MOCKER(set_reinit_pending_flag).stubs().will(ignoreReturnValue());
+-    ret = memory_notifier_cb(&mnb, MEM_OFFLINE);
+-    EXPECT_EQ(-EINVAL, ret);
+-    ret = memory_notifier_cb(&mnb, MEM_OFFLINE);
+-    EXPECT_EQ(0, ret);
+-}
+-
+-extern "C" int pre_offline_notifier_cb(struct memory_notify *mnb, unsigned long action);
+-TEST_F(MemNotifierTest, pre_offline_notifier_cb)
+-{
+-    int ret;
+-    struct memory_notify mnb;
+-    ret = pre_offline_notifier_cb(&mnb, MEM_ONLINE);
+-    EXPECT_EQ(0, ret);
+-}
+-
+-extern "C" int smap_memory_notifier(struct notifier_block *self,
+-    unsigned long action, void *arg);
+-TEST_F(MemNotifierTest, smap_memory_notifier)
+-{
+-    int ret;
+-    struct notifier_block nb;
+-    MOCKER(memory_notifier_cb).stubs().will(returnValue(0));
+-    ret = smap_memory_notifier(&nb, MEM_ONLINE, NULL);
+-    EXPECT_EQ(NOTIFY_OK, ret);
+-}
+-
+-TEST_F(MemNotifierTest, smap_memory_notifier_two)
+-{
+-    int ret;
+-    struct notifier_block nb;
+-    MOCKER(pre_offline_notifier_cb).stubs().will(returnValue(0));
+-    ret = smap_memory_notifier(&nb, MEM_GOING_OFFLINE, NULL);
+-    EXPECT_EQ(NOTIFY_OK, ret);
+-
+-    ret = smap_memory_notifier(&nb, MEM_CANCEL_ONLINE, NULL);
+-    EXPECT_EQ(NOTIFY_OK, ret);
+-}
+-
+-extern "C" int memory_notifier_init(void);
+-TEST_F(MemNotifierTest, memory_notifier_init)
+-{
+-    int ret;
+-    struct notifier_block nb;
+-    MOCKER(register_memory_notifier).stubs().will(returnValue(0));
+-    ret = memory_notifier_init();
+-    EXPECT_EQ(0, ret);
+-}
+-
+-TEST_F(MemNotifierTest, memory_notifier_exit)
+-{
+-    memory_notifier_exit();
+-}
+diff --git a/plugins/smap/test/run_dt.sh b/plugins/smap/test/run_dt.sh
+index 5415451..b717050 100644
+--- a/plugins/smap/test/run_dt.sh
++++ b/plugins/smap/test/run_dt.sh
+@@ -115,7 +115,6 @@ replace_string "${code_dir}/src/drivers/access_mmu.c" "calc_paddr_acidx_iomem" "
+ replace_string "${code_dir}/src/drivers/access_ioctl.c" "ram_changed" "drivers_ram_changed"
+ 
+ replace_string "${code_dir}/src/drivers/access_iomem.h" "remote_ram_list" "drivers_remote_ram_list"
+-replace_string "${code_dir}/src/drivers/access_iomem.h" "remote_ram_changed" "drivers_remote_ram_changed"
+ replace_string "${code_dir}/src/drivers/access_iomem.h" "free_remote_ram" "drivers_free_remote_ram"
+ replace_string "${code_dir}/src/drivers/access_iomem.h" "copy_remote_ram" "drivers_copy_remote_ram"
+ replace_string "${code_dir}/src/drivers/access_iomem.h" "__ram_changed" "drivers__ram_changed"
+@@ -128,7 +127,6 @@ replace_string "${code_dir}/src/drivers/access_iomem.h" "calc_paddr_acidx_iomem"
+ 
+ 
+ replace_string "${code_dir}/src/drivers/access_iomem.c" "remote_ram_list" "drivers_remote_ram_list"
+-replace_string "${code_dir}/src/drivers/access_iomem.c" "remote_ram_changed" "drivers_remote_ram_changed"
+ replace_string "${code_dir}/src/drivers/access_iomem.c" "free_remote_ram" "drivers_free_remote_ram"
+ replace_string "${code_dir}/src/drivers/access_iomem.c" "copy_remote_ram" "drivers_copy_remote_ram"
+ replace_string "${code_dir}/src/drivers/access_iomem.c" "__ram_changed" "drivers__ram_changed"
+@@ -144,7 +142,6 @@ replace_string "${code_dir}/src/drivers/access_iomem.c" "fixed_remote_ram" "driv
+ replace_string "${code_dir}/src/drivers/access_iomem.c" "calc_acidx_paddr_iomem" "drivers_calc_acidx_paddr_iomem"
+ replace_string "${code_dir}/src/drivers/access_iomem.c" "merge_ram_segments" "drivers_merge_ram_segments"
+ replace_string "${code_dir}/src/drivers/access_iomem.c" "update_resource" "drivers_update_resource"
+-replace_string "${code_dir}/src/drivers/memory_notifier.c" "smap_scene" "drivers_smap_scene"
+ 
+ replace_string "${code_dir}/src/drivers/access_acpi_mem.c" "mem_info acpi_mem" "mem_info drivers_acpi_mem"
+ replace_string "${code_dir}/src/drivers/access_acpi_mem.c" "acpi_mem.mem" "drivers_acpi_mem.mem"
+diff --git a/plugins/smap/test/tiering/test_smap_migrate_pages.cpp b/plugins/smap/test/tiering/test_smap_migrate_pages.cpp
+index ca58e9d..f972897 100644
+--- a/plugins/smap/test/tiering/test_smap_migrate_pages.cpp
++++ b/plugins/smap/test/tiering/test_smap_migrate_pages.cpp
+@@ -984,6 +984,7 @@ TEST_F(SmapMigratePagesTest, DoMigrateNrFoliosZeroGotoAgainInvalidPfn)
+     struct mig_list *mig_list = (struct mig_list *)kmalloc(sizeof(struct mig_list), GFP_KERNEL);
+ 
+     mig_list[0].from = NUMA_NO_NODE + 1;
++    mig_list[0].to = nr_local_numa;
+     mig_list[0].nr = nr_total;
+     mig_list[0].addr = (u64*)vzalloc(nr_total * sizeof(u64));
+     ASSERT_NE(nullptr, mig_list[0].addr);
+-- 
+2.53.0.windows.3
+

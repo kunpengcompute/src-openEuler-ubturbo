@@ -1,0 +1,59 @@
+From aaaeb922028a1cf1f4a56c5d445a92dbcd28a5ef Mon Sep 17 00:00:00 2001
+From: meng_zhaohui <mengzhaohui3@huawei.com>
+Date: Thu, 4 Jun 2026 19:25:43 +0800
+Subject: [PATCH 04/71] =?UTF-8?q?fix(rmrs):=20=E6=AD=A3=E7=A1=AE=E5=A4=84?=
+ =?UTF-8?q?=E7=90=86=E7=A9=BApidInfos=E4=BD=86=E5=B7=B2=E8=AF=BB=E5=8F=96n?=
+ =?UTF-8?q?uma=5Fmap=E7=9A=84=E6=83=85=E5=86=B5?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+当进程没有匿名或libvirt内存时，pidInfos可能为空，但这不应被视为收集失败。
+添加hasReadNumaMap标志来区分"完全读取失败"和"正常读取但无有效数据"的情况，
+避免将后者误报为错误。
+---
+ .../src/ubturbo_plugin/export/rmrs_resource_export.cpp   | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/plugins/rmrs/src/ubturbo_plugin/export/rmrs_resource_export.cpp b/plugins/rmrs/src/ubturbo_plugin/export/rmrs_resource_export.cpp
+index dac04ef..7683f1f 100644
+--- a/plugins/rmrs/src/ubturbo_plugin/export/rmrs_resource_export.cpp
++++ b/plugins/rmrs/src/ubturbo_plugin/export/rmrs_resource_export.cpp
+@@ -428,6 +428,7 @@ RmrsResult ResourceExport::CollectPidNumaInfo(const std::vector<pid_t> &pids,
+                                               std::vector<mempooling::PidInfo> &pidInfos)
+ {
+     std::set<uint16_t> localNodeIds = GetLocalNodeIds();
++    bool hasReadNumaMap = false;
+     for (auto &pid : pids) {
+         UBTURBO_LOG_DEBUG(RMRS_MODULE_NAME, RMRS_MODULE_CODE)
+             << "[ContainerPidNumaInfo] Start to collect pid=" << pid << ".";
+@@ -436,6 +437,7 @@ RmrsResult ResourceExport::CollectPidNumaInfo(const std::vector<pid_t> &pids,
+         if (rmrs::OsHelper::ReadNumaMap(vPidStr, fileContent) != RMRS_OK || fileContent.empty()) {
+             continue;
+         }
++        hasReadNumaMap = true;
+ 
+         std::istringstream iss(fileContent);
+ 
+@@ -444,12 +446,17 @@ RmrsResult ResourceExport::CollectPidNumaInfo(const std::vector<pid_t> &pids,
+         }
+     }
+ 
+-    if (pidInfos.empty()) {
++    if (pidInfos.empty() && !hasReadNumaMap) {
+         UBTURBO_LOG_ERROR(RMRS_MODULE_NAME, RMRS_MODULE_CODE)
+             << "[ContainerPidNumaInfo] PidInfos is empty. Collect failed.";
+         return RMRS_ERROR;
+     }
+ 
++    if (pidInfos.empty()) {
++        UBTURBO_LOG_INFO(RMRS_MODULE_NAME, RMRS_MODULE_CODE)
++            << "[ContainerPidNumaInfo] PidInfos is empty. All pids skipped due to no anon/libvirt.";
++    }
++
+     return RMRS_OK;
+ }
+ 
+-- 
+2.53.0.windows.3
+

@@ -1,0 +1,29 @@
+From 1ebce46e3d7e840a7fba82a0657a465a4d1d7826 Mon Sep 17 00:00:00 2001
+From: discrete_brain <discrete_brain@163.com>
+Date: Sun, 7 Jun 2026 18:46:32 +0800
+Subject: [PATCH 11/71] feat: exclude processes in MIG_MEMSIZE_MODE from
+ adaptive adjustment
+
+---
+ plugins/smap/src/user/advanced-strategy/scene.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/plugins/smap/src/user/advanced-strategy/scene.c b/plugins/smap/src/user/advanced-strategy/scene.c
+index b35bf4c..9f27348 100644
+--- a/plugins/smap/src/user/advanced-strategy/scene.c
++++ b/plugins/smap/src/user/advanced-strategy/scene.c
+@@ -532,6 +532,11 @@ static void ConfigMultiVmRatioInGroups(struct ProcessManager *manager)
+             continue;
+         }
+ 
++        if (current->migrateMode == MIG_MEMSIZE_MODE) {
++            current = current->next;
++            continue;
++        }
++
+         int l1 = GetAttrL1(current);
+         int l2 = GetAttrL2(current);
+         if (processed[l1][l2]) { // 如果这个近端-远端组处理过了则跳过
+-- 
+2.53.0.windows.3
+

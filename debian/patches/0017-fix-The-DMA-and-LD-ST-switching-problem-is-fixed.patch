@@ -1,0 +1,25 @@
+From ba17f3da2f4e7f71a4427aff0be2994d5d86c163 Mon Sep 17 00:00:00 2001
+From: jamesricado <825511311@qq.com>
+Date: Tue, 9 Jun 2026 14:53:36 +0800
+Subject: [PATCH 17/71] fix:The DMA and LD/ST switching problem is fixed
+
+---
+ plugins/smap/src/tiering/smap_migrate_pages.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/plugins/smap/src/tiering/smap_migrate_pages.c b/plugins/smap/src/tiering/smap_migrate_pages.c
+index 28ceb79..030e484 100644
+--- a/plugins/smap/src/tiering/smap_migrate_pages.c
++++ b/plugins/smap/src/tiering/smap_migrate_pages.c
+@@ -73,6 +73,8 @@ void set_remote_migrate_mode(unsigned int mode)
+ {
+ 	if (mode) {
+ 		remote_migrate_mode = MIGRATE_ASYNC_DMA_OFFLOADING;
++	} else {
++		remote_migrate_mode = MIGRATE_ASYNC;
+ 	}
+ 	pr_info("set remote migrate mode: %u\n", remote_migrate_mode);
+ }
+-- 
+2.53.0.windows.3
+

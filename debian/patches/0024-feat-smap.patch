@@ -1,0 +1,354 @@
+From dfa9d36a57d996a9a1bad6e750386a05ebc01ca3 Mon Sep 17 00:00:00 2001
+From: davidhwang <huangdewei@huawei.com>
+Date: Thu, 11 Jun 2026 19:36:08 +0800
+Subject: [PATCH 24/71] =?UTF-8?q?feat(smap):=20=E6=B7=BB=E5=8A=A0=E6=B8=85?=
+ =?UTF-8?q?=E7=90=86=E9=9B=B6=E8=BF=9C=E7=A8=8B=E5=86=85=E5=AD=98=E5=8D=A0?=
+ =?UTF-8?q?=E7=94=A8=E7=9A=84=E8=BF=9B=E7=A8=8B=E7=AE=A1=E7=90=86=E5=8A=9F?=
+ =?UTF-8?q?=E8=83=BD?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+在迁移过程中，如果检测到进程已删除（RMRS_MIGRATE_FAILED_VM_DELETED），需要清理那些远程内存占用为零的进程管理记录。新增 SmapRemovePidsWithZeroRemoteUsage 方法，用于查询指定 NUMA 节点上的进程远程内存占用情况，仅移除占用为零的进程，避免因进程已删除但管理记录未清理导致的错误。
+
+同时优化了 RmrsMemFreeModule::ReturnRemoteNuma 中的逻辑，在迁移成功后统一调用清理方法，并添加了相应的单元测试覆盖多种场景。
+---
+ .../common/smap/rmrs_smap_helper.cpp          |  47 +++++
+ .../common/smap/rmrs_smap_helper.h            |   3 +
+ .../rmrs_memfree_module.cpp                   |   6 +-
+ .../rmrs_rollback_module.cpp                  |   9 +
+ .../ubturbo_plugin/test_rmrs_smap_helper.cpp  | 197 ++++++++++++++++++
+ 5 files changed, 260 insertions(+), 2 deletions(-)
+
+diff --git a/plugins/rmrs/src/ubturbo_plugin/common/smap/rmrs_smap_helper.cpp b/plugins/rmrs/src/ubturbo_plugin/common/smap/rmrs_smap_helper.cpp
+index 1a3efb5..b01d6bd 100644
+--- a/plugins/rmrs/src/ubturbo_plugin/common/smap/rmrs_smap_helper.cpp
++++ b/plugins/rmrs/src/ubturbo_plugin/common/smap/rmrs_smap_helper.cpp
+@@ -14,6 +14,7 @@
+ #include <fstream>
+ #include <limits>
+ #include <unordered_map>
++#include <unordered_set>
+ 
+ #include "rmrs_config.h"
+ #include "rmrs_error.h"
+@@ -548,4 +549,50 @@ RmrsResult RmrsSmapHelper::SmapQueryProcessConfigHelper(int nid, std::vector<Pro
+     return RMRS_OK;
+ }
+ 
++RmrsResult RmrsSmapHelper::SmapRemovePidsWithZeroRemoteUsage(std::vector<uint16_t> &remoteNumaIdList,
++                                                             std::vector<pid_t> &pidsList)
++{
++    std::vector<uint16_t> removeNumaIdList;
++    std::vector<pid_t> removePidList;
++    std::unordered_set<uint16_t> queriedNumaIds;
++    std::unordered_map<uint16_t, std::unordered_map<pid_t, uint64_t>> numaManagedPidMap;
++
++    for (size_t i = 0; i < pidsList.size(); i++) {
++        uint16_t remoteNumaId = remoteNumaIdList[i];
++        if (queriedNumaIds.find(remoteNumaId) == queriedNumaIds.end()) {
++            queriedNumaIds.insert(remoteNumaId);
++            std::vector<ProcessPayload> processPayloadList;
++            if (SmapQueryProcessConfigHelper(remoteNumaId, processPayloadList) == RMRS_OK) {
++                std::unordered_map<pid_t, uint64_t> managedPidMap;
++                for (const auto &payload : processPayloadList) {
++                    LOG_DEBUG << "[RmrsSmapHelper] SmapRemovePidsWithZeroRemoteUsage numa=" << remoteNumaId
++                              << " pid=" << payload.pid << " memSize=" << payload.memSize << ".";
++                    managedPidMap[payload.pid] = payload.memSize;
++                }
++                numaManagedPidMap[remoteNumaId] = managedPidMap;
++            } else {
++                LOG_ERROR << "[RmrsSmapHelper] SmapRemovePidsWithZeroRemoteUsage query numa=" << remoteNumaId
++                          << " failed, skip all pids on this numa.";
++            }
++        }
++        auto it = numaManagedPidMap.find(remoteNumaId);
++        if (it != numaManagedPidMap.end()) {
++            auto pidIt = it->second.find(pidsList[i]);
++            if (pidIt != it->second.end() && pidIt->second == 0) {
++                LOG_DEBUG << "[RmrsSmapHelper] SmapRemovePidsWithZeroRemoteUsage remove pid=" << pidsList[i]
++                          << " numa=" << remoteNumaId << ".";
++                removeNumaIdList.push_back(remoteNumaId);
++                removePidList.push_back(pidsList[i]);
++            }
++        }
++    }
++
++    if (removePidList.empty()) {
++        UBTURBO_LOG_DEBUG(RMRS_MODULE_NAME, RMRS_MODULE_CODE) << "[RmrsSmapHelper] No pid need to remove.";
++        return RMRS_OK;
++    }
++
++    return SmapRemoveVMPidToRemoteNuma(removeNumaIdList, removePidList);
++}
++
+ } // namespace rmrs::smap
+\ No newline at end of file
+diff --git a/plugins/rmrs/src/ubturbo_plugin/common/smap/rmrs_smap_helper.h b/plugins/rmrs/src/ubturbo_plugin/common/smap/rmrs_smap_helper.h
+index 40057b0..dd56a66 100644
+--- a/plugins/rmrs/src/ubturbo_plugin/common/smap/rmrs_smap_helper.h
++++ b/plugins/rmrs/src/ubturbo_plugin/common/smap/rmrs_smap_helper.h
+@@ -79,6 +79,9 @@ public:
+ 
+     static RmrsResult SmapQueryProcessConfigHelper(int nid, std::vector<ProcessPayload> &processPayloadList);
+ 
++    static RmrsResult SmapRemovePidsWithZeroRemoteUsage(std::vector<uint16_t> &remoteNumaIdList,
++                                                        std::vector<pid_t> &pidsList);
++
+     static const int smapParamErrorCode;    // SMAP参数错误码 Invalid argument -22
+     static const int smapDealErrorCode;     // SMAP处理异常错误码 -9
+     static const int smapApplyMemErrorCode; // SMAP处理异常错误码 -12
+diff --git a/plugins/rmrs/src/ubturbo_plugin/intranode_strategy/rmrs_memfree_module.cpp b/plugins/rmrs/src/ubturbo_plugin/intranode_strategy/rmrs_memfree_module.cpp
+index 7c44ef2..4e7ece0 100644
+--- a/plugins/rmrs/src/ubturbo_plugin/intranode_strategy/rmrs_memfree_module.cpp
++++ b/plugins/rmrs/src/ubturbo_plugin/intranode_strategy/rmrs_memfree_module.cpp
+@@ -49,15 +49,17 @@ RmrsResult RmrsMemFreeModule::ReturnRemoteNuma(std::vector<ReturnVmInfo> &canRet
+     RmrsResult res =
+         RmrsSmapHelper::MigrateColdDataToRemoteNumaSync(remoteNumaIdList, pidsList, memSizeList, MIGRATEOUT_TIMEOUT);
+     if (res != RMRS_OK) {
++        // 考虑部分成功场景：如果有进程被删除，但是smap迁移成功，且迁移后memSize为0，那么需要移除这些进程的管理
+         if (res == RMRS_MIGRATE_FAILED_VM_DELETED) {
+             LOG_INFO << "[MemFree][MemFree] Detect Dead Pid During Smap Migrate.";
++            res = RmrsSmapHelper::SmapRemovePidsWithZeroRemoteUsage(remoteNumaIdList, pidsList);
+         } else {
+             LOG_ERROR << "[MemFree][MemFree] Smap Migrate failed.";
+             return res;
+         }
++    } else {
++        res = RmrsSmapHelper::SmapRemoveVMPidToRemoteNuma(remoteNumaIdList, pidsList);
+     }
+-    // 移除pid进程管理
+-    res = RmrsSmapHelper::SmapRemoveVMPidToRemoteNuma(remoteNumaIdList, pidsList);
+     if (res != RMRS_OK) {
+         LOG_ERROR << "[MemFree][MemFree] Rm pid mgr failed " << res << ".";
+         return res;
+diff --git a/plugins/rmrs/src/ubturbo_plugin/intranode_strategy/rmrs_rollback_module.cpp b/plugins/rmrs/src/ubturbo_plugin/intranode_strategy/rmrs_rollback_module.cpp
+index efa114f..2d903d0 100644
+--- a/plugins/rmrs/src/ubturbo_plugin/intranode_strategy/rmrs_rollback_module.cpp
++++ b/plugins/rmrs/src/ubturbo_plugin/intranode_strategy/rmrs_rollback_module.cpp
+@@ -210,6 +210,15 @@ bool RmrsRollbackModule::DoMigrateRollback(std::unordered_map<pid_t, uint16_t> v
+     RmrsResult res =
+         RmrsSmapHelper::MigrateColdDataToRemoteNumaSync(remoteNumaIdList, pidList, memSizeList, MIGRATEOUT_TIMEOUT);
+     if (res != 0) {
++        if (res == RMRS_MIGRATE_FAILED_VM_DELETED) {
++            LOG_INFO << "[MemRollback] Detect Dead Pid During Smap Migrate.";
++            res = RmrsSmapHelper::SmapRemovePidsWithZeroRemoteUsage(remoteNumaIdList, pidList);
++            if (res != RMRS_OK) {
++                LOG_ERROR << "[MemRollback] Rm pid mgr failed " << res << ".";
++                return false;
++            }
++            return false; // 应该返回成功？
++        }
+         LOG_ERROR << "[MemRollback] DoMigrateRollback failed " << res << ".";
+         return false;
+     }
+diff --git a/test/testcase/rmrs/ubturbo_plugin/test_rmrs_smap_helper.cpp b/test/testcase/rmrs/ubturbo_plugin/test_rmrs_smap_helper.cpp
+index ac5472a..978675d 100644
+--- a/test/testcase/rmrs/ubturbo_plugin/test_rmrs_smap_helper.cpp
++++ b/test/testcase/rmrs/ubturbo_plugin/test_rmrs_smap_helper.cpp
+@@ -1056,4 +1056,201 @@ TEST_F(TestRmrsSmapHelper, ShouldHandleNullModuleName)
+     RmrsSmapHelper::RackVmLog(static_cast<uint32_t>(RmrsLogLevel::DEBUG), "Test log", nullptr);
+ }
+ 
++/*
++ * 用例描述：
++ * SmapRemovePidsWithZeroRemoteUsage 查询失败场景
++ * 测试步骤：
++ * 1. 构造 GetSmapQueryProcessConfigFunc 返回 nullptr
++ * 预期结果：
++ * 查询失败，跳过所有 pid，返回 RMRS_OK（无需移除）
++ */
++TEST_F(TestRmrsSmapHelper, SmapRemovePidsWithZeroRemoteUsage_QueryFailed)
++{
++    std::vector<uint16_t> remoteNumaIdList = {1};
++    std::vector<pid_t> pidsList = {123};
++
++    SmapQueryProcessConfigFunc smapQueryFunc = nullptr;
++    MOCKER(&SmapModule::GetSmapQueryProcessConfigFunc).stubs().will(returnValue(smapQueryFunc));
++    RmrsResult ret = RmrsSmapHelper::SmapRemovePidsWithZeroRemoteUsage(remoteNumaIdList, pidsList);
++    EXPECT_EQ(ret, RMRS_OK);
++    GlobalMockObject::verify();
++}
++
++/*
++ * 用例描述：
++ * SmapRemovePidsWithZeroRemoteUsage 所有 pid 远端占用不为 0，无需移除
++ * 测试步骤：
++ * 1. 构造查询返回结果，所有 pid 的 memSize > 0
++ * 预期结果：
++ * 无需移除，返回 RMRS_OK
++ */
++TEST_F(TestRmrsSmapHelper, SmapRemovePidsWithZeroRemoteUsage_NoZeroRemoteUsage)
++{
++    std::vector<uint16_t> remoteNumaIdList = {1, 1};
++    std::vector<pid_t> pidsList = {123, 456};
++
++    SmapQueryProcessConfigFunc smapQueryFunc = [](int nid, ProcessPayload *payloadArr, int inLen, int *outLen) -> int {
++        payloadArr[0] = {};
++        payloadArr[0].pid = 123;
++        payloadArr[0].memSize = 1024;
++        payloadArr[1] = {};
++        payloadArr[1].pid = 456;
++        payloadArr[1].memSize = 2048;
++        *outLen = 2;
++        return 0;
++    };
++    MOCKER(&SmapModule::GetSmapQueryProcessConfigFunc).stubs().will(returnValue(smapQueryFunc));
++    RmrsResult ret = RmrsSmapHelper::SmapRemovePidsWithZeroRemoteUsage(remoteNumaIdList, pidsList);
++    EXPECT_EQ(ret, RMRS_OK);
++    GlobalMockObject::verify();
++}
++
++/*
++ * 用例描述：
++ * SmapRemovePidsWithZeroRemoteUsage 部分 pid 远端占用为 0，移除对应 pid
++ * 测试步骤：
++ * 1. 构造查询返回结果，pid=123 的 memSize=0，pid=456 的 memSize=1024
++ * 预期结果：
++ * 只移除 pid=123，返回 RMRS_OK
++ */
++TEST_F(TestRmrsSmapHelper, SmapRemovePidsWithZeroRemoteUsage_SomeZeroRemoteUsage)
++{
++    std::vector<uint16_t> remoteNumaIdList = {1, 1};
++    std::vector<pid_t> pidsList = {123, 456};
++
++    SmapQueryProcessConfigFunc smapQueryFunc = [](int nid, ProcessPayload *payloadArr, int inLen, int *outLen) -> int {
++        payloadArr[0] = {};
++        payloadArr[0].pid = 123;
++        payloadArr[0].memSize = 0;
++        payloadArr[1] = {};
++        payloadArr[1].pid = 456;
++        payloadArr[1].memSize = 1024;
++        *outLen = 2;
++        return 0;
++    };
++    SmapRemoveFunc smapRemoveFunc = [](RemoveMsg *param1, int param2) -> int {
++        EXPECT_EQ(param1->count, 1);
++        EXPECT_EQ(param1->payload[0].pid, 123);
++        return 0;
++    };
++    MOCKER(&SmapModule::GetSmapQueryProcessConfigFunc).stubs().will(returnValue(smapQueryFunc));
++    MOCKER(&SmapModule::GetSmapRemoveFunc).stubs().will(returnValue(smapRemoveFunc));
++    RmrsResult ret = RmrsSmapHelper::SmapRemovePidsWithZeroRemoteUsage(remoteNumaIdList, pidsList);
++    EXPECT_EQ(ret, RMRS_OK);
++    GlobalMockObject::verify();
++}
++
++/*
++ * 用例描述：
++ * SmapRemovePidsWithZeroRemoteUsage 所有 pid 远端占用为 0，全部移除
++ * 测试步骤：
++ * 1. 构造查询返回结果，所有 pid 的 memSize=0
++ * 预期结果：
++ * 移除所有 pid，返回 RMRS_OK
++ */
++TEST_F(TestRmrsSmapHelper, SmapRemovePidsWithZeroRemoteUsage_AllZeroRemoteUsage)
++{
++    std::vector<uint16_t> remoteNumaIdList = {1, 2};
++    std::vector<pid_t> pidsList = {123, 456};
++
++    SmapQueryProcessConfigFunc smapQueryFunc = [](int nid, ProcessPayload *payloadArr, int inLen,
++                                                   int *outLen) -> int {
++        if (nid == 1) {
++            payloadArr[0] = {};
++            payloadArr[0].pid = 123;
++            payloadArr[0].memSize = 0;
++            *outLen = 1;
++        } else if (nid == 2) {
++            payloadArr[0] = {};
++            payloadArr[0].pid = 456;
++            payloadArr[0].memSize = 0;
++            *outLen = 1;
++        }
++        return 0;
++    };
++    SmapRemoveFunc smapRemoveFunc = [](RemoveMsg *param1, int param2) -> int {
++        EXPECT_EQ(param1->count, 2);
++        return 0;
++    };
++    MOCKER(&SmapModule::GetSmapQueryProcessConfigFunc).stubs().will(returnValue(smapQueryFunc));
++    MOCKER(&SmapModule::GetSmapRemoveFunc).stubs().will(returnValue(smapRemoveFunc));
++    RmrsResult ret = RmrsSmapHelper::SmapRemovePidsWithZeroRemoteUsage(remoteNumaIdList, pidsList);
++    EXPECT_EQ(ret, RMRS_OK);
++    GlobalMockObject::verify();
++}
++
++/*
++ * 用例描述：
++ * SmapRemovePidsWithZeroRemoteUsage 移除操作失败
++ * 测试步骤：
++ * 1. 构造查询返回结果，pid 的 memSize=0
++ * 2. SmapRemoveFunc 返回 -22
++ * 预期结果：
++ * 返回 RMRS_ERROR
++ */
++TEST_F(TestRmrsSmapHelper, SmapRemovePidsWithZeroRemoteUsage_RemoveFailed)
++{
++    std::vector<uint16_t> remoteNumaIdList = {1};
++    std::vector<pid_t> pidsList = {123};
++
++    SmapQueryProcessConfigFunc smapQueryFunc = [](int nid, ProcessPayload *payloadArr, int inLen, int *outLen) -> int {
++        payloadArr[0] = {};
++        payloadArr[0].pid = 123;
++        payloadArr[0].memSize = 0;
++        *outLen = 1;
++        return 0;
++    };
++    SmapRemoveFunc smapRemoveFunc = [](RemoveMsg *param1, int param2) -> int {
++        return -22;
++    };
++    MOCKER(&SmapModule::GetSmapQueryProcessConfigFunc).stubs().will(returnValue(smapQueryFunc));
++    MOCKER(&SmapModule::GetSmapRemoveFunc).stubs().will(returnValue(smapRemoveFunc));
++    RmrsResult ret = RmrsSmapHelper::SmapRemovePidsWithZeroRemoteUsage(remoteNumaIdList, pidsList);
++    EXPECT_EQ(ret, RMRS_ERROR);
++    GlobalMockObject::verify();
++}
++
++/*
++ * 用例描述：
++ * SmapRemovePidsWithZeroRemoteUsage 多 numa 混合场景：部分 pid 远端占用为 0
++ * 测试步骤：
++ * 1. numa1 上 pid=123 的 memSize=0，pid=456 的 memSize=1024
++ * 2. numa2 上 pid=789 的 memSize=0
++ * 预期结果：
++ * 移除 pid=123 和 pid=789，返回 RMRS_OK
++ */
++TEST_F(TestRmrsSmapHelper, SmapRemovePidsWithZeroRemoteUsage_MultiNumaMixed)
++{
++    std::vector<uint16_t> remoteNumaIdList = {1, 1, 2};
++    std::vector<pid_t> pidsList = {123, 456, 789};
++
++    // 对 numa=1 的查询
++    SmapQueryProcessConfigFunc smapQueryFunc = [](int nid, ProcessPayload *payloadArr, int inLen, int *outLen) -> int {
++        if (nid == 1) {
++            payloadArr[0] = {};
++            payloadArr[0].pid = 123;
++            payloadArr[0].memSize = 0;
++            payloadArr[1] = {};
++            payloadArr[1].pid = 456;
++            payloadArr[1].memSize = 1024;
++            *outLen = 2;
++        } else if (nid == 2) {
++            payloadArr[0] = {};
++            payloadArr[0].pid = 789;
++            payloadArr[0].memSize = 0;
++            *outLen = 1;
++        }
++        return 0;
++    };
++    SmapRemoveFunc smapRemoveFunc = [](RemoveMsg *param1, int param2) -> int {
++        EXPECT_EQ(param1->count, 2);
++        return 0;
++    };
++    MOCKER(&SmapModule::GetSmapQueryProcessConfigFunc).stubs().will(returnValue(smapQueryFunc));
++    MOCKER(&SmapModule::GetSmapRemoveFunc).stubs().will(returnValue(smapRemoveFunc));
++    RmrsResult ret = RmrsSmapHelper::SmapRemovePidsWithZeroRemoteUsage(remoteNumaIdList, pidsList);
++    EXPECT_EQ(ret, RMRS_OK);
++    GlobalMockObject::verify();
++}
++
+ } // namespace rmrs::smap
+\ No newline at end of file
+-- 
+2.53.0.windows.3
+

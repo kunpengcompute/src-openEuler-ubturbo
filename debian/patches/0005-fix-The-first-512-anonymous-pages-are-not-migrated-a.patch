@@ -1,0 +1,26 @@
+From a33e0857a06c8bbe9a50f28b878e2f90c5549da1 Mon Sep 17 00:00:00 2001
+From: jamesricado <825511311@qq.com>
+Date: Fri, 5 Jun 2026 16:46:05 +0800
+Subject: [PATCH 05/71] fix:The first 512 anonymous pages are not migrated,and
+ subsequent pages are not migrated either
+
+---
+ plugins/smap/src/tiering/smap_migrate_pages.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/plugins/smap/src/tiering/smap_migrate_pages.c b/plugins/smap/src/tiering/smap_migrate_pages.c
+index cfe5975..d0a3d38 100644
+--- a/plugins/smap/src/tiering/smap_migrate_pages.c
++++ b/plugins/smap/src/tiering/smap_migrate_pages.c
+@@ -919,6 +919,8 @@ again:
+ 		if (nr_folios == 0) {
+ 			pr_debug("no page to migrate\n");
+ 			vfree(migrate_folios);
++			if (nr_remain_folios > 0)
++				goto again;
+ 			continue;
+ 		}
+ 		mig_list[i].failed_mig_nr +=
+-- 
+2.53.0.windows.3
+

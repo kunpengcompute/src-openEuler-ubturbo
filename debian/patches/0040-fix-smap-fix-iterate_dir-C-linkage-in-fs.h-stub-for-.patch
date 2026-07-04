@@ -1,0 +1,90 @@
+From 80d6e5f66f17bac04856e9bbbe13d7139c264bbe Mon Sep 17 00:00:00 2001
+From: lizhilong <lizhilong22@huawei.com>
+Date: Tue, 16 Jun 2026 15:05:05 +0800
+Subject: [PATCH 40/71] fix(smap): fix iterate_dir C linkage in fs.h stub for
+ aarch64 build
+
+Move iterate_dir, default_llseek, scnprintf, kstrtouint, kstrtoull
+into the extern "C" block in fs.h, and move struct dir_context
+definition before the extern "C" block so the type is visible
+when iterate_dir is declared with C linkage.
+
+This resolves the aarch64 linker error:
+  undefined reference to 'iterate_dir(file*, dir_context*)'
+
+Also remove the redundant extern "C" iterate_dir declaration from
+test_case_iomem.cpp since it is now correctly declared in fs.h.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ plugins/smap/test/depends/include/linux/fs.h  | 25 +++++++++----------
+ plugins/smap/test/tiering/test_case_iomem.cpp |  1 -
+ 2 files changed, 12 insertions(+), 14 deletions(-)
+
+diff --git a/plugins/smap/test/depends/include/linux/fs.h b/plugins/smap/test/depends/include/linux/fs.h
+index 1c4824b..b11de39 100644
+--- a/plugins/smap/test/depends/include/linux/fs.h
++++ b/plugins/smap/test/depends/include/linux/fs.h
+@@ -74,6 +74,14 @@ typedef void *fl_owner_t;
+ 
+ #define fput(x)
+ 
++struct dir_context;
++typedef bool (*filldir_t)(struct dir_context *, const char *, int, loff_t, u64, unsigned);
++
++struct dir_context {
++    filldir_t actor;
++    loff_t pos;
++};
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -83,14 +91,14 @@ extern ssize_t kernel_read(struct file *file, void *buf, size_t count, loff_t *p
+ extern ssize_t kernel_write(struct file *file, void *buf, size_t count, loff_t *pos);
+ extern ssize_t simple_read_from_buffer(void __user *to, size_t count,
+ 			loff_t *ppos, const void *from, size_t available);
+-#ifdef __cplusplus
+-}
+-#endif
+ extern int scnprintf(char *buf, size_t size, const char *fmt, ...);
+ extern int kstrtouint(const char *s, unsigned int base, unsigned int *res);
+ extern int kstrtoull(const char *s, unsigned int base, unsigned long long *res);
+-
+ extern loff_t default_llseek(struct file *file, loff_t offset, int whence);
++extern int iterate_dir(struct file *, struct dir_context *);
++#ifdef __cplusplus
++}
++#endif
+ static inline struct inode *file_inode(const struct file *f)
+ {
+     return 0;
+@@ -100,13 +108,4 @@ static inline loff_t i_size_read(const struct inode *inode)
+     return 0;
+ }
+ 
+-struct dir_context;
+-typedef bool (*filldir_t)(struct dir_context *, const char *, int, loff_t, u64, unsigned);
+-
+-struct dir_context {
+-    filldir_t actor;
+-    loff_t pos;
+-};
+-extern int iterate_dir(struct file *, struct dir_context *);
+-
+ #endif
+diff --git a/plugins/smap/test/tiering/test_case_iomem.cpp b/plugins/smap/test/tiering/test_case_iomem.cpp
+index 50acdf9..4511d49 100644
+--- a/plugins/smap/test/tiering/test_case_iomem.cpp
++++ b/plugins/smap/test/tiering/test_case_iomem.cpp
+@@ -791,7 +791,6 @@ TEST_F(IomemTest, IncObmmDevSeqIncrement)
+ 
+ extern "C" int iterate_obmm_dev_dir(void);
+ extern "C" long PTR_ERR(const void *ptr);
+-extern "C" int iterate_dir(struct file *, struct dir_context *);
+ 
+ TEST_F(IomemTest, IterateObmmDevDirOpenFail)
+ {
+-- 
+2.53.0.windows.3
+

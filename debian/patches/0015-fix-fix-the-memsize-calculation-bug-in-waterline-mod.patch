@@ -1,0 +1,718 @@
+From 5c66ee98cf226f6acfbd30a63b6d6eace822c5a4 Mon Sep 17 00:00:00 2001
+From: discrete_brain <discrete_brain@163.com>
+Date: Sun, 7 Jun 2026 18:50:01 +0800
+Subject: [PATCH 15/71] fix: fix the memsize calculation bug in waterline mode
+
+---
+ plugins/smap/src/user/manage/manage.c         | 174 ++++++++----
+ plugins/smap/src/user/manage/manage.h         |  22 ++
+ plugins/smap/src/user/strategy/migration.c    |  32 ++-
+ .../src/user/strategy/separate_strategy.c     |   8 +-
+ plugins/smap/test/user/manage/ManageTest.cpp  | 258 ++++++++++++++++++
+ .../smap/test/user/strategy/MigrationTest.cpp |  28 +-
+ 6 files changed, 448 insertions(+), 74 deletions(-)
+
+diff --git a/plugins/smap/src/user/manage/manage.c b/plugins/smap/src/user/manage/manage.c
+index 79cafe5..ec9d8e0 100644
+--- a/plugins/smap/src/user/manage/manage.c
++++ b/plugins/smap/src/user/manage/manage.c
+@@ -1776,8 +1776,7 @@ static inline uint64_t CalAvailPages(uint64_t sizeMb)
+     return MBToPage(sizeMb) - reservedPages;
+ }
+ 
+-static void CalAvailBorrowPage(uint32_t tmpMaxAllocNrPages[LOCAL_NUMA_NUM][REMOTE_NUMA_NUM],
+-                               uint32_t availPrivatePages[LOCAL_NUMA_NUM][REMOTE_NUMA_NUM],
++static void CalAvailBorrowPage(uint32_t availPrivatePages[LOCAL_NUMA_NUM][REMOTE_NUMA_NUM],
+                                uint32_t availSharedPages[REMOTE_NUMA_NUM])
+ {
+     struct RemoteNumaInfo *rmi = &g_processManager.remoteNumaInfo;
+@@ -1788,9 +1787,6 @@ static void CalAvailBorrowPage(uint32_t tmpMaxAllocNrPages[LOCAL_NUMA_NUM][REMOT
+             SMAP_LOGGER_DEBUG("availSharedPages[%d] %llu", j, availSharedPages[j]);
+         }
+         for (int i = 0; i < GetNrLocalNuma() && i < LOCAL_NUMA_NUM; i++) {
+-            if (tmpMaxAllocNrPages[i][j] == 0) {
+-                continue;
+-            }
+             if (rmi->privateSize[i][j] > 0) {
+                 availPrivatePages[i][j] = CalAvailPages(rmi->privateSize[i][j]);
+                 SMAP_LOGGER_DEBUG("availPrivatePages[%d][%d] %llu", i, j, availPrivatePages[i][j]);
+@@ -1865,32 +1861,104 @@ static void AllocBorrowPage(uint32_t tmpMaxAllocNrPages[LOCAL_NUMA_NUM][REMOTE_N
+     }
+ }
+ 
++static void AllocBorrowPagesForMemsize(ProcessAttr *attr, uint32_t availPrivatePages[LOCAL_NUMA_NUM][REMOTE_NUMA_NUM],
++                                       uint32_t availSharedPages[REMOTE_NUMA_NUM])
++{
++    int l2Nid = attr->migrateParam[0].nid;
++    int l2Index = l2Nid - GetNrLocalNuma();
++    if (l2Index < 0 || l2Index >= REMOTE_NUMA_NUM) {
++        return;
++    }
++
++    StrategyAttribute *sa = &attr->strategyAttr;
++    uint32_t nrTarget = KBToPage(attr->migrateParam[0].memSize);
++
++    for (int i = 0; i < GetNrLocalNuma() && i < LOCAL_NUMA_NUM; i++) {
++        if (!InAttrL1(attr, i)) {
++            sa->memSize[i][l2Index] = 0;
++            SMAP_LOGGER_INFO("[memsize_clear] pid=%d local=%d remote=%d pages=0", attr->pid, i, l2Nid);
++            continue;
++        }
++
++        // 先使用私有借用内存
++        uint32_t nrTotal = sa->nrPagesPerLocalNuma[i];
++        uint32_t nrAvail = MIN(nrTotal, availPrivatePages[i][l2Index]);
++        SMAP_LOGGER_INFO("[memsize_private] pid=%d local=%d remote=%d nrTarget=%u nrTotal=%u nrAvail=%u", attr->pid, i,
++                         l2Nid, nrTarget, nrTotal, nrAvail);
++
++        if (nrTarget >= nrAvail) {
++            nrTarget -= nrAvail;
++            nrTotal -= nrAvail;
++            availPrivatePages[i][l2Index] -= nrAvail;
++            sa->memSize[i][l2Index] = PageToKB(nrAvail);
++            SMAP_LOGGER_INFO("[memsize_private] pid=%d local=%d remote=%d pages=%u", attr->pid, i, l2Nid, nrAvail);
++        } else {
++            availPrivatePages[i][l2Index] -= nrTarget;
++            sa->memSize[i][l2Index] = PageToKB(nrTarget);
++            SMAP_LOGGER_INFO("[memsize_private*] pid=%d local=%d remote=%d pages=%u", attr->pid, i, l2Nid, nrTarget);
++            break;
++        }
++
++        if (nrTotal == 0) {
++            continue;
++        }
++
++        // 再使用共享借用内存
++        nrAvail = MIN(nrTotal, availSharedPages[l2Index]);
++        SMAP_LOGGER_INFO("[memsize_shared] pid=%d local=%d remote=%d nrTarget=%u nrTotal=%u nrAvail=%u", attr->pid, i,
++                         l2Nid, nrTarget, nrTotal, nrAvail);
++
++        if (nrTarget >= nrAvail) {
++            nrTarget -= nrAvail;
++            availSharedPages[l2Index] -= nrAvail;
++            sa->memSize[i][l2Index] += PageToKB(nrAvail);
++            SMAP_LOGGER_INFO("[memsize_shared] pid=%d local=%d remote=%d pages=%u", attr->pid, i, l2Nid, nrAvail);
++        } else {
++            availSharedPages[l2Index] -= nrTarget;
++            sa->memSize[i][l2Index] += PageToKB(nrTarget);
++            SMAP_LOGGER_INFO("[memsize_shared*] pid=%d local=%d remote=%d pages=%u", attr->pid, i, l2Nid, nrTarget);
++            break;
++        }
++    }
++}
++
+ static void CalRemoteNumaSizeAllocPerNuma(void)
+ {
+-    ProcessAttr *attr = g_processManager.processes;
++    ProcessAttr *attr;
+     struct RemoteNumaInfo remoteNumaInfo = g_processManager.remoteNumaInfo;
+     uint32_t tmpMaxAllocNrPages[LOCAL_NUMA_NUM][REMOTE_NUMA_NUM] = { 0 };
+     int i, j;
+ 
+-    // 计算每个本地远端对应按照ratio可迁出的最大量
+-    while (attr) {
++    uint32_t availPrivatePages[LOCAL_NUMA_NUM][REMOTE_NUMA_NUM] = { 0 };
++    uint32_t availSharedPages[REMOTE_NUMA_NUM] = { 0 };
++    // 在远端预留多少内存, 暂不支持混用, 否则预留的内存会比预期多(超过200M)
++    CalAvailBorrowPage(availPrivatePages, availSharedPages);
++
++    // 先满足迁移模式为 MIG_MEMSIZE_MODE 的进程
++    for (attr = g_processManager.processes; attr; attr = attr->next) {
++        if (attr->migrateMode == MIG_MEMSIZE_MODE) {
++            AllocBorrowPagesForMemsize(attr, availPrivatePages, availSharedPages);
++        }
++    }
++
++    // 计算所有进程**想要**从各本地NUMA迁移到各远端NUMA的总页面数量
++    for (attr = g_processManager.processes; attr; attr = attr->next) {
++        if (attr->migrateMode == MIG_MEMSIZE_MODE) {
++            continue;
++        }
++
++        StrategyAttribute *sa = &attr->strategyAttr;
+         for (i = 0; i < GetNrLocalNuma(); i++) {
+             for (j = 0; j < REMOTE_NUMA_NUM; j++) {
+-                tmpMaxAllocNrPages[i][j] +=
+-                    attr->strategyAttr.nrPagesPerLocalNuma[i] * attr->strategyAttr.initRemoteMemRatio[i][j] / HUNDRED;
++                tmpMaxAllocNrPages[i][j] += sa->nrPagesPerLocalNuma[i] * sa->initRemoteMemRatio[i][j] / HUNDRED;
+                 SMAP_LOGGER_DEBUG("tmpMaxAllocNrPages[%d][%d]=%u, initRemoteMemRatio=%.2lf.", i, j,
+-                                  tmpMaxAllocNrPages[i][j], attr->strategyAttr.initRemoteMemRatio[i][j]);
+-                attr->strategyAttr.l2RemoteMemRatio[i][j] = 0;
++                                  tmpMaxAllocNrPages[i][j], sa->initRemoteMemRatio[i][j]);
++
++                sa->l2RemoteMemRatio[i][j] = 0;
+             }
+         }
+-        attr = attr->next;
+     }
+ 
+-    uint32_t availPrivatePages[LOCAL_NUMA_NUM][REMOTE_NUMA_NUM] = { 0 };
+-    uint32_t availSharedPages[REMOTE_NUMA_NUM] = { 0 };
+-    // 在远端预留多少内存, 暂不支持混用, 否则预留的内存会比预期多(超过200M)
+-    CalAvailBorrowPage(tmpMaxAllocNrPages, availPrivatePages, availSharedPages);
+-
+     // 用远端借用的内存计算每个pid，每个numa可迁出的比例
+     AllocBorrowPage(tmpMaxAllocNrPages, availPrivatePages, availSharedPages);
+ }
+@@ -1990,24 +2058,31 @@ int SetRemoteNumaInfo(int srcNid, int destNid, uint64_t size)
+         EnvMutexUnlock(&numaInfo->lock);
+         return -EBADF;
+     }
+-    SMAP_LOGGER_INFO("SetRemoteNumaInfo %d-%d to %llu.", srcNid, column, size);
++    SMAP_LOGGER_INFO("SetRemoteNumaInfo %d-%d to %llu.", srcNid, destNid, size);
+     if (srcNid == NUMA_NO_NODE) {
+         numaInfo->sharedSize[column] = size;
+     } else {
+         numaInfo->privateSize[srcNid][column] = size;
+     }
+     for (int j = 0; j < REMOTE_NUMA_NUM; j++) {
++        int l2Nid = j + g_processManager.nrLocalNuma;
+         numaInfo->usedInfo[j].ifUsedFreshed = false;
+         numaInfo->usedInfo[j].size = MBToPage(numaInfo->sharedSize[j]);
+-        SMAP_LOGGER_DEBUG("Node%d shared size: %llu.", j, numaInfo->usedInfo[j].size);
++        if (numaInfo->usedInfo[j].size) {
++            SMAP_LOGGER_INFO("Node%d shared pages: %llu.", l2Nid, numaInfo->usedInfo[j].size);
++        }
+         for (int i = 0; i < g_processManager.nrLocalNuma; i++) {
+             numaInfo->usedInfo[j].size += MBToPage(numaInfo->privateSize[i][j]);
+             numaInfo->privateUsedInfo[i][j].ifUsedFreshed = false;
+             numaInfo->privateUsedInfo[i][j].size = MBToPage(numaInfo->privateSize[i][j]);
+-            SMAP_LOGGER_INFO("local %d borrow remote %d private size: %llu.", i, j,
+-                             numaInfo->privateUsedInfo[i][j].size);
++            if (numaInfo->privateUsedInfo[i][j].size) {
++                SMAP_LOGGER_INFO("local %d borrow remote %d private pages: %llu.", i, l2Nid,
++                                 numaInfo->privateUsedInfo[i][j].size);
++            }
++        }
++        if (numaInfo->usedInfo[j].size) {
++            SMAP_LOGGER_INFO("Node%d total borrow pages: %llu.", l2Nid, numaInfo->usedInfo[j].size);
+         }
+-        SMAP_LOGGER_INFO("Node%d total borrow size: %llu.", j, numaInfo->usedInfo[j].size);
+     }
+     EnvMutexUnlock(&numaInfo->lock);
+     return 0;
+@@ -2015,36 +2090,34 @@ int SetRemoteNumaInfo(int srcNid, int destNid, uint64_t size)
+ 
+ static bool CheckPrivateBorrowUsed(int destNid)
+ {
+-    int column = destNid - g_processManager.nrLocalNuma;
++    int nrLocalNuma = GetNrLocalNuma();
++    int column = destNid - nrLocalNuma;
+     struct RemoteNumaInfo *numaInfo = &g_processManager.remoteNumaInfo;
+-    bool flag;
++
+     for (int count = 0; count < MAX_FRESH_USED_TIME; count++) {
+-        flag = false;
+         EnvMutexLock(&numaInfo->lock);
+-        for (int i = 0; i < g_processManager.nrLocalNuma; i++) {
+-            if (numaInfo->privateUsedInfo[i][column].ifUsedFreshed == false) {
+-                SMAP_LOGGER_INFO("Private used info not fresh , local: %d, remote nid: %d, used: %d, freshed: %d.", i,
+-                                 destNid, numaInfo->privateUsedInfo[i][column].used,
+-                                 numaInfo->privateUsedInfo[i][column].ifUsedFreshed);
+-                flag = true;
++        for (int i = 0; i < nrLocalNuma; i++) {
++            struct RemoteNumaUsedInfo *usedInfo = &numaInfo->privateUsedInfo[i][column];
++            SMAP_LOGGER_INFO("[private_borrow] local=%d remote=%d used_pages=%llu total_pages=%llu fresh=%d", i,
++                             destNid, usedInfo->used, usedInfo->size, usedInfo->ifUsedFreshed);
++
++            if (!usedInfo->ifUsedFreshed) {
++                EnvMutexUnlock(&numaInfo->lock);
++                EnvMsleep(WAIT_FRESH_USED_PERIOD);
+                 break;
+             }
+-        }
+-        if (flag) {
+-            EnvMutexUnlock(&numaInfo->lock);
+-            EnvMsleep(WAIT_FRESH_USED_PERIOD);
+-            continue;
+-        }
+-        for (int i = 0; i < g_processManager.nrLocalNuma; i++) {
+-            SMAP_LOGGER_INFO("CheckPrivateBorrowUsed, remote nid: %d, column: %d, used: %d, size: %d.", destNid, column,
+-                             numaInfo->privateUsedInfo[i][column].used, numaInfo->privateUsedInfo[i][column].size);
+-            if (numaInfo->privateUsedInfo[i][column].used > numaInfo->privateUsedInfo[i][column].size) {
++
++            if (usedInfo->used > usedInfo->size) {
+                 EnvMutexUnlock(&numaInfo->lock);
+                 return false;
+             }
++
++            // 走到这里表明所有本地NUMA的远端内存用量都少于总量
++            if (i == nrLocalNuma - 1) {
++                EnvMutexUnlock(&numaInfo->lock);
++                return true;
++            }
+         }
+-        EnvMutexUnlock(&numaInfo->lock);
+-        return true;
+     }
+     return false;
+ }
+@@ -2053,18 +2126,19 @@ static bool CheckBorrowUsed(int destNid)
+ {
+     int column = destNid - g_processManager.nrLocalNuma;
+     struct RemoteNumaInfo *numaInfo = &g_processManager.remoteNumaInfo;
++
+     for (int count = 0; count < MAX_FRESH_USED_TIME; count++) {
+         EnvMutexLock(&numaInfo->lock);
+-        if (numaInfo->usedInfo[column].ifUsedFreshed == false) {
++        struct RemoteNumaUsedInfo *usedInfo = &numaInfo->usedInfo[column];
++        SMAP_LOGGER_INFO("[total_borrow] remote=%d used_pages=%llu total_pages=%llu freshed=%d", destNid,
++                         usedInfo->used, usedInfo->size, usedInfo->ifUsedFreshed);
++
++        if (!usedInfo->ifUsedFreshed) {
+             EnvMutexUnlock(&numaInfo->lock);
+             EnvMsleep(WAIT_FRESH_USED_PERIOD);
+-            SMAP_LOGGER_INFO("Remote numa info not fresh , remote nid: %d, used: %d, freshed: %d.", destNid,
+-                             numaInfo->usedInfo[column].used, numaInfo->usedInfo[column].ifUsedFreshed);
+             continue;
+         }
+-        SMAP_LOGGER_INFO("CheckBorrowUsed, remote nid: %d, column: %d, used: %d, size: %d.", destNid, column,
+-                         numaInfo->usedInfo[column].used, numaInfo->usedInfo[column].size);
+-        if (numaInfo->usedInfo[column].used > numaInfo->usedInfo[column].size) {
++        if (usedInfo->used > usedInfo->size) {
+             EnvMutexUnlock(&numaInfo->lock);
+             return false;
+         }
+diff --git a/plugins/smap/src/user/manage/manage.h b/plugins/smap/src/user/manage/manage.h
+index b61009a..47fe4d4 100644
+--- a/plugins/smap/src/user/manage/manage.h
++++ b/plugins/smap/src/user/manage/manage.h
+@@ -582,12 +582,34 @@ static inline uint64_t KBToHugePage(uint64_t memSize)
+     return memSize / (size / KIB);
+ }
+ 
++static inline uint64_t HugePageToKB(uint64_t nr)
++{
++    int size = GetHugePageSize();
++    return nr * (size / KIB);
++}
++
+ static inline uint64_t KBToNormalPage(uint64_t memSize)
+ {
+     int size = GetNormalPageSize();
+     return memSize / (size / KIB);
+ }
+ 
++static inline uint64_t NormalPageToKB(uint64_t nr)
++{
++    int size = GetNormalPageSize();
++    return nr * (size / KIB);
++}
++
++static inline uint64_t KBToPage(uint64_t memSize)
++{
++    return IsHugeMode() ? KBToHugePage(memSize) : KBToNormalPage(memSize);
++}
++
++static inline uint64_t PageToKB(uint64_t nr)
++{
++    return IsHugeMode() ? HugePageToKB(nr) : NormalPageToKB(nr);
++}
++
+ static inline uint64_t MBToPage(uint64_t memSize)
+ {
+     return memSize * MIB / GetPageSize();
+diff --git a/plugins/smap/src/user/strategy/migration.c b/plugins/smap/src/user/strategy/migration.c
+index 1dab02c..d9430be 100644
+--- a/plugins/smap/src/user/strategy/migration.c
++++ b/plugins/smap/src/user/strategy/migration.c
+@@ -413,18 +413,34 @@ static void NumaSwapMemPool(ProcessAttr *current)
+     if (IsMultiNumaVm(current)) {
+         return;
+     }
++
+     for (int i = 0; i < LOCAL_NUMA_NUM; i++) {
++        if (!InAttrL1(current, i)) {
++            continue;
++        }
++
+         for (int j = 0; j < REMOTE_NUMA_NUM; j++) {
++            StrategyAttribute *sa = &current->strategyAttr;
+             int l2Node = GetNrLocalNuma() + j;
+-            int32_t tmpNum = IsHugeMode() ? KBToHugePage(current->strategyAttr.memSize[i][j]) :
+-                                            KBToNormalPage(current->strategyAttr.memSize[i][j]);
+-            int32_t migNum = current->strategyAttr.allocRemoteNrPages[i][j] - tmpNum;
+-            if (migNum > 0) {
+-                migNum = MIN(migNum, current->scanAttr.actcLen[l2Node]);
+-                current->strategyAttr.nrMigratePages[l2Node][i] = migNum;
++            uint32_t targetNum = KBToPage(sa->memSize[i][j]);
++            uint32_t localNum = current->walkPage.nrPages[i];
++            uint32_t remoteNum = sa->remoteNrPagesAfterMigrate[i][j];
++            uint32_t migNum;
++
++            if (remoteNum == 0 && targetNum == 0) {
++                continue;
++            }
++
++            if (remoteNum > targetNum) {
++                migNum = remoteNum - targetNum;
++                sa->nrMigratePages[l2Node][i] = migNum;
++                SMAP_LOGGER_INFO("[swap_pool] pid=%d src=%d dst=%d remote_pages=%u target_pages=%u mig_pages=%u",
++                                 current->pid, l2Node, i, remoteNum, targetNum, migNum);
+             } else {
+-                migNum = MIN(-migNum, current->scanAttr.actcLen[i]);
+-                current->strategyAttr.nrMigratePages[i][l2Node] = migNum;
++                migNum = MIN(localNum, targetNum - remoteNum);
++                sa->nrMigratePages[i][l2Node] = migNum;
++                SMAP_LOGGER_INFO("[swap_pool] pid=%d src=%d dst=%d remote_pages=%u target_pages=%u mig_pages=%u",
++                                 current->pid, i, l2Node, remoteNum, targetNum, migNum);
+             }
+         }
+     }
+diff --git a/plugins/smap/src/user/strategy/separate_strategy.c b/plugins/smap/src/user/strategy/separate_strategy.c
+index a686a7e..1e64338 100644
+--- a/plugins/smap/src/user/strategy/separate_strategy.c
++++ b/plugins/smap/src/user/strategy/separate_strategy.c
+@@ -550,9 +550,11 @@ static void UpdateSwapNum(ProcessAttr *process, uint64_t swapNum[LOCAL_NUMA_BITS
+                           uint64_t numaFreePage[MAX_NODES])
+ {
+     uint64_t numaOffset[MAX_NODES] = { 0 };
++    StrategyAttribute *sa = &process->strategyAttr;
++
+     for (int nid1 = 0; nid1 < MAX_NODES; nid1++) {
+         for (int nid2 = 0; nid2 < MAX_NODES; nid2++) {
+-            numaOffset[nid1] += process->strategyAttr.nrMigratePages[nid1][nid2];
++            numaOffset[nid1] += sa->nrMigratePages[nid1][nid2];
+         }
+     }
+     for (int remoteNid = localNumaNum; remoteNid < localNumaNum + REMOTE_NUMA_NUM; remoteNid++) {
+@@ -563,6 +565,10 @@ static void UpdateSwapNum(ProcessAttr *process, uint64_t swapNum[LOCAL_NUMA_BITS
+             if (NotInAttrL1(process, localNid)) {
+                 continue;
+             }
++            // nrMigratePages being zero means no swap should happen for processes in MIG_MEMSIZE_MODE.
++            if (process->migrateMode == MIG_MEMSIZE_MODE && sa->nrMigratePages[localNid][remoteNid] == 0) {
++                continue;
++            }
+             swapNum[localNid][remoteNid] = CalcSwapNum4K(process, localNid, remoteNid, numaOffset, numaFreePage);
+             numaOffset[localNid] += swapNum[localNid][remoteNid];
+             numaOffset[remoteNid] += swapNum[localNid][remoteNid];
+diff --git a/plugins/smap/test/user/manage/ManageTest.cpp b/plugins/smap/test/user/manage/ManageTest.cpp
+index a051ef0..7fb355a 100644
+--- a/plugins/smap/test/user/manage/ManageTest.cpp
++++ b/plugins/smap/test/user/manage/ManageTest.cpp
+@@ -2020,3 +2020,261 @@ TEST_F(ManageTest, TestMigratePagesToRemote_MultiLocalNuma)
+     EXPECT_EQ(expectedNuma0MemSize, attr.strategyAttr.memSize[0][0]);
+     EXPECT_EQ(expectedNuma1MemSize, attr.strategyAttr.memSize[1][0]);
+ }
++
++extern "C" uint32_t g_pageSizeNormal;
++
++TEST_F(ManageTest, TestHugePageToKB)
++{
++    g_pageSizeHuge = PAGESIZE_2M;
++    uint64_t ret;
++
++    ret = HugePageToKB(0);
++    EXPECT_EQ((uint64_t)0, ret);
++
++    ret = HugePageToKB(1);
++    EXPECT_EQ((uint64_t)2048, ret);  // 2MB = 2048KB
++
++    ret = HugePageToKB(5);
++    EXPECT_EQ((uint64_t)10240, ret); // 5 * 2048 = 10240KB
++}
++
++TEST_F(ManageTest, TestNormalPageToKB)
++{
++    g_pageSizeNormal = PAGESIZE_4K;
++    uint64_t ret;
++
++    ret = NormalPageToKB(0);
++    EXPECT_EQ((uint64_t)0, ret);
++
++    ret = NormalPageToKB(1);
++    EXPECT_EQ((uint64_t)4, ret);  // 4KB page → 4KB
++
++    ret = NormalPageToKB(256);
++    EXPECT_EQ((uint64_t)1024, ret); // 256 * 4 = 1024KB
++}
++
++TEST_F(ManageTest, TestKBToPageNormal)
++{
++    g_pageSizeNormal = PAGESIZE_4K;
++    g_pageSizeHuge = PAGESIZE_2M;
++    g_processManager.tracking.pageSize = PAGESIZE_4K;
++
++    uint64_t ret = KBToPage(0);
++    EXPECT_EQ((uint64_t)0, ret);
++
++    ret = KBToPage(4);
++    EXPECT_EQ((uint64_t)1, ret);  // 4KB memory → 1 normal page
++
++    ret = KBToPage(1024);
++    EXPECT_EQ((uint64_t)256, ret); // 1024KB / 4KB = 256 pages
++}
++
++TEST_F(ManageTest, TestKBToPageHuge)
++{
++    g_pageSizeHuge = PAGESIZE_2M;
++    g_processManager.tracking.pageSize = PAGESIZE_2M;
++
++    uint64_t ret = KBToPage(0);
++    EXPECT_EQ((uint64_t)0, ret);
++
++    ret = KBToPage(2048);
++    EXPECT_EQ((uint64_t)1, ret);  // 2048KB → 1 huge page
++
++    ret = KBToPage(4096);
++    EXPECT_EQ((uint64_t)2, ret); // 4096KB / 2048KB = 2 huge pages
++}
++
++TEST_F(ManageTest, TestPageToKBNormal)
++{
++    g_pageSizeNormal = PAGESIZE_4K;
++    g_pageSizeHuge = PAGESIZE_2M;
++    g_processManager.tracking.pageSize = PAGESIZE_4K;
++
++    uint64_t ret = PageToKB(0);
++    EXPECT_EQ((uint64_t)0, ret);
++
++    ret = PageToKB(1);
++    EXPECT_EQ((uint64_t)4, ret);  // 1 normal page = 4KB
++
++    ret = PageToKB(256);
++    EXPECT_EQ((uint64_t)1024, ret); // 256 * 4KB = 1024KB
++}
++
++TEST_F(ManageTest, TestPageToKBHuge)
++{
++    g_pageSizeHuge = PAGESIZE_2M;
++    g_processManager.tracking.pageSize = PAGESIZE_2M;
++
++    uint64_t ret = PageToKB(0);
++    EXPECT_EQ((uint64_t)0, ret);
++
++    ret = PageToKB(1);
++    EXPECT_EQ((uint64_t)2048, ret);  // 1 huge page = 2048KB
++
++    ret = PageToKB(5);
++    EXPECT_EQ((uint64_t)10240, ret); // 5 * 2048KB = 10240KB
++}
++
++extern "C" void AllocBorrowPagesForMemsize(ProcessAttr *attr,
++                                           uint32_t availPrivatePages[LOCAL_NUMA_NUM][REMOTE_NUMA_NUM],
++                                           uint32_t availSharedPages[REMOTE_NUMA_NUM]);
++
++TEST_F(ManageTest, TestAllocBorrowPagesForMemsizeInvalidL2IndexLow)
++{
++    g_pageSizeNormal = PAGESIZE_4K;
++    g_processManager.tracking.pageSize = PAGESIZE_4K;
++    g_processManager.nrLocalNuma = 4;
++
++    ProcessAttr attr = {};
++    attr.migrateParam[0].nid = 1; // l2Index = 1 - 4 = -3 < 0, triggers early return
++
++    uint32_t availPrivatePages[LOCAL_NUMA_NUM][REMOTE_NUMA_NUM] = { 0 };
++    uint32_t availSharedPages[REMOTE_NUMA_NUM] = { 0 };
++
++    // Should return early without crash or modification
++    AllocBorrowPagesForMemsize(&attr, availPrivatePages, availSharedPages);
++    EXPECT_EQ((uint64_t)0, attr.strategyAttr.memSize[0][0]);
++}
++
++TEST_F(ManageTest, TestAllocBorrowPagesForMemsizeInvalidL2IndexHigh)
++{
++    g_pageSizeNormal = PAGESIZE_4K;
++    g_processManager.tracking.pageSize = PAGESIZE_4K;
++    g_processManager.nrLocalNuma = 4;
++
++    ProcessAttr attr = {};
++    attr.migrateParam[0].nid = 30; // l2Index = 30 - 4 = 26 >= REMOTE_NUMA_NUM(18)
++
++    uint32_t availPrivatePages[LOCAL_NUMA_NUM][REMOTE_NUMA_NUM] = { 0 };
++    uint32_t availSharedPages[REMOTE_NUMA_NUM] = { 0 };
++
++    AllocBorrowPagesForMemsize(&attr, availPrivatePages, availSharedPages);
++    EXPECT_EQ((uint64_t)0, attr.strategyAttr.memSize[0][0]);
++}
++
++TEST_F(ManageTest, TestAllocBorrowPagesForMemsizeNoLocalNuma)
++{
++    g_pageSizeNormal = PAGESIZE_4K;
++    g_processManager.tracking.pageSize = PAGESIZE_4K;
++    g_processManager.nrLocalNuma = 4;
++
++    ProcessAttr attr = {};
++    attr.migrateParam[0].nid = 4;  // l2Index = 0
++    attr.migrateParam[0].memSize = 400;  // 400KB → 100 pages (4K)
++    attr.numaAttr.numaNodes = 0;  // No local NUMA set
++
++    uint32_t availPrivatePages[LOCAL_NUMA_NUM][REMOTE_NUMA_NUM] = { 0 };
++    availPrivatePages[0][0] = 100;
++    uint32_t availSharedPages[REMOTE_NUMA_NUM] = { 0 };
++
++    AllocBorrowPagesForMemsize(&attr, availPrivatePages, availSharedPages);
++
++    // All local NUMAs skipped, nothing allocated
++    EXPECT_EQ((uint64_t)0, attr.strategyAttr.memSize[0][0]);
++    EXPECT_EQ((uint32_t)100, availPrivatePages[0][0]);
++}
++
++TEST_F(ManageTest, TestAllocBorrowPagesForMemsizePrivateOnly)
++{
++    g_pageSizeNormal = PAGESIZE_4K;
++    g_processManager.tracking.pageSize = PAGESIZE_4K;
++    g_processManager.nrLocalNuma = 4;
++
++    ProcessAttr attr = {};
++    attr.migrateParam[0].nid = 4;  // remote NUMA 4, l2Index = 0
++    attr.migrateParam[0].memSize = 400;  // 400KB → 100 pages (4K)
++    attr.numaAttr.numaNodes = 0b00000001;  // L1: node 0
++    attr.strategyAttr.nrPagesPerLocalNuma[0] = 200;
++
++    uint32_t availPrivatePages[LOCAL_NUMA_NUM][REMOTE_NUMA_NUM] = { 0 };
++    availPrivatePages[0][0] = 150;  // More than memSize needs
++    uint32_t availSharedPages[REMOTE_NUMA_NUM] = { 0 };
++
++    AllocBorrowPagesForMemsize(&attr, availPrivatePages, availSharedPages);
++
++    // nrLeft=100, nrUsed=MIN(200,150)=150, nrLeft(100) < nrUsed(150)
++    // So: availPrivatePages[0][0] -= 100 → 50, memSize[0][0] = PageToKB(100) = 400
++    EXPECT_EQ((uint32_t)50, availPrivatePages[0][0]);
++    EXPECT_EQ((uint64_t)400, attr.strategyAttr.memSize[0][0]);
++}
++
++TEST_F(ManageTest, TestAllocBorrowPagesForMemsizePrivateAndShared)
++{
++    g_pageSizeNormal = PAGESIZE_4K;
++    g_processManager.tracking.pageSize = PAGESIZE_4K;
++    g_processManager.nrLocalNuma = 4;
++
++    ProcessAttr attr = {};
++    attr.migrateParam[0].nid = 4;  // l2Index = 0
++    attr.migrateParam[0].memSize = 1000;  // 1000KB → 250 pages (4K)
++    attr.numaAttr.numaNodes = 0b00000001;  // L1: node 0
++    attr.strategyAttr.nrPagesPerLocalNuma[0] = 300;
++
++    uint32_t availPrivatePages[LOCAL_NUMA_NUM][REMOTE_NUMA_NUM] = { 0 };
++    availPrivatePages[0][0] = 100;  // Private insufficient
++    uint32_t availSharedPages[REMOTE_NUMA_NUM] = { 0 };
++    availSharedPages[0] = 200;
++
++    AllocBorrowPagesForMemsize(&attr, availPrivatePages, availSharedPages);
++
++    // Step 1 - Private: nrPages=300, nrUsed=MIN(300,100)=100
++    //   nrLeft(250)>=nrUsed(100): nrLeft=150, availPrivatePages[0][0]=0, memSize=PageToKB(100)=400
++    // Step 2 - Shared: nrPages=200, nrUsed=MIN(200,200)=200
++    //   nrLeft(150)<nrUsed(200): availSharedPages[0]-=150→50, memSize+=PageToKB(150)=1000
++    EXPECT_EQ((uint32_t)0, availPrivatePages[0][0]);
++    EXPECT_EQ((uint32_t)50, availSharedPages[0]);
++    EXPECT_EQ((uint64_t)1000, attr.strategyAttr.memSize[0][0]);
++}
++
++TEST_F(ManageTest, TestAllocBorrowPagesForMemsizeSkipNonLocal)
++{
++    g_pageSizeNormal = PAGESIZE_4K;
++    g_processManager.tracking.pageSize = PAGESIZE_4K;
++    g_processManager.nrLocalNuma = 4;
++
++    ProcessAttr attr = {};
++    attr.migrateParam[0].nid = 5;  // l2Index = 1
++    attr.migrateParam[0].memSize = 400;  // 100 pages
++    attr.numaAttr.numaNodes = 0b00000010;  // L1: node 1 only (not node 0)
++    attr.strategyAttr.nrPagesPerLocalNuma[0] = 200;
++    attr.strategyAttr.nrPagesPerLocalNuma[1] = 200;
++
++    uint32_t availPrivatePages[LOCAL_NUMA_NUM][REMOTE_NUMA_NUM] = { 0 };
++    availPrivatePages[1][1] = 200;
++    uint32_t availSharedPages[REMOTE_NUMA_NUM] = { 0 };
++
++    AllocBorrowPagesForMemsize(&attr, availPrivatePages, availSharedPages);
++
++    // i=0: InAttrL1(attr,0)=false → memSize[0][1]=0
++    // i=1: InAttrL1(attr,1)=true → nrLeft=100, nrUsed=MIN(200,200)=200
++    //   nrLeft(100)<nrUsed(200): availPrivatePages[1][1]-=100→100, memSize[1][1]=PageToKB(100)=400
++    EXPECT_EQ((uint64_t)0, attr.strategyAttr.memSize[0][1]);
++    EXPECT_EQ((uint64_t)400, attr.strategyAttr.memSize[1][1]);
++    EXPECT_EQ((uint32_t)100, availPrivatePages[1][1]);
++}
++
++TEST_F(ManageTest, TestAllocBorrowPagesForMemsizeHugePage)
++{
++    g_pageSizeHuge = PAGESIZE_2M;
++    g_pageSizeNormal = PAGESIZE_4K;
++    g_processManager.tracking.pageSize = PAGESIZE_2M;  // Huge mode
++    g_processManager.nrLocalNuma = 4;
++
++    ProcessAttr attr = {};
++    attr.migrateParam[0].nid = 4;  // l2Index = 0
++    attr.migrateParam[0].memSize = 2048;  // 2048KB = 1 huge page worth
++    attr.numaAttr.numaNodes = 0b00000001;  // L1: node 0
++    attr.strategyAttr.nrPagesPerLocalNuma[0] = 10;
++
++    uint32_t availPrivatePages[LOCAL_NUMA_NUM][REMOTE_NUMA_NUM] = { 0 };
++    availPrivatePages[0][0] = 5;
++    uint32_t availSharedPages[REMOTE_NUMA_NUM] = { 0 };
++
++    AllocBorrowPagesForMemsize(&attr, availPrivatePages, availSharedPages);
++
++    // KBToPage(2048) in huge mode = 2048 / 2048 = 1 page (floor division)
++    // nrLeft=1, nrPages=10, nrUsed=MIN(10,5)=5
++    // nrLeft(1)<nrUsed(5): availPrivatePages[0][0]-=1→4, memSize[0][0]=PageToKB(1)=2048
++    EXPECT_EQ((uint32_t)4, availPrivatePages[0][0]);
++    EXPECT_EQ((uint64_t)2048, attr.strategyAttr.memSize[0][0]);
++}
+diff --git a/plugins/smap/test/user/strategy/MigrationTest.cpp b/plugins/smap/test/user/strategy/MigrationTest.cpp
+index 3c28903..e7d3015 100644
+--- a/plugins/smap/test/user/strategy/MigrationTest.cpp
++++ b/plugins/smap/test/user/strategy/MigrationTest.cpp
+@@ -401,13 +401,14 @@ TEST_F(MigrationTest, TestScanMigrateWorkTwo)
+     EXPECT_EQ(-1, ret);
+ }
+ 
++extern "C" uint32_t g_pageSizeHuge;
+ extern "C" int SetMigrateThreadNum(struct MigrateMsg *mMsg, uint64_t migratePages, bool isForcedSingleThread);
+ TEST_F(MigrationTest, TestSetMigrateThreadNum)
+ {
+     int ret;
+     struct MigrateMsg mMsg = { 0 };
+     uint64_t migratePages = LESS_MIG_OUT_2M_PAGE_THRE + 1;
+-    mMsg.mulMig.pageSize = PAGESIZE_2M;
++    mMsg.mulMig.pageSize = g_pageSizeHuge = PAGESIZE_2M;
+     ret = SetMigrateThreadNum(&mMsg, migratePages, 0);
+     EXPECT_EQ(0, ret);
+     EXPECT_EQ(true, mMsg.mulMig.isMulThread);
+@@ -522,28 +523,25 @@ TEST_F(MigrationTest, TestNumaSwapMemPool)
+ {
+     int l2Node = 4;
+     ProcessAttr attr = {};
+-    attr.strategyAttr.allocRemoteNrPages[0][0] = 100;
+-    attr.scanAttr.actcLen[l2Node] = 5;
++    attr.numaAttr.numaNodes = 0x11;
++    attr.strategyAttr.remoteNrPagesAfterMigrate[0][0] = 5;
++    attr.walkPage.nrPages[l2Node] = 5;
+     attr.strategyAttr.memSize[0][0] = 4096; // 2 hugepage
++    g_pageSizeHuge = PAGESIZE_2M;
++    g_processManager.tracking.pageSize = g_pageSizeHuge;
+     MOCKER(IsHugeMode).stubs().will(returnValue(true));
+     MOCKER(GetNrLocalNuma).stubs().will(returnValue(l2Node));
+ 
+-    // migNum > 0 case
+-    NumaSwapMemPool(&attr);
+-    EXPECT_EQ(5, attr.strategyAttr.nrMigratePages[l2Node][0]);
+-
+-    attr.scanAttr.actcLen[l2Node] = 100;
++    // promote case
+     NumaSwapMemPool(&attr);
+-    EXPECT_EQ(98, attr.strategyAttr.nrMigratePages[l2Node][0]);
++    EXPECT_EQ(3, attr.strategyAttr.nrMigratePages[l2Node][0]);
+ 
+-    // migNum < 0 case
+-    attr.scanAttr.actcLen[0] = 100;
++    // demote case
++    attr.strategyAttr.remoteNrPagesAfterMigrate[0][0] = 140;
++    attr.walkPage.nrPages[0] = 200;
++    attr.walkPage.nrPages[l2Node] = 140;
+     attr.strategyAttr.memSize[0][0] = 307200; // 150 hugepage
+     NumaSwapMemPool(&attr);
+-    EXPECT_EQ(50, attr.strategyAttr.nrMigratePages[0][l2Node]);
+-
+-    attr.scanAttr.actcLen[0] = 10;
+-    NumaSwapMemPool(&attr);
+     EXPECT_EQ(10, attr.strategyAttr.nrMigratePages[0][l2Node]);
+ }
+ 
+-- 
+2.53.0.windows.3
+

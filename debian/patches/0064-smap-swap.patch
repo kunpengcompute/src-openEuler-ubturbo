@@ -1,0 +1,122 @@
+From 729a0ea67d9a12260b452961551c4894d5ba8401 Mon Sep 17 00:00:00 2001
+From: dszhu <2549951418@qq.com>
+Date: Wed, 3 Jun 2026 20:25:52 +0800
+Subject: [PATCH 64/71] =?UTF-8?q?smap:=E5=8E=86=E5=8F=B2=E9=A2=91=E6=AC=A1?=
+ =?UTF-8?q?=E8=BE=83=E9=AB=98=E7=9A=84=E4=B8=8D=E5=8F=82=E4=B8=8Eswap?=
+ =?UTF-8?q?=E4=BA=A4=E6=8D=A2?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ plugins/smap/src/user/manage/manage.c | 47 +++++++++++++++++++++++++++
+ plugins/smap/src/user/manage/manage.h |  4 +++
+ 2 files changed, 51 insertions(+)
+
+diff --git a/plugins/smap/src/user/manage/manage.c b/plugins/smap/src/user/manage/manage.c
+index 3e08976..62ead9a 100644
+--- a/plugins/smap/src/user/manage/manage.c
++++ b/plugins/smap/src/user/manage/manage.c
+@@ -1305,16 +1305,49 @@ static void SetPidNrPages(ProcessAttr *attr, size_t *nrPages, int len)
+ 
+ #define FREQ_FILE_PATH_LEN 50
+ 
++/**
++ * EstimatePriorThre - 从直方图估算 prior 的阈值
++ * @histogram: 256桶直方图数组
++ * @totalCount: 总样本数
++ *
++ * 返回估算的prior阈值（uint8_t）
++ */
++static uint8_t EstimatePriorThre(const uint32_t *histogram, uint32_t target)
++{
++    uint32_t cumulative = 0;
++    for (int i = 0; i < PRIOR_HISTOGRAM_SIZE; i++) {
++        if (histogram[i]) {
++            SMAP_LOGGER_DEBUG("Hist[%d] = %u", i, histogram[i]);
++        }
++    }
++
++    for (int i = 0; i < PRIOR_HISTOGRAM_SIZE; i++) {
++        cumulative += histogram[i];
++        if (cumulative >= target) {
++            SMAP_LOGGER_INFO("Prior thre = %u", i);
++            return (uint8_t)i;
++        }
++    }
++    return 0;
++}
++
+ /**
+  * CalcActcStats - 从actc_data数组计算统计数据
+  * @attr: ProcessAttr结构体指针
+  *
+  * 遍历actc_data数组，计算freqMax、freqMin、freqNum、freqSum等统计数据。
++ * 同时根据历史prior提升freq：如果prior > priorThre，则freq增加1。
++ * 在循环中统计prior直方图，更新priorThre供下次使用。
+  */
+ static void CalcActcStats(ProcessAttr *attr)
+ {
+     uint16_t remoteHotThreshold = GetRemoteHotThreshold();
+     int nrLocalNuma = GetNrLocalNuma();
++    uint8_t priorThre = attr->scanAttr.priorThre;
++    uint32_t priorTotalCount = 0;
++
++    /* 每次扫描开始时清空 prior 直方图统计 */
++    memset(attr->scanAttr.priorHistogram, 0, sizeof(attr->scanAttr.priorHistogram));
+ 
+     for (int nid = 0; nid < MAX_NODES; nid++) {
+         uint64_t actcLen = attr->scanAttr.actcLen[nid];
+@@ -1339,6 +1372,18 @@ static void CalcActcStats(ProcessAttr *attr)
+         count->freqZero = 0;
+ 
+         for (uint64_t i = 0; i < actcLen; i++) {
++            attr->scanAttr.priorHistogram[actc[i].prior]++;
++            priorTotalCount++;
++
++            /* 根据历史prior阈值调整热度（本地NUMA直接加一，远端NUMA需freq非零） */
++            if ((actc[i].prior > priorThre) && (attr->type == PROCESS_TYPE)) {
++                if (nid < nrLocalNuma) {
++                    actc[i].freq++;
++                } else if (actc[i].freq != 0) {
++                    actc[i].freq++;
++                }
++            }
++
+             actc_t freq = actc[i].freq;
+             uint16_t bucketIdx = MIN(freq, FREQ_BUCKETS_SIZE - 1);
+             if (nid >= nrLocalNuma || !actc[i].isWhiteListPage) {
+@@ -1374,6 +1419,8 @@ static void CalcActcStats(ProcessAttr *attr)
+             }
+         }
+     }
++    /* 计算prior的低25%位置的阈值 */
++    attr->scanAttr.priorThre = EstimatePriorThre(attr->scanAttr.priorHistogram, priorTotalCount / 4);
+ }
+ 
+ /**
+diff --git a/plugins/smap/src/user/manage/manage.h b/plugins/smap/src/user/manage/manage.h
+index 3139b33..03c822f 100644
+--- a/plugins/smap/src/user/manage/manage.h
++++ b/plugins/smap/src/user/manage/manage.h
+@@ -84,6 +84,7 @@
+ #define NUMA_MAPS_MAX_PATTERN_LEN 20
+ 
+ #define FREQ_BUCKETS_SIZE 256
++#define PRIOR_HISTOGRAM_SIZE 256
+ 
+ extern EnvAtomic g_forbiddenNodes[MAX_NODES];
+ 
+@@ -250,6 +251,9 @@ typedef struct {
+     ActcData *actcData[MAX_NODES]; // actc数据
+     ActCount actCount[MAX_NODES]; // 统计数据
+     uint32_t selectedBuckets[MAX_NODES][FREQ_BUCKETS_SIZE]; // 已选频次为freq的页面数
++    /* prior 历史频次的直方图统计 */
++    uint32_t priorHistogram[PRIOR_HISTOGRAM_SIZE]; // 累积统计 prior 分布
++    uint8_t priorThre; // 估算的prior阈值（供下次使用）
+ } ScanAttribute;
+ 
+ typedef struct {
+-- 
+2.53.0.windows.3
+

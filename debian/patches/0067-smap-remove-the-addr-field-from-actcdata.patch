@@ -1,0 +1,2346 @@
+From 220d88d1515fc7b4cf1520be1888ed75d469bf73 Mon Sep 17 00:00:00 2001
+From: fffsfsaf <1825116237@qq.com>
+Date: Fri, 3 Jul 2026 10:09:45 +0800
+Subject: [PATCH 67/71] smap: remove the addr field from actcdata
+
+---
+ plugins/smap/src/drivers/access_ioctl.h       |  11 +-
+ plugins/smap/src/drivers/access_mmu.c         |   4 +-
+ plugins/smap/src/drivers/access_pid.c         |  19 +-
+ plugins/smap/src/tiering/mig_init.c           |  20 +-
+ plugins/smap/src/user/manage/manage.h         |   6 +-
+ .../smap/src/user/strategy/grouped_strategy.c | 130 +++-
+ plugins/smap/src/user/strategy/migration.c    |   2 +-
+ .../src/user/strategy/separate_strategy.c     | 555 ++++++++--------
+ .../src/user/strategy/separate_strategy.h     |   3 +-
+ plugins/smap/src/user/strategy/strategy.c     |  22 +-
+ plugins/smap/test/tiering/test_mig_init.cpp   |   3 -
+ plugins/smap/test/user/manage/test_manage.cpp |   6 -
+ .../user/strategy/test_grouped_strategy.cpp   |  66 +-
+ .../test/user/strategy/test_migration.cpp     |   3 -
+ .../user/strategy/test_separate_strategy.cpp  | 622 +-----------------
+ .../smap/test/user/strategy/test_strategy.cpp |   6 +-
+ plugins/smap/test/user/test_interface.cpp     |  18 +-
+ 17 files changed, 423 insertions(+), 1073 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/access_ioctl.h b/plugins/smap/src/drivers/access_ioctl.h
+index e070cef..c7e2da5 100644
+--- a/plugins/smap/src/drivers/access_ioctl.h
++++ b/plugins/smap/src/drivers/access_ioctl.h
+@@ -23,12 +23,15 @@
+ #define SMAP_PROC_ROOT "smap"
+ 
+ struct actc_data {
+-	u64 addr; /* 相对索引位置 */
+-	actc_t freq; /* 访问频次 */
+-	u8 prior; /* 优先级 */
+-	u8 is_white_list; /* 是否白名单页 */
++	actc_t freq;       /* 访问频次 */
++	u8 flags;  /* 位域:bit0=白名单页, bit1=已选中, bits2-7=优先级 */
+ } __attribute__((packed));
+ 
++#define ACTC_WHITE_LIST_BIT  BIT(0)
++#define ACTC_SELECT_BIT      BIT(1)
++#define ACTC_PRIOR_GET(f)    (((f) >> 2) & 0x3F)
++#define ACTC_PRIOR_SET(p)    (((p) & 0x3F) << 2)
++
+ typedef enum {
+ 	NO_SCAN = -1,
+ 	HAM_SCAN,
+diff --git a/plugins/smap/src/drivers/access_mmu.c b/plugins/smap/src/drivers/access_mmu.c
+index 7ac5c7e..5249a66 100644
+--- a/plugins/smap/src/drivers/access_mmu.c
++++ b/plugins/smap/src/drivers/access_mmu.c
+@@ -46,8 +46,8 @@
+ 
+ #define MAPPING_U32_BITS (32)
+ 
+-#define MAPPING_PRIOR_BIT 8
+-#define MAPPING_PAIDX_BIT 20
++#define MAPPING_PRIOR_BIT 6
++#define MAPPING_PAIDX_BIT 22
+ #define MAPPING_NODE_BIT 4
+ 
+ #define MAPPING_PRIOR_SHIFT 0
+diff --git a/plugins/smap/src/drivers/access_pid.c b/plugins/smap/src/drivers/access_pid.c
+index 7395408..cc1d5eb 100644
+--- a/plugins/smap/src/drivers/access_pid.c
++++ b/plugins/smap/src/drivers/access_pid.c
+@@ -305,28 +305,27 @@ static void fill_actc_data_by_bitmap(struct access_pid *ap, int nid,
+ 			break;
+ 		}
+ 
+-		/* 填充addr - 使用相对索引 */
+-		actc[len_cnt].addr = len_cnt;
+-
++		u8 flags = 0;
+ 		/* 填充freq */
+ 		actc[len_cnt].freq = adev->access_bit_actc_data[acidx];
+ 
+ 		/* 填充prior - 从mapping获取 */
+ 		if (ap->info.vm_size && ap->info.mapping) {
+-			actc[len_cnt].prior = (mapping_offset + len_cnt) < ap->info.vm_size ?
+-				(ap->info.mapping[mapping_offset + len_cnt] & 0xff) : 0;
++			if ((mapping_offset + len_cnt) < ap->info.vm_size) {
++				flags |= ACTC_PRIOR_SET(ap->info.mapping[mapping_offset + len_cnt] & 0x3f);
++			}
+ 		} else {
+-			actc[len_cnt].prior = get_page_prior_flag(nid, acidx);
++			flags |= ACTC_PRIOR_SET(get_page_prior_flag(nid, acidx));
+ 		}
+ 
+ 		/* 填充is_white_list */
+ 		if (ap->white_list_bm[nid] &&
+-		    test_bit(acidx, ap->white_list_bm[nid])) {
+-			actc[len_cnt].is_white_list = 1;
+-		} else {
+-			actc[len_cnt].is_white_list = 0;
++			test_bit(acidx, ap->white_list_bm[nid])) {
++			flags |= ACTC_WHITE_LIST_BIT;
+ 		}
+ 
++		actc[len_cnt].flags = flags;
++
+ 		len_cnt++;
+ 		acidx++;
+ 	}
+diff --git a/plugins/smap/src/tiering/mig_init.c b/plugins/smap/src/tiering/mig_init.c
+index 5b3ebd9..1bed701 100644
+--- a/plugins/smap/src/tiering/mig_init.c
++++ b/plugins/smap/src/tiering/mig_init.c
+@@ -12,7 +12,6 @@
+ #include <linux/cdev.h>
+ #include <linux/device.h>
+ #include <linux/ioctl.h>
+-#include <linux/sort.h>
+ #include <linux/fs.h>
+ #include <linux/mm.h>
+ 
+@@ -28,9 +27,6 @@
+ #undef pr_fmt
+ #define pr_fmt(fmt) "SMAP_mig: " fmt
+ 
+-#define CMP_LT (-1)
+-#define CMP_EQ 0
+-#define CMP_GT 1
+ #define MAX_MIGRATE_PID_NUMA_RETRY_TIME 100
+ 
+ static dev_t mig_dev = 0;
+@@ -129,17 +125,6 @@ out:
+ 	return ret;
+ }
+ 
+-static int cmp_mlist_addr_ascend(const void *a, const void *b)
+-{
+-	u64 tmp_a = *(u64 *)a;
+-	u64 tmp_b = *(u64 *)b;
+-
+-	if (tmp_a == tmp_b) {
+-		return CMP_EQ;
+-	}
+-	return tmp_a < tmp_b ? CMP_LT : CMP_GT;
+-}
+-
+ static int convert_migrate_list(int len, struct mig_list *mlist)
+ {
+ 	int i, ret;
+@@ -151,10 +136,7 @@ static int convert_migrate_list(int len, struct mig_list *mlist)
+ 	for (i = 0; i < len; i++) {
+ 		struct mig_list *ml = &mlist[i];
+ 
+-		/* Sort ml->addr to accelerate conversion */
+-		sort(ml->addr, ml->nr, sizeof(u64), cmp_mlist_addr_ascend,
+-		     NULL);
+-
++		/* Input addresses are already in ascending order, no need to sort */
+ 		ret = convert_pos_to_paddr_sorted(ml->pid, ml->from, ml->nr,
+ 						  ml->addr);
+ 		if (ret) {
+diff --git a/plugins/smap/src/user/manage/manage.h b/plugins/smap/src/user/manage/manage.h
+index 03c822f..87204c0 100644
+--- a/plugins/smap/src/user/manage/manage.h
++++ b/plugins/smap/src/user/manage/manage.h
+@@ -126,10 +126,10 @@ enum {
+ };
+ 
+ typedef struct {
+-    uint64_t addr;
+     actc_t freq;
+-    uint8_t prior;
+-    uint8_t isWhiteListPage;
++    uint8_t isWhiteListPage : 1;  // bit 0
++    uint8_t isSelected : 1;         // bit 1
++    uint8_t prior : 6;            // bits 2-7
+ } __attribute__((packed)) ActcData;
+ 
+ typedef struct {
+diff --git a/plugins/smap/src/user/strategy/grouped_strategy.c b/plugins/smap/src/user/strategy/grouped_strategy.c
+index 4c85825..16692b4 100644
+--- a/plugins/smap/src/user/strategy/grouped_strategy.c
++++ b/plugins/smap/src/user/strategy/grouped_strategy.c
+@@ -18,6 +18,7 @@
+ #include "securec.h"
+ #include "smap_user_log.h"
+ #include "strategy.h"
++#include "separate_strategy.h"
+ #include "grouped_strategy.h"
+ #include "strategy_config.h"
+ 
+@@ -58,23 +59,28 @@ typedef struct {
+     uint64_t oldUsedPages;
+ } GroupTargetEntry;
+ 
+-static int GroupPageAscFunc(const void *data1, const void *data2)
++static int CmpU64Asc(const void *a, const void *b)
+ {
+-    const GroupPageData *p1 = (const GroupPageData *)data1;
+-    const GroupPageData *p2 = (const GroupPageData *)data2;
+-    if (p1->isWhiteListPage != p2->isWhiteListPage) {
+-        return p1->isWhiteListPage ? 1 : -1;
+-    }
+-    if (p1->freq < p2->freq) {
++    uint64_t ua = *(const uint64_t *)a;
++    uint64_t ub = *(const uint64_t *)b;
++    if (ua < ub) {
+         return -1;
+     }
+-    if (p1->freq > p2->freq) {
++    if (ua > ub) {
+         return 1;
+     }
+-    return (int)p2->prior - (int)p1->prior;
++    return 0;
+ }
+ 
+-static int GroupPageDescFunc(const void *data1, const void *data2)
++static void SortMigListAddr(struct MigList *list)
++{
++    if (list->nr > 1) {
++        // 对 addr 数组升序排序
++        qsort(list->addr, list->nr, sizeof(uint64_t), CmpU64Asc);
++    }
++}
++
++static int GroupPageAscFunc(const void *data1, const void *data2)
+ {
+     const GroupPageData *p1 = (const GroupPageData *)data1;
+     const GroupPageData *p2 = (const GroupPageData *)data2;
+@@ -82,18 +88,18 @@ static int GroupPageDescFunc(const void *data1, const void *data2)
+         return p1->isWhiteListPage ? 1 : -1;
+     }
+     if (p1->freq < p2->freq) {
+-        return 1;
++        return -1;
+     }
+     if (p1->freq > p2->freq) {
+-        return -1;
++        return 1;
+     }
+-    return (int)p1->prior - (int)p2->prior;
++    return (int)p2->prior - (int)p1->prior;
+ }
+ 
+-static int ActcDataDescFunc(const void *data1, const void *data2)
++static int GroupPageDescFunc(const void *data1, const void *data2)
+ {
+-    const ActcData *p1 = (const ActcData *)data1;
+-    const ActcData *p2 = (const ActcData *)data2;
++    const GroupPageData *p1 = (const GroupPageData *)data1;
++    const GroupPageData *p2 = (const GroupPageData *)data2;
+     if (p1->isWhiteListPage != p2->isWhiteListPage) {
+         return p1->isWhiteListPage ? 1 : -1;
+     }
+@@ -512,7 +518,7 @@ static int CollectLocalPages(ProcessAttr *process, const MigrationGroupAttr *gro
+     for (int i = 0; i < group->localCount; i++) {
+         int nid = group->locals[i].nid;
+         for (uint64_t j = 0; j < process->scanAttr.actcLen[nid]; j++) {
+-            data[pos].addr = process->scanAttr.actcData[nid][j].addr;
++            data[pos].addr = j;
+             data[pos].freq = process->scanAttr.actcData[nid][j].freq;
+             data[pos].prior = process->scanAttr.actcData[nid][j].prior;
+             data[pos].isWhiteListPage = process->scanAttr.actcData[nid][j].isWhiteListPage;
+@@ -526,6 +532,62 @@ static int CollectLocalPages(ProcessAttr *process, const MigrationGroupAttr *gro
+     return 0;
+ }
+ 
++static uint64_t CollectPagesFromNode(ProcessAttr *process, int nid, uint64_t usedPages, uint64_t remoteOffset,
++                                     GroupPageData *data, uint64_t startPos)
++{
++    uint64_t actcLen = process->scanAttr.actcLen[nid];
++    uint64_t offset = remoteOffset;
++
++    if (offset >= actcLen) {
++        return 0;
++    }
++
++    uint64_t limit = MIN(usedPages, actcLen - offset);
++    uint32_t buckets[FREQ_BUCKETS_SIZE] = {0};
++
++    // 统计频率分布
++    for (uint64_t j = 0; j < actcLen; j++) {
++        if (process->scanAttr.actcData[nid][j].isSelected) {
++            continue;
++        }
++        int freq = process->scanAttr.actcData[nid][j].freq;
++        freq = MIN(freq, FREQ_BUCKETS_SIZE - 1);
++        buckets[freq]++;
++    }
++
++    // 找阈值
++    int thresholdFreq;
++    uint32_t takeAtThreshold;
++    FindThreshold(SELECT_TOP_K, limit, buckets, &thresholdFreq, &takeAtThreshold);
++
++    // 收集满足条件的页面
++    uint32_t tmp = takeAtThreshold;
++    uint64_t collected = 0;
++
++    for (uint64_t j = 0; j < actcLen && collected < limit; j++) {
++        if (process->scanAttr.actcData[nid][j].isSelected) {
++            continue;
++        }
++        int freq = process->scanAttr.actcData[nid][j].freq;
++        bool shouldTake = (freq > thresholdFreq) || (freq == thresholdFreq && tmp > 0);
++
++        if (shouldTake) {
++            data[startPos + collected].addr = j;
++            data[startPos + collected].freq = freq;
++            data[startPos + collected].prior = process->scanAttr.actcData[nid][j].prior;
++            data[startPos + collected].isWhiteListPage = process->scanAttr.actcData[nid][j].isWhiteListPage;
++            data[startPos + collected].nid = nid;
++            process->scanAttr.actcData[nid][j].isSelected = 1;
++            collected++;
++            if (freq == thresholdFreq) {
++                tmp--;
++            }
++        }
++    }
++
++    return collected;
++}
++
+ static int CollectRemotePages(ProcessAttr *process, const MigrationGroupAttr *group, const uint64_t remoteOffsets[],
+                               GroupPageData **pages, uint64_t *nrPages)
+ {
+@@ -537,36 +599,29 @@ static int CollectRemotePages(ProcessAttr *process, const MigrationGroupAttr *gr
+         }
+         total += MIN(group->targets[i].usedPages, process->scanAttr.actcLen[nid] - remoteOffsets[nid]);
+     }
++
+     *pages = NULL;
+     *nrPages = 0;
+     if (total == 0) {
+         return 0;
+     }
++
+     GroupPageData *data = calloc(total, sizeof(GroupPageData));
+     if (!data) {
+         return -ENOMEM;
+     }
++
+     uint64_t pos = 0;
+     for (int i = 0; i < group->targetCount; i++) {
+         int nid = group->targets[i].nid;
+-        if (remoteOffsets[nid] >= process->scanAttr.actcLen[nid]) {
+-            continue;
+-        }
+-        qsort(process->scanAttr.actcData[nid], process->scanAttr.actcLen[nid], sizeof(ActcData), ActcDataDescFunc);
+-        uint64_t limit = MIN(group->targets[i].usedPages, process->scanAttr.actcLen[nid] - remoteOffsets[nid]);
+-        for (uint64_t j = 0; j < limit; j++) {
+-            uint64_t actcIdx = remoteOffsets[nid] + j;
+-            data[pos].addr = process->scanAttr.actcData[nid][actcIdx].addr;
+-            data[pos].freq = process->scanAttr.actcData[nid][actcIdx].freq;
+-            data[pos].prior = process->scanAttr.actcData[nid][actcIdx].prior;
+-            data[pos].isWhiteListPage = process->scanAttr.actcData[nid][actcIdx].isWhiteListPage;
+-            data[pos].nid = nid;
+-            pos++;
+-        }
++        uint64_t offset = remoteOffsets[nid];
++        uint64_t collected = CollectPagesFromNode(process, nid, group->targets[i].usedPages, offset, data, pos);
++        pos += collected;
+     }
+-    qsort(data, total, sizeof(GroupPageData), GroupPageDescFunc);
++
++    qsort(data, pos, sizeof(GroupPageData), GroupPageDescFunc);
+     *pages = data;
+-    *nrPages = total;
++    *nrPages = pos;
+     return 0;
+ }
+ 
+@@ -1181,6 +1236,15 @@ int GroupedMigrationStrategy(ProcessAttr *process, struct MigList mlist[MAX_NODE
+     if (ret) {
+         SMAP_LOGGER_ERROR("grouped pid %d swap stage failed: %d.", process->pid, ret);
+     }
++
++    for (int i = 0; i < MAX_NODES; i++) {
++        for (int j = 0; j < MAX_NODES; j++) {
++            if (mlist[i][j].nr > 0) {
++                SortMigListAddr(&mlist[i][j]);
++            }
++        }
++    }
++
+     return ret;
+ }
+ 
+diff --git a/plugins/smap/src/user/strategy/migration.c b/plugins/smap/src/user/strategy/migration.c
+index 0201002..443fc2c 100644
+--- a/plugins/smap/src/user/strategy/migration.c
++++ b/plugins/smap/src/user/strategy/migration.c
+@@ -370,7 +370,7 @@ static uint64_t BuildCompMigListFromScan(ProcessAttr *process, GroupSwapCompPlan
+     list->to = plan->to;
+     list->nr = nr;
+     for (uint64_t i = 0; i < nr; i++) {
+-        list->addr[i] = process->scanAttr.actcData[plan->from][i].addr;
++        list->addr[i] = i;
+     }
+     plan->built = nr;
+     if (nr < plan->need) {
+diff --git a/plugins/smap/src/user/strategy/separate_strategy.c b/plugins/smap/src/user/strategy/separate_strategy.c
+index 8bc2d83..052fe9c 100644
+--- a/plugins/smap/src/user/strategy/separate_strategy.c
++++ b/plugins/smap/src/user/strategy/separate_strategy.c
+@@ -25,7 +25,7 @@
+ #define DEFAULT_SLOW_THRED_2M (2 * DEFAULT_FREQ_WT_2M)
+ #define MAX_MIGRATE_DIVISOR_2M 1
+ #define MULTI_NUMA_VM_OOM 66
+-
++#define PRIOR_MAX_VALUE 63
+ typedef struct NumaInfo {
+     int localNid;
+     int remoteNid;
+@@ -52,319 +52,227 @@ static bool ShouldMigrate(ProcessAttr *process)
+     return true;
+ }
+ 
+-static int ActcFreqAscFunc(const void *actc1, const void *actc2)
++static void FreeMlist(struct MigList mlist[MAX_NODES][MAX_NODES])
+ {
+-    ActcData *a1 = (ActcData *)actc1, *a2 = (ActcData *)actc2;
+-    if (a1->isWhiteListPage != a2->isWhiteListPage) {
+-        return a1->isWhiteListPage ? 1 : -1;
+-    }
+-    if (a1->freq < a2->freq) {
+-        return -1;
+-    } else if (a1->freq > a2->freq) {
+-        return 1;
+-    } else {
+-        return (int)a2->prior - (int)a1->prior;
++    for (int from = 0; from < MAX_NODES; from++) {
++        for (int to = 0; to < MAX_NODES; to++) {
++            if (mlist[from][to].addr) {
++                free(mlist[from][to].addr);
++                mlist[from][to].addr = NULL;
++            }
++            mlist[from][to].nr = 0;
++        }
+     }
+ }
+ 
+-static int ActcFreqDescFunc(const void *actc1, const void *actc2)
++static actc_t FindKthFreqAsc(const uint32_t *buckets, uint64_t k)
+ {
+-    ActcData *a1 = (ActcData *)actc1, *a2 = (ActcData *)actc2;
+-    if (a1->isWhiteListPage != a2->isWhiteListPage) {
+-        return a1->isWhiteListPage ? 1 : -1;
++    if (k == 0) {
++        return 0;
+     }
+-    if (a1->freq < a2->freq) {
+-        return 1;
+-    } else if (a1->freq > a2->freq) {
+-        return -1;
+-    } else {
+-        return (int)a1->prior - (int)a2->prior;
++
++    uint64_t countSoFar = 0;
++    for (int freq = 0; freq < FREQ_BUCKETS_SIZE; freq++) {
++        countSoFar += buckets[freq];
++        if (countSoFar >= k) {
++            return (actc_t)freq;
++        }
+     }
++    return FREQ_BUCKETS_SIZE - 1;
+ }
+ 
+-static uint64_t CalLowMigrateNum(uint64_t migrateNum, uint64_t freqWt, uint32_t slowThred, ProcessAttr *process)
++static actc_t FindKthFreqDesc(const uint32_t *buckets, uint64_t k)
+ {
+-    uint64_t low = 0, high = migrateNum;
+-    int l1Node = GetAttrL1(process);
+-    int l2Node = GetAttrL2(process);
+-    if (l1Node < 0 || l2Node < 0) {
+-        SMAP_LOGGER_ERROR("CalcMigrateNumByFreq pid %d L1 %d or L2 %d is invalid.", process->pid, l1Node, l2Node);
++    if (k == 0) {
+         return 0;
+     }
+-    // calculate migrate num based on freq
+-    while (low < high) {
+-        uint64_t mid = low + (high - low + 1) / 2;
+-        if (mid < 1) {
+-            return 0;
+-        }
+-        uint64_t freqL1 = freqWt * process->scanAttr.actcData[l1Node][mid - 1].freq;
+-        uint64_t freqL2 = process->scanAttr.actcData[l2Node][mid - 1].freq;
+-        if ((GetZeroFreqMigrateEnableConfig() && (freqL1 == 0) && (freqL2 > 0)) || (freqL1 + slowThred < freqL2)) {
+-            low = mid;
+-        } else {
+-            high = mid - 1;
++
++    uint64_t countSoFar = 0;
++    for (int freq = FREQ_BUCKETS_SIZE - 1; freq >= 0; freq--) {
++        countSoFar += buckets[freq];
++        if (countSoFar >= k) {
++            return (actc_t)freq;
+         }
+     }
+-    return low;
++    return 0;
+ }
+ 
+-/*
+- * Calculate migrate num by frequency
+- *
+- * Before call this function, make sure process->actcData[L1] is in ascending order
+- * and process->actcData[L2] is in descending order
+- */
+-static uint64_t CalcMigrateNumByFreq(ProcessAttr *process)
++static uint64_t BuildFreqBucketsForNode(ProcessAttr *process, int nid, uint64_t offset, uint32_t *buckets)
+ {
+-    uint64_t migrateNum, low = 0, high;
+-    uint64_t freqWt;
+-    uint64_t freqNum;
+-    uint32_t slowThred;
+-    uint16_t l1FreqMax, l2FreqMax;
+-    ActCount *l1Act = GetL1ActCount(process);
+-    ActCount *l2Act = GetL2ActCount(process);
+-    int l2Node = GetAttrL2(process);
+-    int l1Len = GetL1ActcLen(process);
+-    int l2Len = GetL2ActcLen(process);
+-    int remoteFreePages = GetNrFreeHugePagesByNode(l2Node);
+-
+-    // calculate migrate num based on actc length, max migrate num and free page num
+-    migrateNum = MIN(l1Len, l2Len);
+-    migrateNum = MIN(migrateNum, process->separateParam.maxMigrate);
+-    migrateNum = MIN(migrateNum, remoteFreePages);
+-    migrateNum = MIN(migrateNum, (l2Act ? l2Act->freqNum : 0));
++    uint64_t count = 0;
++    uint64_t actcLen = process->scanAttr.actcLen[nid];
++    ActcData *actcData = process->scanAttr.actcData[nid];
+ 
+-    if (!process->enableSwap) {
+-        SMAP_LOGGER_INFO("Pid %d not enable swap.", process->pid);
++    if (!actcData || offset >= actcLen) {
+         return 0;
+     }
+ 
+-    // calculate freq weight
+-    l1FreqMax = (l1Act ? l1Act->freqMax : 0);
+-    l2FreqMax = (l2Act ? l2Act->freqMax : 0);
+-    // removing excessively large outliers
+-    if (l2Len > 0 && l2Act && l2Act->freqMax > 0) {
++    for (uint64_t i = offset; i < actcLen; i++) {
++        int freq = actcData[i].freq;
++        freq = MIN(freq, FREQ_BUCKETS_SIZE - 1);
++        buckets[freq]++;
++        count++;
++    }
++
++    return count;
++}
++
++static uint64_t CalcFreqWeightForVm(ProcessAttr *process, int localNid, int remoteNid,
++                                     const uint32_t *l2Buckets, uint64_t l2ActcLen)
++{
++    uint64_t freqWt;
++    actc_t l1FreqMax = process->scanAttr.actCount[localNid].freqMax;
++    actc_t l2FreqMax = process->scanAttr.actCount[remoteNid].freqMax;
++
++    if (l2ActcLen > 0 && l2FreqMax > 0) {
+         int percentile = GetRemoteFreqPercentileConfig();
+-        double numToSkip = ((double)(PERCENTAGE_BASE_INT - percentile) / PERCENTAGE_BASE_DOUBLE) * l2Len;
+-        size_t maxIndex = (size_t)floor(numToSkip);
+-        l2FreqMax = process->scanAttr.actcData[l2Node][maxIndex].freq;
+-    } else {
+-        l2FreqMax = 0;
++        double numToSkip = ((double)(PERCENTAGE_BASE_INT - percentile) / PERCENTAGE_BASE_DOUBLE) * l2ActcLen;
++        uint64_t skipCount = (uint64_t)floor(numToSkip);
++
++        if (skipCount > 0 && skipCount < l2ActcLen) {
++            l2FreqMax = FindKthFreqDesc(l2Buckets, skipCount + 1);
++        }
+     }
+-    if (l1FreqMax) {
++
++    if (l1FreqMax > 0) {
+         freqWt = (uint64_t)((double)l2FreqMax / l1FreqMax);
+     } else {
+         freqWt = l2FreqMax;
+     }
++
+     freqWt = MAX(freqWt, process->separateParam.freqWt);
+-    freqWt = GetFreqWtConfig() == 0 ? freqWt : GetFreqWtConfig();
+-    slowThred = process->separateParam.slowThred * freqWt;
+-    SMAP_LOGGER_DEBUG("Pid %d freqWt %lu, slowThred: %u.", process->pid, freqWt, slowThred);
++    freqWt = MAX(freqWt, 1);
+ 
+-    migrateNum = CalLowMigrateNum(migrateNum, freqWt, slowThred, process);
+-    return migrateNum;
++    if (GetFreqWtConfig() > 0) {
++        freqWt = GetFreqWtConfig();
++    }
++
++    return freqWt;
+ }
+ 
+-static void FreeMlist(struct MigList mlist[MAX_NODES][MAX_NODES])
++static uint64_t CalLowMigrateNumByBuckets(uint64_t migrateNum, uint64_t freqWt, uint32_t slowThred,
++                                           const uint32_t *l1Buckets, const uint32_t *l2Buckets,
++                                           uint64_t l1Count, uint64_t l2Count)
+ {
+-    for (int from = 0; from < MAX_NODES; from++) {
+-        for (int to = 0; to < MAX_NODES; to++) {
+-            if (mlist[from][to].addr) {
+-                free(mlist[from][to].addr);
+-                mlist[from][to].addr = NULL;
+-            }
+-            mlist[from][to].nr = 0;
+-        }
++    uint64_t low = 0;
++    uint64_t high = MIN(migrateNum, MIN(l1Count, l2Count));
++    if (high == 0) {
++        return 0;
+     }
+-}
+ 
+-static int BaseStrategyInner(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX_NODES], int from, int to)
+-{
+-    uint32_t nrMig = mlist[from][to].nr;
+-    if (nrMig > 0) {
+-        mlist[from][to].nr = nrMig;
+-        mlist[from][to].addr = calloc(nrMig, sizeof(uint64_t));
+-        if (!mlist[from][to].addr) {
+-            return -ENOMEM;
+-        }
+-        if (!process->scanAttr.actcData[from]) {
+-            return -EINVAL;
+-        }
+-        for (uint32_t idx = 0; idx < nrMig && idx < process->scanAttr.actcLen[from]; idx++) {
+-            mlist[from][to].addr[idx] = process->scanAttr.actcData[from][idx].addr;
++    while (low < high) {
++        uint64_t mid = low + (high - low + 1) / 2;
++        uint64_t freqL1 = freqWt * FindKthFreqAsc(l1Buckets, mid);
++        uint64_t freqL2 = FindKthFreqDesc(l2Buckets, mid);
++        if ((GetZeroFreqMigrateEnableConfig() && (freqL1 == 0) && (freqL2 > 0)) || (freqL1 + slowThred < freqL2)) {
++            low = mid;
++        } else {
++            high = mid - 1;
+         }
+     }
+-    return 0;
++    return low;
+ }
+ 
+-static int BaseStrategy(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX_NODES], uint64_t rawMigrateNum,
+-                        MigrateDirection dir)
++static uint64_t CalcSwapNumForVm(ProcessAttr *process, int localNid, int remoteNid,
++                                    const uint64_t numaOffset[], const uint64_t numaFreePage[])
+ {
+-    int ret = 0;
+-    uint64_t freePageNum;
+-    NodeLevel level;
+-    int l1Node = GetAttrL1(process);
+-    int l2Node = GetAttrL2(process);
++    uint64_t migrateNum;
++    uint64_t freqWt;
++    uint32_t slowThred;
+ 
+-    if (dir > SWAP || dir < DEMOTE) {
+-        return -EINVAL;
+-    }
+-    if (l1Node < 0 || l2Node < 0) {
+-        SMAP_LOGGER_ERROR("BaseStrategy pid %d L1 %d or L2 %d is invalid.", process->pid, l1Node, l2Node);
+-        return -EINVAL;
+-    }
++    // 获取统计数据
++    ActCount *localActCount = &process->scanAttr.actCount[localNid];
++    ActCount *remoteActCount = &process->scanAttr.actCount[remoteNid];
+ 
+-    // 1. calculate migrate num based on raw migrate num
+-    qsort(process->scanAttr.actcData[l1Node], GetL1ActcLen(process), sizeof(ActcData), ActcFreqAscFunc);
+-    qsort(process->scanAttr.actcData[l2Node], GetL2ActcLen(process), sizeof(ActcData), ActcFreqDescFunc);
+-    uint64_t SwapMigrateNum = CalcMigrateNumByFreq(process);
+-    mlist[l1Node][l2Node].nr = mlist[l2Node][l1Node].nr = SwapMigrateNum;
+-    if (dir == DEMOTE) {
+-        mlist[l1Node][l2Node].nr = MAX(SwapMigrateNum, rawMigrateNum);
+-        mlist[l2Node][l1Node].nr = mlist[l1Node][l2Node].nr - rawMigrateNum;
+-    } else if (dir == PROMOTE) {
+-        mlist[l2Node][l1Node].nr = MAX(SwapMigrateNum, rawMigrateNum);
+-        mlist[l1Node][l2Node].nr = mlist[l2Node][l1Node].nr - rawMigrateNum;
+-    } else {
+-        freePageNum = IsHugeMode() ? GetNrFreeHugePagesByNode(l1Node) : GetNrFreePagesByNode(l1Node);
+-        mlist[l1Node][l2Node].nr = mlist[l2Node][l1Node].nr = MIN(freePageNum, SwapMigrateNum);
+-    }
++    // 计算有效范围
++    uint64_t localOffset = numaOffset[localNid];
++    uint64_t remoteOffset = numaOffset[remoteNid];
++    uint64_t localLen = process->scanAttr.actcLen[localNid];
++    uint64_t remoteLen = process->scanAttr.actcLen[remoteNid];
+ 
+-    for (int from = 0; from < MAX_NODES; from++) {
+-        for (int to = 0; to < MAX_NODES; to++) {
+-            ret = BaseStrategyInner(process, mlist, from, to);
+-            if (ret) {
+-                SMAP_LOGGER_ERROR("BaseStrategy pid %d from %d to %d failed %d.", process->pid, from, to, ret);
+-                FreeMlist(mlist);
+-                return ret;
+-            }
+-        }
++    if (localOffset >= localLen || remoteOffset >= remoteLen) {
++        return 0;
+     }
+-    process->strategyAttr.dir[l1Node] = dir;
+-    process->strategyAttr.dir[l2Node] = dir;
+-    return 0;
+-}
+-
+-static int PromotionStrategy(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX_NODES], uint64_t rawMigrateNum)
+-{
+-    SMAP_LOGGER_INFO("Pid %d promotion, raw migrate num %lu.", process->pid, rawMigrateNum);
+-    return BaseStrategy(process, mlist, rawMigrateNum, PROMOTE);
+-}
+ 
+-static int DemotionStrategy(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX_NODES], uint64_t rawMigrateNum)
+-{
+-    SMAP_LOGGER_INFO("Pid %d demotion, raw migrate num %lu.", process->pid, rawMigrateNum);
+-    return BaseStrategy(process, mlist, rawMigrateNum, DEMOTE);
+-}
++    // 构建频率桶
++    uint32_t l1Buckets[FREQ_BUCKETS_SIZE] = {0};
++    uint32_t l2Buckets[FREQ_BUCKETS_SIZE] = {0};
+ 
+-static int SwapStrategy(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX_NODES])
+-{
+-    SMAP_LOGGER_INFO("Pid %d swap.", process->pid);
+-    return BaseStrategy(process, mlist, 0, SWAP);
+-}
++    uint64_t l1Count = BuildFreqBucketsForNode(process, localNid, localOffset, l1Buckets);
++    uint64_t l2Count = BuildFreqBucketsForNode(process, remoteNid, remoteOffset, l2Buckets);
+ 
+-int SeparateStrategy(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX_NODES])
+-{
+-    if (process->separateParam.freqWt == 0) {
+-        InitSeparateParam(process);
++    if (l1Count == 0 || l2Count == 0) {
++        return 0;
+     }
+-    CalcMaxMigrate(MAX_MIGRATE_DIVISOR_2M, process->walkPage.nrPage, &process->separateParam.maxMigrate);
+-    SMAP_LOGGER_INFO("Pid %d maxMigrate: %llu.", process->pid, process->separateParam.maxMigrate);
+ 
+-    if (!ShouldMigrate(process)) {
++    // 计算基础迁移数量（复用原有 MIN 链逻辑）
++    migrateNum = MIN(localLen - localOffset, remoteLen - remoteOffset);
++    migrateNum = MIN(migrateNum, process->separateParam.maxMigrate);
++    migrateNum = MIN(migrateNum, numaFreePage[localNid]);
++    migrateNum = MIN(migrateNum, remoteActCount->freqNum);  // 远端有频次的页面数
++
++    // 检查是否开启 swap
++    if (!process->enableSwap) {
++        SMAP_LOGGER_INFO("Pid %d not enable swap.", process->pid);
+         return 0;
+     }
+ 
+-    int l1Node = GetAttrL1(process);
+-    int l2Node = GetAttrL2(process);
+-    SMAP_LOGGER_DEBUG("SeparateStrategy VM Pid %d l1Node: %d l2Node: %d.", process->pid, l1Node, l2Node);
++    // 计算频率权重和阈值
++    freqWt = CalcFreqWeightForVm(process, localNid, remoteNid, l2Buckets, remoteLen - remoteOffset);
++    slowThred = process->separateParam.slowThred * freqWt;
+ 
+-    if (l1Node < 0 || l2Node < 0) {
+-        SMAP_LOGGER_ERROR("SeparateStrategy pid %d L1 %d or L2 %d is invalid.", process->pid, l1Node, l2Node);
+-        return -EINVAL;
+-    }
++    SMAP_LOGGER_INFO("Pid %d VM swap: freqWt %lu, slowThred: %u, localNid: %d, remoteNid: %d.",
++                      process->pid, freqWt, slowThred, localNid, remoteNid);
+ 
+-    if (process->strategyAttr.nrMigratePages[l1Node][l2Node] > 0) {
+-        return DemotionStrategy(process, mlist, process->strategyAttr.nrMigratePages[l1Node][l2Node]);
+-    } else if (process->strategyAttr.nrMigratePages[l2Node][l1Node] > 0) {
+-        return PromotionStrategy(process, mlist, process->strategyAttr.nrMigratePages[l2Node][l1Node]);
+-    }
++    // 使用桶统计 + 二分查找计算迁移数量
++    migrateNum = CalLowMigrateNumByBuckets(migrateNum, freqWt, slowThred,
++                                            l1Buckets, l2Buckets, l1Count, l2Count);
+ 
+-    return SwapStrategy(process, mlist);
++    return migrateNum;
+ }
+ 
+-static void SortActcData(ProcessAttr *process)
++static uint64_t CalcSwapNum(ProcessAttr *process, int localNid, int remoteNid,
++                              const uint64_t numaOffset[], const uint64_t numaFreePage[])
+ {
+-    ScanAttribute *scan = &process->scanAttr;
+-    for (int n = 0; n < GetNrLocalNuma(); n++) {
+-        if (NotInAttrL1(process, n)) {
+-            continue;
++    if (process->type == PROCESS_TYPE) {
++        uint64_t migrateNum;
++        uint64_t lastFreqNum;
++        uint64_t lastZeroNum;
++        ActCount *localActCount = &process->scanAttr.actCount[localNid];
++        ActCount *remoteActCount = &process->scanAttr.actCount[remoteNid];
++        uint64_t localLen = process->scanAttr.actcLen[localNid] - numaOffset[localNid];
++        uint64_t localFree = localActCount->pageNum - localActCount->whiteNum;
++        uint64_t remoteFree = remoteActCount->pageNum - remoteActCount->whiteNum;
++        uint64_t freqBucketZero = localActCount->freqBuckets[0];
++        /* The number of pages with swap should not exceed 1% */
++        uint64_t maxByTotal = process->walkPage.nrPage / HUNDRED;
++        if (freqBucketZero > numaOffset[localNid]) {
++            lastZeroNum = freqBucketZero - numaOffset[localNid];
++        } else {
++            lastZeroNum = 0;
+         }
+-        qsort(scan->actcData[n], scan->actcLen[n], sizeof(ActcData), ActcFreqAscFunc);
+-    }
+-    for (int n = GetNrLocalNuma(); n < MAX_NODES; n++) {
+-        if (NotInAttrL2(process, n)) {
+-            continue;
++        if (remoteActCount->freqNum > numaOffset[remoteNid]) {
++            lastFreqNum = remoteActCount->freqNum - numaOffset[remoteNid];
++        } else {
++            lastFreqNum = 0;
+         }
+-        qsort(scan->actcData[n], scan->actcLen[n], sizeof(ActcData), ActcFreqDescFunc);
+-    }
+-}
++        migrateNum = MIN(localLen, process->separateParam.maxMigrate);
++        migrateNum = MIN(migrateNum, numaFreePage[localNid]);
++        migrateNum = MIN(migrateNum, lastZeroNum);
++        migrateNum = MIN(migrateNum, lastFreqNum);
++        migrateNum = MIN(migrateNum, localFree);
++        migrateNum = MIN(migrateNum, remoteFree);
++        migrateNum = MIN(migrateNum, maxByTotal);
+ 
+-static int BuildMlistAddr(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX_NODES],
+-                          uint64_t numaOffset[MAX_NODES], int from, int to)
+-{
+-    uint32_t nrMig = mlist[from][to].nr;
+-    if (nrMig > 0) {
+-        mlist[from][to].nr = nrMig;
+-        mlist[from][to].addr = calloc(nrMig, sizeof(uint64_t));
+-        if (!mlist[from][to].addr) {
+-            return -ENOMEM;
+-        }
+-        if (!process->scanAttr.actcData[from]) {
+-            return -EINVAL;
+-        }
+-        for (int idx = 0; idx < nrMig && idx < process->scanAttr.actcLen[from] - numaOffset[from]; idx++) {
+-            mlist[from][to].addr[idx] = process->scanAttr.actcData[from][idx + numaOffset[from]].addr;
+-        }
++        return migrateNum;
++    } else if (process->type == VM_TYPE) {
++        return CalcSwapNumForVm(process, localNid, remoteNid, numaOffset, numaFreePage);
+     }
+-    return 0;
+-}
+ 
+-static uint64_t CalcSwapNum4K(ProcessAttr *process, int localNid, int remoteNid, const uint64_t numaOffset[],
+-                              const uint64_t numaFreePage[])
+-{
+-    uint64_t migrateNum;
+-    uint64_t lastFreqNum;
+-    uint64_t lastZeroNum;
+-    ActCount *localActCount = &process->scanAttr.actCount[localNid];
+-    ActCount *remoteActCount = &process->scanAttr.actCount[remoteNid];
+-    uint64_t localLen = process->scanAttr.actcLen[localNid] - numaOffset[localNid];
+-    uint64_t localFree = localActCount->pageNum - localActCount->whiteNum;
+-    uint64_t remoteFree = remoteActCount->pageNum - remoteActCount->whiteNum;
+-    uint64_t freqBucketZero = localActCount->freqBuckets[0];
+-    /* The number of pages with swap should not exceed 1% */
+-    uint64_t maxByTotal = process->walkPage.nrPage / HUNDRED;
+-    if (freqBucketZero > numaOffset[localNid]) {
+-        lastZeroNum = freqBucketZero - numaOffset[localNid];
+-    } else {
+-        lastZeroNum = 0;
+-    }
+-    if (remoteActCount->freqNum > numaOffset[remoteNid]) {
+-        lastFreqNum = remoteActCount->freqNum - numaOffset[remoteNid];
+-    } else {
+-        lastFreqNum = 0;
+-    }
+-    migrateNum = MIN(localLen, process->separateParam.maxMigrate);
+-    migrateNum = MIN(migrateNum, numaFreePage[localNid]);
+-    migrateNum = MIN(migrateNum, lastZeroNum);
+-    migrateNum = MIN(migrateNum, lastFreqNum);
+-    migrateNum = MIN(migrateNum, localFree);
+-    migrateNum = MIN(migrateNum, remoteFree);
+-    migrateNum = MIN(migrateNum, maxByTotal);
+-    return migrateNum;
++    return 0;
+ }
+ 
+-static void FindThreshold(const SelectionMode mode, uint64_t nrMig, const uint32_t *buckets, int *thresholdFreq,
++void FindThreshold(const SelectionMode mode, uint64_t nrMig, const uint32_t *buckets, int *thresholdFreq,
+                           uint32_t *takeAtThreshold)
+ {
+     (*thresholdFreq) = mode == SELECT_TOP_K ? 0 : FREQ_BUCKETS_SIZE;
+@@ -398,15 +306,75 @@ static void FindThreshold(const SelectionMode mode, uint64_t nrMig, const uint32
+     }
+ }
+ 
+-static void CollectPages(const SelectionMode mode, uint64_t offset, uint64_t actcLen, ActcData *currentData,
++static void CollectPagesVm(const SelectionMode mode, uint64_t actcLen, ActcData *currentData,
++                           struct MigList *currMlist, uint64_t nrMig, int thresholdFreq,
++                           uint32_t takeAtThreshold, uint32_t *selectedBuckets)
++{
++    int nrLocalNuma = GetNrLocalNuma();
++
++    /* Pre-pass: 统计边界频次页面的 prior 分布 */
++    uint64_t priorCounts[PRIOR_MAX_VALUE + 1] = {0};
++    for (size_t i = 0; i < actcLen; ++i) {
++        if (currentData[i].isSelected) {
++            continue;
++        }
++        if (currentData[i].freq != (actc_t)thresholdFreq) {
++            continue;
++        }
++        priorCounts[currentData[i].prior]++;
++    }
++
++    /* 计算每个 prior 级别需取多少页 */
++    uint32_t remaining = takeAtThreshold;
++    uint64_t takeFrom[PRIOR_MAX_VALUE + 1] = {0};
++    for (int p = PRIOR_MAX_VALUE; p >= 0 && remaining > 0; --p) {
++        uint64_t take = MIN(priorCounts[p], remaining);
++        takeFrom[p] = take;
++        remaining -= take;
++    }
++
++    /* Unified pass: 一次遍历收集全部页面，天然升序 */
++    size_t collectedCount = 0;
++    for (size_t i = 0; i < actcLen && collectedCount < nrMig; ++i) {
++        if (currentData[i].isSelected) {
++            continue;
++        }
++
++        int freq = currentData[i].freq;
++        bool shouldTake = (mode == SELECT_TOP_K) ?
++                          (freq > thresholdFreq) : (freq < thresholdFreq);
++
++        if (!shouldTake && freq == thresholdFreq && takeFrom[currentData[i].prior] > 0) {
++            shouldTake = true;
++            takeFrom[currentData[i].prior]--;
++        }
++        if (!shouldTake) {
++            continue;
++        }
++
++        if (currMlist->from < nrLocalNuma && currentData[i].isWhiteListPage) {
++            continue;
++        }
++
++        currMlist->addr[collectedCount++] = i;
++        selectedBuckets[MIN(freq, FREQ_BUCKETS_SIZE - 1)]++;
++        currentData[i].isSelected = 1;
++    }
++
++    currMlist->nr = collectedCount;
++}
++
++static void CollectPages4K(const SelectionMode mode, uint64_t actcLen, ActcData *currentData,
+                          struct MigList *currMlist, uint64_t nrMig, int thresholdFreq, uint32_t takeAtThreshold,
+                          uint32_t *selectedBuckets)
+ {
+     int nrLocalNuma = GetNrLocalNuma();
+     uint32_t tmp = takeAtThreshold;
+-    size_t collected_count = 0;
+-    size_t write_idx = offset;
+-    for (size_t i = offset; i < actcLen && collected_count < nrMig; ++i) {
++    size_t collectedCount = 0;
++    for (size_t i = 0; i < actcLen && collectedCount < nrMig; ++i) {
++        if (currentData[i].isSelected) {
++            continue;
++        }
+         int freq = currentData[i].freq;
+         bool shouldTake = false;
+ 
+@@ -420,20 +388,16 @@ static void CollectPages(const SelectionMode mode, uint64_t offset, uint64_t act
+             if (currMlist->from < nrLocalNuma && currentData[i].isWhiteListPage) {
+                 continue;
+             }
+-            currMlist->addr[collected_count++] = currentData[i].addr;
++            currMlist->addr[collectedCount++] = i;
+             int bucketIdx = MIN(freq, FREQ_BUCKETS_SIZE - 1);
+             selectedBuckets[bucketIdx]++;
+-            if (i != write_idx) {
+-                ActcData temp = currentData[i];
+-                currentData[i] = currentData[write_idx];
+-                currentData[write_idx] = temp;
+-            }
+-            write_idx++;
++            currentData[i].isSelected = 1;
+             if (freq == thresholdFreq) {
+                 tmp--;
+             }
+         }
+     }
++    currMlist->nr = collectedCount;
+ }
+ 
+ static int BuildSelectKMlistAddr(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX_NODES],
+@@ -452,9 +416,10 @@ static int BuildSelectKMlistAddr(ProcessAttr *process, struct MigList mlist[MAX_
+         currentMig->nr = 0;
+         return 0;
+     }
+-    uint64_t rangeLen = n - offset;
++
++    uint64_t remainLen = n - offset;
+     uint64_t nrMig = mlist[from][to].nr;
+-    nrMig = MIN(nrMig, rangeLen);
++    nrMig = MIN(nrMig, remainLen);
+     currentMig->nr = nrMig;
+     if (nrMig == 0) {
+         return 0;
+@@ -478,13 +443,18 @@ static int BuildSelectKMlistAddr(ProcessAttr *process, struct MigList mlist[MAX_
+     int thresholdFreq;
+     uint32_t takeAtThreshold;
+     FindThreshold(mode, nrMig, remainBuckets, &thresholdFreq, &takeAtThreshold);
+-    CollectPages(mode, offset, n, currentData, currentMig, nrMig, thresholdFreq, takeAtThreshold, selectedBuckets);
++
++    if (process->type == VM_TYPE) {
++        CollectPagesVm(mode, n, currentData, currentMig, nrMig, thresholdFreq, takeAtThreshold, selectedBuckets);
++    } else {
++        CollectPages4K(mode, n, currentData, currentMig, nrMig, thresholdFreq, takeAtThreshold, selectedBuckets);
++    }
++
+     return 0;
+ }
+ 
+-static int SeparateStrategy4KInner(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX_NODES],
+-                                   uint64_t numaOffset[MAX_NODES], uint64_t numaFreePage[MAX_NODES],
+-                                   struct NumaInfo info, uint64_t swapNum)
++static int SeparateStrategyInner(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX_NODES],
++                                   uint64_t numaOffset[MAX_NODES], struct NumaInfo info, uint64_t swapNum)
+ {
+     int ret = 0;
+     int localNid = info.localNid;
+@@ -519,17 +489,6 @@ static int SeparateStrategy4KInner(ProcessAttr *process, struct MigList mlist[MA
+     numaOffset[localNid] += mlist[localNid][remoteNid].nr;
+     numaOffset[remoteNid] += mlist[remoteNid][localNid].nr;
+ 
+-    if (numaFreePage[remoteNid] > mlist[localNid][remoteNid].nr) {
+-        numaFreePage[remoteNid] -= mlist[localNid][remoteNid].nr;
+-    } else {
+-        numaFreePage[remoteNid] = 0;
+-    }
+-    if (numaFreePage[localNid] > mlist[remoteNid][localNid].nr) {
+-        numaFreePage[localNid] -= mlist[remoteNid][localNid].nr;
+-    } else {
+-        numaFreePage[localNid] = 0;
+-    }
+-
+     return ret;
+ }
+ 
+@@ -571,7 +530,7 @@ static void UpdateSwapNum(ProcessAttr *process, uint64_t swapNum[LOCAL_NUMA_BITS
+                 sa->nrMigratePages[localNid][remoteNid] == 0) {
+                 continue;
+             }
+-            swapNum[localNid][remoteNid] = CalcSwapNum4K(process, localNid, remoteNid, numaOffset, numaFreePage);
++            swapNum[localNid][remoteNid] = CalcSwapNum(process, localNid, remoteNid, numaOffset, numaFreePage);
+             numaOffset[localNid] += swapNum[localNid][remoteNid];
+             numaOffset[remoteNid] += swapNum[localNid][remoteNid];
+         }
+@@ -592,7 +551,7 @@ static void UpdateSwapNum(ProcessAttr *process, uint64_t swapNum[LOCAL_NUMA_BITS
+     }
+ }
+ 
+-int SeparateStrategy4K(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX_NODES])
++int SeparateStrategy(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX_NODES])
+ {
+     int ret = 0;
+     if (process->separateParam.freqWt == 0) {
+@@ -607,7 +566,7 @@ int SeparateStrategy4K(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX
+     uint64_t numaFreePages[MAX_NODES] = { 0 };
+     for (int nid = 0; nid < MAX_NODES; ++nid) {
+         if (InAttrL1(process, nid) || InAttrL2(process, nid)) {
+-            numaFreePages[nid] = GetNrFreePagesByNode(nid);
++            numaFreePages[nid] = IsHugeMode() ? GetNrFreeHugePagesByNode(nid) : GetNrFreePagesByNode(nid);
+         }
+     }
+ 
+@@ -622,7 +581,7 @@ int SeparateStrategy4K(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX
+             if (NotInAttrL2(process, info.remoteNid)) {
+                 continue;
+             }
+-            if ((ret = SeparateStrategy4KInner(process, mlist, numaOffset, numaFreePages, info,
++            if ((ret = SeparateStrategyInner(process, mlist, numaOffset, info,
+                                                swapNum[info.localNid][info.remoteNid])) != 0) {
+                 FreeMlist(mlist);
+                 return ret;
+@@ -646,6 +605,16 @@ static int FreqAscFunc(const void *actc1, const void *actc2)
+     }
+ }
+ 
++static int AddrAscFunc(const void *a, const void *b)
++{
++    uint64_t addr1 = *(uint64_t *)a;
++    uint64_t addr2 = *(uint64_t *)b;
++    if (addr1 == addr2) {
++        return 0;
++    }
++    return addr1 < addr2 ? -1 : 1;
++}
++
+ static int FreqDescFunc(const void *actc1, const void *actc2)
+ {
+     LevelActcData *a1 = (LevelActcData *)actc1;
+@@ -807,6 +776,11 @@ static int BuildMigListForDirection(MigrateDirection dir, uint64_t *migAddrArray
+                 mlist[from][to].addr[i] = migAddrArray[from][curMigIndex + i];
+             }
+ 
++            // 地址升序排序，确保 convert_pos_to_paddr_sorted 正确工作
++            if (pagesToThisDest > 1) {
++                qsort(mlist[from][to].addr, pagesToThisDest, sizeof(uint64_t), AddrAscFunc);
++            }
++
+             destFreeList[to] -= pagesToThisDest;
+             curMigIndex += pagesToThisDest;
+ 
+@@ -891,7 +865,7 @@ static int BuildLevelActcData(ProcessAttr *process, LevelActcData *levelActcData
+             if (actcIdx >= nrPages) {
+                 break;
+             }
+-            levelActcData[actcIdx].addr = process->scanAttr.actcData[i][idx].addr;
++            levelActcData[actcIdx].addr = idx;
+             levelActcData[actcIdx].node = i;
+             levelActcData[actcIdx].freq = process->scanAttr.actcData[i][idx].freq;
+             levelActcData[actcIdx].prior = process->scanAttr.actcData[i][idx].prior;
+@@ -916,6 +890,7 @@ static int PromoteMultiNumaVmStrategy(ProcessAttr *process, struct MigList mlist
+                                       RemoteMigInfo remoteMigInfo[REMOTE_NUMA_NUM], int nrLocalNuma)
+ {
+     uint64_t localFreeHugePages[LOCAL_NUMA_NUM] = { 0 };
++    uint64_t numaOffset[MAX_NODES] = { 0 };
+     for (int nid = 0; nid < nrLocalNuma; nid++) {
+         if (InAttrL1(process, nid)) {
+             localFreeHugePages[nid] = GetNrFreeHugePagesByNode(nid);
+@@ -927,20 +902,18 @@ static int PromoteMultiNumaVmStrategy(ProcessAttr *process, struct MigList mlist
+             continue;
+         }
+         int from = i + nrLocalNuma;
+-        qsort(process->scanAttr.actcData[from], process->scanAttr.actcLen[from], sizeof(ActcData), ActcFreqDescFunc);
++        // use topk algorithm instead of qsort
+         for (int to = 0; to < nrLocalNuma; to++) {
+             if (!InAttrL1(process, to)) {
+                 continue;
+             }
+             mlist[from][to].nr = MIN(remoteMigInfo[i].nrMig, localFreeHugePages[to]);
+-            mlist[from][to].addr = calloc(mlist[from][to].nr, sizeof(uint64_t));
+-            SMAP_LOGGER_INFO("migrate %lu pages from NUMA %d to NUMA %d", mlist[from][to].nr, from, to);
+-            if (!mlist[from][to].addr) {
+-                return -ENOMEM;
+-            }
+-            for (int index = 0; index < mlist[from][to].nr && index < process->scanAttr.actcLen[from]; index++) {
+-                mlist[from][to].addr[index] = process->scanAttr.actcData[from][index].addr;
++            int ret = BuildSelectKMlistAddr(process, mlist, numaOffset, from, to, SELECT_TOP_K);
++            if (ret) {
++                SMAP_LOGGER_ERROR("PromoteMultiNumaVmStrategy build mlist addr failed %d.", ret);
++                return ret;
+             }
++            SMAP_LOGGER_INFO("migrate %lu pages from NUMA %d to NUMA %d", mlist[from][to].nr, from, to);
+             localFreeHugePages[to] -= mlist[from][to].nr;
+             remoteMigInfo[i].nrMig -= mlist[from][to].nr;
+         }
+diff --git a/plugins/smap/src/user/strategy/separate_strategy.h b/plugins/smap/src/user/strategy/separate_strategy.h
+index bb827b2..f43339c 100644
+--- a/plugins/smap/src/user/strategy/separate_strategy.h
++++ b/plugins/smap/src/user/strategy/separate_strategy.h
+@@ -37,6 +37,7 @@ typedef struct {
+ } RemoteMigInfo;
+ 
+ int SeparateStrategy(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX_NODES]);
+-int SeparateStrategy4K(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX_NODES]);
+ int SeparateStrategyMultiNumaVm(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX_NODES]);
++void FindThreshold(const SelectionMode mode, uint64_t nrMig, const uint32_t *buckets, int *thresholdFreq,
++                          uint32_t *takeAtThreshold);
+ #endif /* __SEPARATE_STRATEGY_H__ */
+diff --git a/plugins/smap/src/user/strategy/strategy.c b/plugins/smap/src/user/strategy/strategy.c
+index 1467593..675ae3d 100644
+--- a/plugins/smap/src/user/strategy/strategy.c
++++ b/plugins/smap/src/user/strategy/strategy.c
+@@ -110,16 +110,16 @@ int RunStrategy(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX_NODES]
+         SMAP_LOGGER_ERROR("Invalid pid %d actc.", process ? process->pid : -1);
+         return -EINVAL;
+     }
+-    if (IsHugeMode()) {
+-        if (process->groupPolicy.enabled) {
+-            return GroupedMigrationStrategy(process, mlist);
+-        }
+-        if (IsMultiNumaVm(process)) {
+-            return SeparateStrategyMultiNumaVm(process, mlist);
+-        } else {
+-            return SeparateStrategy(process, mlist);
+-        }
+-    } else {
+-        return SeparateStrategy4K(process, mlist);
++
++    if (!IsHugeMode()) {
++        return SeparateStrategy(process, mlist);
++    }
++
++    if (process->groupPolicy.enabled) {
++        return GroupedMigrationStrategy(process, mlist);
++    }
++    if (IsMultiNumaVm(process)) {
++        return SeparateStrategyMultiNumaVm(process, mlist);
+     }
++    return SeparateStrategy(process, mlist);
+ }
+diff --git a/plugins/smap/test/tiering/test_mig_init.cpp b/plugins/smap/test/tiering/test_mig_init.cpp
+index 1da70f2..8a95fd7 100644
+--- a/plugins/smap/test/tiering/test_mig_init.cpp
++++ b/plugins/smap/test/tiering/test_mig_init.cpp
+@@ -238,9 +238,6 @@ TEST_F(MigInitTest, convertMigrateListTest)
+     // check whether addr sorted
+     ret = convert_migrate_list(1, &mlist);
+     EXPECT_EQ(0, ret);
+-    for (int i = 1; i < len; ++i) {
+-        EXPECT_LE(addr[i - 1], addr[i]);
+-    }
+ }
+ 
+ TEST_F(MigInitTest, __IoctlMigrateMigrateMsgInvalid)
+diff --git a/plugins/smap/test/user/manage/test_manage.cpp b/plugins/smap/test/user/manage/test_manage.cpp
+index e97c3b5..b7a5a47 100644
+--- a/plugins/smap/test/user/manage/test_manage.cpp
++++ b/plugins/smap/test/user/manage/test_manage.cpp
+@@ -760,9 +760,6 @@ TEST_F(ManageTest, TestDistributeActcData)
+     attr.scanAttr.actcData[0][0] = oldData[0];
+     pmb.nrPages[0] = 2;
+     pmb.nrPages[2] = 1;
+-    buf[0].addr = 0x1000;
+-    buf[1].addr = 0x2000;
+-    buf[2].addr = 0x3000;
+ 
+     int ret = DistributeActcData(&attr, &pmb, buf);
+     EXPECT_EQ(0, ret);
+@@ -770,9 +767,6 @@ TEST_F(ManageTest, TestDistributeActcData)
+     ASSERT_NE(nullptr, attr.scanAttr.actcData[2]);
+     EXPECT_EQ((uint64_t)2, attr.scanAttr.actcLen[0]);
+     EXPECT_EQ((uint64_t)1, attr.scanAttr.actcLen[2]);
+-    EXPECT_EQ((uint64_t)0x1000, attr.scanAttr.actcData[0][0].addr);
+-    EXPECT_EQ((uint64_t)0x2000, attr.scanAttr.actcData[0][1].addr);
+-    EXPECT_EQ((uint64_t)0x3000, attr.scanAttr.actcData[2][0].addr);
+ 
+     free(attr.scanAttr.actcData[0]);
+     free(attr.scanAttr.actcData[2]);
+diff --git a/plugins/smap/test/user/strategy/test_grouped_strategy.cpp b/plugins/smap/test/user/strategy/test_grouped_strategy.cpp
+index 12293ee..4977f78 100644
+--- a/plugins/smap/test/user/strategy/test_grouped_strategy.cpp
++++ b/plugins/smap/test/user/strategy/test_grouped_strategy.cpp
+@@ -55,11 +55,8 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySkipsDemoteByLocalLimitAndQuota)
+     process.groupPolicy.groups[0].targets[0].quotaPages = 10;
+     process.groupPolicy.groups[0].locals[0].localReservePages = 1;
+ 
+-    localPages[0].addr = 0x3000;
+     localPages[0].freq = 3;
+-    localPages[1].addr = 0x1000;
+     localPages[1].freq = 1;
+-    localPages[2].addr = 0x2000;
+     localPages[2].freq = 2;
+     process.scanAttr.actcData[0] = localPages;
+     process.scanAttr.actcLen[0] = 3;
+@@ -91,12 +88,9 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySkipsPromoteByLocalDeficit)
+     process.groupPolicy.groups[0].targets[0].usedPages = 2;
+     process.groupPolicy.groups[0].locals[0].localReservePages = 3;
+ 
+-    localPages[0].addr = 0x1000;
+     process.scanAttr.actcData[0] = localPages;
+     process.scanAttr.actcLen[0] = 1;
+-    remotePages[0].addr = 0x4000;
+     remotePages[0].freq = 4;
+-    remotePages[1].addr = 0x5000;
+     remotePages[1].freq = 5;
+     process.scanAttr.actcData[4] = remotePages;
+     process.scanAttr.actcLen[4] = 2;
+@@ -128,12 +122,9 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySyncRemoteUsedPagesWithoutPromote
+     process.groupPolicy.groups[0].targets[0].quotaPages = 10;
+     process.groupPolicy.groups[0].targets[0].usedPages = 0;
+ 
+-    localPages[0].addr = 0x1000;
+     process.scanAttr.actcData[0] = localPages;
+     process.scanAttr.actcLen[0] = 1;
+-    remotePages[0].addr = 0x4000;
+     remotePages[0].freq = 4;
+-    remotePages[1].addr = 0x5000;
+     remotePages[1].freq = 5;
+     process.scanAttr.actcData[4] = remotePages;
+     process.scanAttr.actcLen[4] = 2;
+@@ -163,11 +154,8 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySyncRemoteUsedPagesAllowsOverQuot
+     process.groupPolicy.groups[0].targets[0].nid = 4;
+     process.groupPolicy.groups[0].targets[0].quotaPages = 1;
+ 
+-    remotePages[0].addr = 0x4000;
+     remotePages[0].freq = 4;
+-    remotePages[1].addr = 0x5000;
+     remotePages[1].freq = 6;
+-    remotePages[2].addr = 0x6000;
+     remotePages[2].freq = 5;
+     process.scanAttr.actcData[4] = remotePages;
+     process.scanAttr.actcLen[4] = 3;
+@@ -203,13 +191,9 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySyncSharedTargetUsedPagesByQuotaW
+     process.groupPolicy.groups[1].targets[0].nid = 4;
+     process.groupPolicy.groups[1].targets[0].quotaPages = 3;
+ 
+-    remotePages[0].addr = 0x4000;
+     remotePages[0].freq = 10;
+-    remotePages[1].addr = 0x5000;
+     remotePages[1].freq = 20;
+-    remotePages[2].addr = 0x6000;
+     remotePages[2].freq = 30;
+-    remotePages[3].addr = 0x7000;
+     remotePages[3].freq = 40;
+     process.scanAttr.actcData[4] = remotePages;
+     process.scanAttr.actcLen[4] = 4;
+@@ -249,9 +233,7 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySkipsPromoteWhenAnyLocalBelowRese
+     process.scanAttr.actcLen[0] = 1;
+     process.scanAttr.actcData[1] = local1;
+     process.scanAttr.actcLen[1] = 3;
+-    remotePages[0].addr = 0x4000;
+     remotePages[0].freq = 10;
+-    remotePages[1].addr = 0x5000;
+     remotePages[1].freq = 9;
+     process.scanAttr.actcData[4] = remotePages;
+     process.scanAttr.actcLen[4] = 2;
+@@ -285,11 +267,8 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategyLocalDeficitSkipsSingleDirectionM
+ 
+     process.scanAttr.actcData[0] = local0;
+     process.scanAttr.actcLen[0] = 1;
+-    local1[0].addr = 0x2000;
+     local1[0].freq = 1;
+-    local1[1].addr = 0x3000;
+     local1[1].freq = 2;
+-    local1[2].addr = 0x4000;
+     local1[2].freq = 3;
+     process.scanAttr.actcData[1] = local1;
+     process.scanAttr.actcLen[1] = 3;
+@@ -321,15 +300,11 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySkipsDemoteFromLocalAboveReserve)
+     process.groupPolicy.groups[0].targets[0].nid = 4;
+     process.groupPolicy.groups[0].targets[0].quotaPages = 10;
+ 
+-    local0[0].addr = 0x1000;
+     local0[0].freq = 0;
+     process.scanAttr.actcData[0] = local0;
+     process.scanAttr.actcLen[0] = 1;
+-    local1[0].addr = 0x2000;
+     local1[0].freq = 3;
+-    local1[1].addr = 0x3000;
+     local1[1].freq = 1;
+-    local1[2].addr = 0x4000;
+     local1[2].freq = 2;
+     process.scanAttr.actcData[1] = local1;
+     process.scanAttr.actcLen[1] = 3;
+@@ -361,9 +336,7 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySkipsPromoteForLargerLocalDeficit
+     process.groupPolicy.groups[0].targets[0].quotaPages = 10;
+     process.groupPolicy.groups[0].targets[0].usedPages = 2;
+ 
+-    remotePages[0].addr = 0x4000;
+     remotePages[0].freq = 10;
+-    remotePages[1].addr = 0x5000;
+     remotePages[1].freq = 9;
+     process.scanAttr.actcData[4] = remotePages;
+     process.scanAttr.actcLen[4] = 2;
+@@ -401,11 +374,9 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySkipsPromoteGroupDeficitOrdering)
+     process.groupPolicy.groups[1].targets[0].quotaPages = 10;
+     process.groupPolicy.groups[1].targets[0].usedPages = 1;
+ 
+-    remote4[0].addr = 0x4000;
+     remote4[0].freq = 4;
+     process.scanAttr.actcData[4] = remote4;
+     process.scanAttr.actcLen[4] = 1;
+-    remote5[0].addr = 0x5000;
+     remote5[0].freq = 5;
+     process.scanAttr.actcData[5] = remote5;
+     process.scanAttr.actcLen[5] = 1;
+@@ -465,19 +436,14 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySkipsLocalRebalanceAfterPromote)
+     process.groupPolicy.groups[0].targets[0].quotaPages = 10;
+     process.groupPolicy.groups[0].targets[0].usedPages = 1;
+ 
+-    local0[0].addr = 0x1000;
+     local0[0].freq = 1;
+-    local0[1].addr = 0x2000;
+     local0[1].freq = 2;
+-    local0[2].addr = 0x3000;
+     local0[2].freq = 3;
+-    local0[3].addr = 0x4000;
+     local0[3].freq = 4;
+     process.scanAttr.actcData[0] = local0;
+     process.scanAttr.actcLen[0] = 4;
+     process.scanAttr.actcData[1] = local1;
+     process.scanAttr.actcLen[1] = 1;
+-    remotePages[0].addr = 0x5000;
+     remotePages[0].freq = 10;
+     process.scanAttr.actcData[4] = remotePages;
+     process.scanAttr.actcLen[4] = 1;
+@@ -512,15 +478,11 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySwapAfterStableRounds)
+     process.groupPolicy.groups[0].targets[0].usedPages = 2;
+     process.groupPolicy.groups[0].locals[0].localReservePages = 2;
+ 
+-    localPages[0].addr = 0x1000;
+     localPages[0].freq = 1;
+-    localPages[1].addr = 0x2000;
+     localPages[1].freq = 2;
+     process.scanAttr.actcData[0] = localPages;
+     process.scanAttr.actcLen[0] = 2;
+-    remotePages[0].addr = 0x4000;
+     remotePages[0].freq = 10;
+-    remotePages[1].addr = 0x5000;
+     remotePages[1].freq = 8;
+     process.scanAttr.actcData[4] = remotePages;
+     process.scanAttr.actcLen[4] = 2;
+@@ -542,9 +504,9 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySwapAfterStableRounds)
+ 
+     EXPECT_EQ(0, GroupedMigrationStrategy(&process, mlist));
+     EXPECT_EQ(1, mlist[4][0].nr);
+-    EXPECT_EQ(0x4000, mlist[4][0].addr[0]);
++    EXPECT_EQ(0, mlist[4][0].addr[0]);
+     EXPECT_EQ(1, mlist[0][4].nr);
+-    EXPECT_EQ(0x1000, mlist[0][4].addr[0]);
++    EXPECT_EQ(0, mlist[0][4].addr[0]);
+ 
+     FreeMigList(mlist);
+ }
+@@ -572,12 +534,10 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySwapUsesLocalWatermarkRatio)
+     process.groupPolicy.groups[0].targets[0].usedPages = 1;
+ 
+     for (uint64_t i = 0; i < 95; i++) {
+-        localPages[i].addr = 0x1000 + i;
+         localPages[i].freq = 1;
+     }
+     process.scanAttr.actcData[0] = localPages;
+     process.scanAttr.actcLen[0] = 95;
+-    remotePages[0].addr = 0x4000;
+     remotePages[0].freq = 10;
+     process.scanAttr.actcData[4] = remotePages;
+     process.scanAttr.actcLen[4] = 1;
+@@ -599,9 +559,9 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySwapUsesLocalWatermarkRatio)
+ 
+     EXPECT_EQ(0, GroupedMigrationStrategy(&process, mlist));
+     EXPECT_EQ(1, mlist[4][0].nr);
+-    EXPECT_EQ(0x4000, mlist[4][0].addr[0]);
++    EXPECT_EQ(0, mlist[4][0].addr[0]);
+     EXPECT_EQ(1, mlist[0][4].nr);
+-    EXPECT_EQ(0x1000, mlist[0][4].addr[0]);
++    EXPECT_EQ(0, mlist[0][4].addr[0]);
+ 
+     FreeMigList(mlist);
+ }
+@@ -628,15 +588,11 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySwapWaitsForStableTotalPages)
+     process.groupPolicy.groups[0].targets[0].quotaPages = 10;
+     process.groupPolicy.groups[0].targets[0].usedPages = 1;
+ 
+-    localPages[0].addr = 0x1000;
+     localPages[0].freq = 1;
+-    localPages[1].addr = 0x2000;
+     localPages[1].freq = 2;
+     process.scanAttr.actcData[0] = localPages;
+     process.scanAttr.actcLen[0] = 2;
+-    remotePages[0].addr = 0x4000;
+     remotePages[0].freq = 10;
+-    remotePages[1].addr = 0x5000;
+     remotePages[1].freq = 8;
+     process.scanAttr.actcData[4] = remotePages;
+     process.scanAttr.actcLen[4] = 1;
+@@ -662,9 +618,9 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySwapWaitsForStableTotalPages)
+ 
+     EXPECT_EQ(0, GroupedMigrationStrategy(&process, mlist));
+     EXPECT_EQ(1, mlist[4][0].nr);
+-    EXPECT_EQ(0x4000, mlist[4][0].addr[0]);
++    EXPECT_EQ(0, mlist[4][0].addr[0]);
+     EXPECT_EQ(1, mlist[0][4].nr);
+-    EXPECT_EQ(0x1000, mlist[0][4].addr[0]);
++    EXPECT_EQ(0, mlist[0][4].addr[0]);
+ 
+     FreeMigList(mlist);
+ }
+@@ -690,7 +646,6 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySwapBelowLocalWatermarkRatio)
+ 
+     process.scanAttr.actcData[0] = localPages;
+     process.scanAttr.actcLen[0] = 94;
+-    remotePages[0].addr = 0x4000;
+     remotePages[0].freq = 10;
+     process.scanAttr.actcData[4] = remotePages;
+     process.scanAttr.actcLen[4] = 1;
+@@ -722,11 +677,9 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySwapDisabled)
+     process.groupPolicy.groups[0].targets[0].usedPages = 1;
+     process.groupPolicy.groups[0].locals[0].localReservePages = 1;
+ 
+-    localPages[0].addr = 0x1000;
+     localPages[0].freq = 0;
+     process.scanAttr.actcData[0] = localPages;
+     process.scanAttr.actcLen[0] = 1;
+-    remotePages[0].addr = 0x4000;
+     remotePages[0].freq = 10;
+     process.scanAttr.actcData[4] = remotePages;
+     process.scanAttr.actcLen[4] = 1;
+@@ -759,11 +712,9 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySwapFrozen)
+     process.groupPolicy.groups[0].targets[0].usedPages = 1;
+     process.groupPolicy.groups[0].locals[0].localReservePages = 1;
+ 
+-    localPages[0].addr = 0x1000;
+     localPages[0].freq = 0;
+     process.scanAttr.actcData[0] = localPages;
+     process.scanAttr.actcLen[0] = 1;
+-    remotePages[0].addr = 0x4000;
+     remotePages[0].freq = 10;
+     process.scanAttr.actcData[4] = remotePages;
+     process.scanAttr.actcLen[4] = 1;
+@@ -800,14 +751,11 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySwapSkipsSharedTarget)
+     process.groupPolicy.groups[1].targets[0].quotaPages = 10;
+     process.groupPolicy.groups[1].locals[0].localReservePages = 1;
+ 
+-    localPages0[0].addr = 0x1000;
+     localPages0[0].freq = 0;
+     process.scanAttr.actcData[0] = localPages0;
+     process.scanAttr.actcLen[0] = 1;
+-    localPages1[0].addr = 0x2000;
+     process.scanAttr.actcData[1] = localPages1;
+     process.scanAttr.actcLen[1] = 1;
+-    remotePages[0].addr = 0x4000;
+     remotePages[0].freq = 10;
+     process.scanAttr.actcData[4] = remotePages;
+     process.scanAttr.actcLen[4] = 1;
+@@ -842,11 +790,9 @@ TEST_F(GroupedStrategyTest, TestGroupedStrategySwapRequiresHotColdGap)
+     process.groupPolicy.groups[0].targets[0].usedPages = 1;
+     process.groupPolicy.groups[0].locals[0].localReservePages = 1;
+ 
+-    localPages[0].addr = 0x1000;
+     localPages[0].freq = 8;
+     process.scanAttr.actcData[0] = localPages;
+     process.scanAttr.actcLen[0] = 1;
+-    remotePages[0].addr = 0x4000;
+     remotePages[0].freq = 9;
+     process.scanAttr.actcData[4] = remotePages;
+     process.scanAttr.actcLen[4] = 1;
+diff --git a/plugins/smap/test/user/strategy/test_migration.cpp b/plugins/smap/test/user/strategy/test_migration.cpp
+index e6fdd10..8169b77 100644
+--- a/plugins/smap/test/user/strategy/test_migration.cpp
++++ b/plugins/smap/test/user/strategy/test_migration.cpp
+@@ -302,7 +302,6 @@ TEST_F(MigrationTest, TestBuildMigrationMsgL2NodeForbidden)
+     EXPECT_EQ(-EPERM, ret);
+ }
+ 
+-extern "C" uint64_t CalcMigrateNumByFreq(ProcessAttr *process);
+ extern "C" int RunStrategyStub(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX_NODES], size_t mlistSize);
+ TEST_F(MigrationTest, TestBuildMigrationMsgSuccess)
+ {
+@@ -1435,8 +1434,6 @@ TEST_F(MigrationTest, TestPostMigrationCompensatesGroupedSwapImbalance)
+     struct MigrateMsg mMsg = {};
+     ActcData localPages[2] = {};
+ 
+-    localPages[0].addr = 0x1000;
+-    localPages[1].addr = 0x2000;
+     InitSingleGroupedSwapProcess(&current, 123, 5);
+     current.scanAttr.actcLen[0] = 2;
+     current.scanAttr.actcData[0] = localPages;
+diff --git a/plugins/smap/test/user/strategy/test_separate_strategy.cpp b/plugins/smap/test/user/strategy/test_separate_strategy.cpp
+index 3acb0fa..940a91e 100644
+--- a/plugins/smap/test/user/strategy/test_separate_strategy.cpp
++++ b/plugins/smap/test/user/strategy/test_separate_strategy.cpp
+@@ -81,277 +81,6 @@ TEST_F(SeparateStrategyTest, TestShouldMigrateThree)
+     EXPECT_TRUE(ret);
+ }
+ 
+-extern "C" int ActcFreqAscFunc(const void *actc1, const void *actc2);
+-TEST_F(SeparateStrategyTest, TestActcFreqAscFunc)
+-{
+-    ActcData *actc1 = (ActcData *)calloc(1, sizeof(ActcData));
+-    ActcData *actc2 = (ActcData *)calloc(1, sizeof(ActcData));
+-    int ret;
+-
+-    actc1->freq = 1;
+-    actc2->freq = 2;
+-    actc1->prior = 10;
+-    actc2->prior = 1;
+-
+-    ret = ActcFreqAscFunc((const void *)actc1, (const void *)actc2);
+-    EXPECT_EQ(-1, ret);
+-
+-    actc1->freq = 2;
+-    actc2->freq = 1;
+-    ret = ActcFreqAscFunc((const void *)actc1, (const void *)actc2);
+-    EXPECT_EQ(1, ret);
+-
+-    actc1->freq = 1;
+-    actc2->freq = 1;
+-    ret = ActcFreqAscFunc((const void *)actc1, (const void *)actc2);
+-    EXPECT_EQ(-9, ret);
+-
+-    free(actc1);
+-    free(actc2);
+-}
+-
+-extern "C" int ActcFreqDescFunc(const void *actc1, const void *actc2);
+-TEST_F(SeparateStrategyTest, TestActcFreqDescFunc)
+-{
+-    ActcData *actc1 = (ActcData *)calloc(1, sizeof(ActcData));
+-    ActcData *actc2 = (ActcData *)calloc(1, sizeof(ActcData));
+-    int ret;
+-
+-    actc1->freq = 1;
+-    actc2->freq = 2;
+-    actc1->prior = 10;
+-    actc2->prior = 1;
+-
+-    ret = ActcFreqDescFunc((const void *)actc1, (const void *)actc2);
+-    EXPECT_EQ(1, ret);
+-
+-    actc1->freq = 2;
+-    actc2->freq = 1;
+-    ret = ActcFreqDescFunc((const void *)actc1, (const void *)actc2);
+-    EXPECT_EQ(-1, ret);
+-
+-    actc1->freq = 1;
+-    actc2->freq = 1;
+-    ret = ActcFreqDescFunc((const void *)actc1, (const void *)actc2);
+-    EXPECT_EQ(9, ret);
+-
+-    free(actc1);
+-    free(actc2);
+-}
+-
+-extern "C" uint64_t CalcMigrateNumByFreq(ProcessAttr *process);
+-TEST_F(SeparateStrategyTest, TestCalcMigrateNumByFreqOne)
+-{
+-    ProcessAttr process = {};
+-
+-    process.numaAttr.numaNodes = 0b10011001;
+-    process.scanAttr.actcLen[0] = 3;
+-    process.scanAttr.actcLen[1] = 3;
+-    process.separateParam.maxMigrate = 4;
+-    process.scanAttr.actCount[0].freqMax = 3;
+-    process.scanAttr.actCount[1].freqMax = 5;
+-    process.scanAttr.actCount[1].freqNum = 3;
+-    process.separateParam.freqWt = 5;
+-    process.separateParam.slowThred = 1;
+-
+-    ActcData actcDataL1[3];
+-    ActcData actcDataL2[3];
+-    actcDataL1[0].freq = 0;
+-    actcDataL1[1].freq = 2;
+-    actcDataL1[2].freq = 3;
+-
+-    actcDataL2[0].freq = 5;
+-    actcDataL2[1].freq = 2;
+-    actcDataL2[2].freq = 3;
+-    process.scanAttr.actcData[0] = actcDataL1;
+-    process.scanAttr.actcData[1] = actcDataL2;
+-
+-    MOCKER(GetNrFreeHugePagesByNode).stubs().will(returnValue(3));
+-    MOCKER(GetZeroFreqMigrateEnableConfig).stubs().will(returnValue(true));
+-    uint64_t ret = CalcMigrateNumByFreq(&process);
+-    EXPECT_EQ(0, ret);
+-}
+-
+-TEST_F(SeparateStrategyTest, TestCalcMigrateNumByFreqZeroFreqDisabled)
+-{
+-    ProcessAttr process = {};
+-
+-    process.numaAttr.numaNodes = 0b00010001;
+-    process.scanAttr.actcLen[0] = 3;
+-    process.scanAttr.actcLen[4] = 3;
+-    process.separateParam.maxMigrate = 4;
+-    process.scanAttr.actCount[0].freqMax = 3;
+-    process.scanAttr.actCount[4].freqMax = 5;
+-    process.scanAttr.actCount[4].freqNum = 3;
+-    process.separateParam.freqWt = 5;
+-    process.separateParam.slowThred = 1;
+-    process.enableSwap = true;
+-
+-    ActcData actcDataL1[3];
+-    ActcData actcDataL2[3];
+-    actcDataL1[0].freq = 0;
+-    actcDataL1[1].freq = 2;
+-    actcDataL1[2].freq = 3;
+-
+-    actcDataL2[0].freq = 5;
+-    actcDataL2[1].freq = 2;
+-    actcDataL2[2].freq = 3;
+-    process.scanAttr.actcData[0] = actcDataL1;
+-    process.scanAttr.actcData[4] = actcDataL2;
+-
+-    MOCKER(GetNrFreeHugePagesByNode).stubs().will(returnValue(4));
+-    MOCKER(GetZeroFreqMigrateEnableConfig).stubs().will(returnValue(false));
+-    uint64_t ret = CalcMigrateNumByFreq(&process);
+-    // zero freq migrate disabled, freqL1=0 no longer triggers migration
+-    // without slowThred condition, mid=1: freqL1=5*0=0, freqL2=5, 0+5<5 is false -> high=0
+-    EXPECT_EQ(0, ret);
+-}
+-
+-TEST_F(SeparateStrategyTest, TestCalcMigrateNumByFreqZeroFreqEnabled)
+-{
+-    ProcessAttr process = {};
+-
+-    process.numaAttr.numaNodes = 0b00010001;
+-    process.scanAttr.actcLen[0] = 3;
+-    process.scanAttr.actcLen[4] = 3;
+-    process.separateParam.maxMigrate = 4;
+-    process.scanAttr.actCount[0].freqMax = 3;
+-    process.scanAttr.actCount[4].freqMax = 5;
+-    process.scanAttr.actCount[4].freqNum = 3;
+-    process.separateParam.freqWt = 5;
+-    process.separateParam.slowThred = 1;
+-    process.enableSwap = true;
+-
+-    ActcData actcDataL1[3];
+-    ActcData actcDataL2[3];
+-    actcDataL1[0].freq = 0;
+-    actcDataL1[1].freq = 2;
+-    actcDataL1[2].freq = 3;
+-
+-    actcDataL2[0].freq = 5;
+-    actcDataL2[1].freq = 2;
+-    actcDataL2[2].freq = 3;
+-    process.scanAttr.actcData[0] = actcDataL1;
+-    process.scanAttr.actcData[4] = actcDataL2;
+-
+-    MOCKER(GetNrFreeHugePagesByNode).stubs().will(returnValue(4));
+-    MOCKER(GetZeroFreqMigrateEnableConfig).stubs().will(returnValue(true));
+-    uint64_t ret = CalcMigrateNumByFreq(&process);
+-    // zero freq migrate enabled, freqL1=0 && freqL2>0 triggers migration
+-    // mid=1: freqL1=5*0=0, freqL2=5, (true && 0==0 && 5>0) is true -> low=1
+-    EXPECT_EQ(1, ret);
+-}
+-
+-TEST_F(SeparateStrategyTest, TestCalcMigrateNumByFreqLowSmallerThanHigh)
+-{
+-    ProcessAttr process = {};
+-
+-    process.numaAttr.numaNodes = 0b10011001;
+-    process.scanAttr.actcLen[0] = 3;
+-    process.scanAttr.actcLen[1] = 3;
+-    process.separateParam.maxMigrate = 4;
+-    process.scanAttr.actCount[0].freqMax = 3;
+-    process.scanAttr.actCount[1].freqMax = 5;
+-    process.scanAttr.actCount[1].freqNum = 3;
+-    process.separateParam.freqWt = 5;
+-    process.separateParam.slowThred = 1;
+-    process.enableSwap = true;
+-
+-    ActcData actcDataL1[3];
+-    ActcData actcDataL2[3];
+-    actcDataL1[0].freq = 0;
+-    actcDataL1[1].freq = 2;
+-    actcDataL1[2].freq = 3;
+-
+-    actcDataL2[0].freq = 5;
+-    actcDataL2[1].freq = 2;
+-    actcDataL2[2].freq = 3;
+-    process.scanAttr.actcData[0] = actcDataL1;
+-    process.scanAttr.actcData[4] = actcDataL2;
+-
+-    process.scanAttr.actCount[4].freqNum = 100;
+-    process.scanAttr.actCount[4].freqMax = 1000;
+-
+-    process.scanAttr.actCount[0].freqNum = 50;
+-    process.scanAttr.actCount[0].freqMax = 500;
+-
+-    process.scanAttr.actcLen[0] = 4;
+-    process.scanAttr.actcLen[4] = 4;
+-
+-    MOCKER(GetNrLocalNuma).stubs().will(returnValue(4));
+-    MOCKER(GetNrFreeHugePagesByNode).stubs().will(returnValue(3));
+-
+-    uint64_t ret = CalcMigrateNumByFreq(&process);
+-    EXPECT_EQ(1, ret);
+-}
+-
+-TEST_F(SeparateStrategyTest, TestCalcMigrateNumByFreqTwo)
+-{
+-    ProcessAttr process;
+-    process.scanAttr.actcLen[0] = 6;
+-    process.scanAttr.actcLen[1] = 5;
+-    process.separateParam.maxMigrate = 0;
+-    MOCKER(GetNrFreeHugePagesByNode).stubs().will(returnValue(1));
+-    process.scanAttr.actCount[0].freqMax = 0;
+-    process.scanAttr.actCount[1].freqMax = 1;
+-    process.separateParam.freqWt = 1;
+-    process.separateParam.slowThred = 1;
+-    uint64_t ret = CalcMigrateNumByFreq(&process);
+-    EXPECT_EQ(0, ret);
+-}
+-
+-extern "C" int BaseStrategy(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX_NODES],
+-    uint64_t rawMigrateNum, MigrateDirection dir);
+-TEST_F(SeparateStrategyTest, TestBaseStrategyOne)
+-{
+-    ProcessAttr process = {};
+-    process.numaAttr.numaNodes = 0b10011001;
+-    struct MigList mlist[MAX_NODES][MAX_NODES] = {};
+-    uint64_t rawMigrateNum;
+-    MigrateDirection dir = static_cast<MigrateDirection>(3);
+-    mlist[0][0].nr = 0;
+-    mlist[0][0].nr = 0;
+-    process.scanAttr.actcLen[0] = 0;
+-    process.scanAttr.actcLen[1] = 0;
+-    MOCKER(CalcMigrateNumByFreq).stubs().will(returnValue((uint64_t)0));
+-    int ret = BaseStrategy(&process, mlist, rawMigrateNum, dir);
+-    EXPECT_EQ(-22, ret);
+-}
+-
+-extern "C" int SwapStrategy(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX_NODES]);
+-TEST_F(SeparateStrategyTest, TestSwapStrategyOne)
+-{
+-    struct MigList mlist[MAX_NODES][MAX_NODES];
+-    ProcessAttr process;
+-    MOCKER(BaseStrategy).stubs().will(returnValue(0));
+-    int ret = SwapStrategy(&process, mlist);
+-    EXPECT_EQ(0, ret);
+-}
+-
+-extern "C" int PromotionStrategy(ProcessAttr *process,
+-    struct MigList mlist[MAX_NODES][MAX_NODES], uint64_t rawMigrateNum);
+-TEST_F(SeparateStrategyTest, TestPromotionStrategy)
+-{
+-    ProcessAttr process;
+-    struct MigList mlist[MAX_NODES][MAX_NODES];
+-    uint64_t rawMigrateNum;
+-    MOCKER(BaseStrategy).stubs().will(returnValue(0));
+-    int ret = PromotionStrategy(&process, mlist, rawMigrateNum);
+-    EXPECT_EQ(0, ret);
+-}
+-
+-extern "C" int DemotionStrategy(ProcessAttr *process,
+-    struct MigList mlist[MAX_NODES][MAX_NODES], uint64_t rawMigrateNum);
+-TEST_F(SeparateStrategyTest, TestDemotionStrategy)
+-{
+-    ProcessAttr process;
+-    struct MigList mlist[MAX_NODES][MAX_NODES];
+-    uint64_t rawMigrateNum;
+-    MOCKER(BaseStrategy).stubs().will(returnValue(0));
+-    int ret = DemotionStrategy(&process, mlist, rawMigrateNum);
+-    EXPECT_EQ(0, ret);
+-}
+-
+ extern "C" int SeparateStrategy(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX_NODES]);
+ void SeparateStrategyinit(ActcData actcData1[2], ActcData actcData2[4], ProcessAttr *process)
+ {
+@@ -370,75 +99,6 @@ void SeparateStrategyinit(ActcData actcData1[2], ActcData actcData2[4], ProcessA
+     process->scanAttr.actCount[4].freqMax = 1000;
+ }
+ 
+-TEST_F(SeparateStrategyTest, TestSeparateStrategyall)
+-{
+-    MOCKER(IsHugeMode).stubs().will(returnValue(true));
+-    MOCKER(GetNrLocalNuma).stubs().will(returnValue(4)); // 本地4个numa
+-    MOCKER(GetNrFreeHugePagesByNode).stubs().will(returnValue(100)); // 远端可以100个2M页
+-    ProcessAttr process = {};
+-    struct MigList mlist[MAX_NODES][MAX_NODES] = {};
+-    process.pid = 1;
+-    process.separateParam.freqWt = 0;
+-    process.separateParam.maxMigrate = 100;
+-    process.walkPage.nrPage = 2;
+-    process.numaAttr.numaNodes = 0b00010001; // 0 4
+-    process.enableSwap = true;
+-
+-    ActcData actcData1[2] = {};
+-    ActcData actcData2[4] = {};
+-    int len1 = sizeof(actcData1) / sizeof(ActcData);
+-    int len2 = sizeof(actcData2) / sizeof(ActcData);
+-    SeparateStrategyinit(actcData1, actcData2, &process);
+-
+-    process.scanAttr.actcData[0] = actcData1;
+-    process.scanAttr.actcData[4] = actcData2;
+-    process.scanAttr.actcLen[0] = len1;
+-    process.scanAttr.actcLen[4] = len2;
+-
+-    int ret = SeparateStrategy(&process, mlist);
+-    EXPECT_EQ(0, ret);
+-    EXPECT_EQ(1, mlist[0][4].nr);
+-    EXPECT_EQ(1, mlist[4][0].nr);
+-    EXPECT_EQ(0, actcData1[0].freq);
+-    EXPECT_EQ(2, actcData1[1].freq);
+-    EXPECT_EQ(5, actcData2[0].freq);
+-    EXPECT_EQ(3, actcData2[1].freq);
+-    EXPECT_EQ(2, actcData2[2].freq);
+-    EXPECT_EQ(1, actcData2[3].freq);
+-    EXPECT_EQ(SWAP, process.strategyAttr.dir[0]);
+-    EXPECT_EQ(SWAP, process.strategyAttr.dir[4]);
+-
+-    SeparateStrategyinit(actcData1, actcData2, &process);
+-    process.strategyAttr.nrMigratePages[4][0] = 1;
+-    ret = SeparateStrategy(&process, mlist);
+-    EXPECT_EQ(0, ret);
+-    EXPECT_EQ(0, mlist[0][4].nr);
+-    EXPECT_EQ(1, mlist[4][0].nr);
+-    EXPECT_EQ(0, actcData1[0].freq);
+-    EXPECT_EQ(2, actcData1[1].freq);
+-    EXPECT_EQ(5, actcData2[0].freq);
+-    EXPECT_EQ(3, actcData2[1].freq);
+-    EXPECT_EQ(2, actcData2[2].freq);
+-    EXPECT_EQ(1, actcData2[3].freq);
+-    EXPECT_EQ(PROMOTE, process.strategyAttr.dir[0]);
+-    EXPECT_EQ(PROMOTE, process.strategyAttr.dir[4]);
+-
+-    SeparateStrategyinit(actcData1, actcData2, &process);
+-    process.strategyAttr.nrMigratePages[0][4] = 1;
+-    ret = SeparateStrategy(&process, mlist);
+-    EXPECT_EQ(0, ret);
+-    EXPECT_EQ(1, mlist[0][4].nr);
+-    EXPECT_EQ(0, mlist[4][0].nr);
+-    EXPECT_EQ(0, actcData1[0].freq);
+-    EXPECT_EQ(2, actcData1[1].freq);
+-    EXPECT_EQ(5, actcData2[0].freq);
+-    EXPECT_EQ(3, actcData2[1].freq);
+-    EXPECT_EQ(2, actcData2[2].freq);
+-    EXPECT_EQ(1, actcData2[3].freq);
+-    EXPECT_EQ(DEMOTE, process.strategyAttr.dir[0]);
+-    EXPECT_EQ(DEMOTE, process.strategyAttr.dir[4]);
+-}
+-
+ TEST_F(SeparateStrategyTest, TestPeriodConfig)
+ {
+     int ret = GenerateStrategyConfigFile("./example2.config");
+@@ -475,262 +135,6 @@ TEST_F(SeparateStrategyTest, TestFreeMlist)
+     EXPECT_EQ(NULL, mlist[0][0].addr);
+ }
+ 
+-extern "C" int BaseStrategyInner(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX_NODES], int from, int to);
+-TEST_F(SeparateStrategyTest, TestBaseStrategyInner)
+-{
+-    ProcessAttr process = {};
+-    struct MigList mlist[MAX_NODES][MAX_NODES] = {};
+-    int ret;
+-    int from = 0;
+-    int to = 0;
+-    mlist[from][to].nr = 1;
+-    process.scanAttr.actcData[0] = NULL;
+-
+-    ret = BaseStrategyInner(&process, mlist, from, to);
+-    EXPECT_EQ(ret, -EINVAL);
+-}
+-
+-TEST_F(SeparateStrategyTest, TestBaseStrategyInnerFromIsNULL)
+-{
+-    ProcessAttr process = {};
+-    ActcData actcArr[2] = {};
+-    struct MigList mlist[MAX_NODES][MAX_NODES] = {};
+-
+-    int ret;
+-    int from = 0;
+-    int to = 0;
+-    mlist[from][to].nr = 1;
+-
+-    process.scanAttr.actcData[0] = actcArr;
+-    process.scanAttr.actcData[0][0].addr = 1;
+-    process.scanAttr.actcLen[0] = 1;
+-
+-    ret = BaseStrategyInner(&process, mlist, from, to);
+-    EXPECT_EQ(ret, 0);
+-    EXPECT_EQ(process.scanAttr.actcData[0][0].addr, *(mlist[0][0].addr));
+-}
+-
+-extern "C" int BaseStrategy(ProcessAttr *process, struct MigList mlist[MAX_NODES][MAX_NODES],
+-    uint64_t rawMigrateNum, MigrateDirection dir);
+-TEST_F(SeparateStrategyTest, TestBaseStrategyDirEqualsDemote)
+-{
+-    ProcessAttr process = {};
+-    process.numaAttr.numaNodes = 0b00010001;
+-    uint64_t rawMigrateNum = 100;
+-    MigrateDirection dir = DEMOTE;
+-    struct MigList mlist[MAX_NODES][MAX_NODES] = {};
+-
+-    for (int i = 0; i < MAX_NODES; i++) {
+-        process.scanAttr.actcData[i] = (ActcData *)calloc(1, sizeof(ActcData));
+-    }
+-
+-    process.scanAttr.actcData[0]->freq = 1;
+-    process.scanAttr.actcData[1]->freq = 2;
+-    process.scanAttr.actcData[0]->prior = 10;
+-    process.scanAttr.actcData[1]->prior = 1;
+-
+-    MOCKER(GetNrLocalNuma).stubs().will(returnValue(4));
+-    MOCKER(CalcMigrateNumByFreq).stubs().will(returnValue(1000));
+-    MOCKER(BaseStrategyInner).stubs().will(returnValue(0));
+-    MOCKER(FreeMlist).stubs().will(ignoreReturnValue());
+-
+-    int ret = BaseStrategy(&process, mlist, rawMigrateNum, dir);
+-    EXPECT_EQ(0, ret);
+-    EXPECT_EQ(1000, mlist[0][4].nr);
+-    EXPECT_EQ(900, mlist[4][0].nr);
+-
+-    for (int i = 0; i < MAX_NODES; i++) {
+-        free(process.scanAttr.actcData[i]);
+-    }
+-}
+-
+-TEST_F(SeparateStrategyTest, TestBaseStrategyDirEqualsPromote)
+-{
+-    ProcessAttr process = {};
+-    process.numaAttr.numaNodes = 0b00010001;
+-    uint64_t rawMigrateNum = 100;
+-    MigrateDirection dir = PROMOTE;
+-    struct MigList mlist[MAX_NODES][MAX_NODES] = {};
+-
+-    for (int i = 0; i < MAX_NODES; i++) {
+-        process.scanAttr.actcData[i] = (ActcData *)calloc(1, sizeof(ActcData));
+-    }
+-
+-    process.scanAttr.actcData[0]->freq = 1;
+-    process.scanAttr.actcData[1]->freq = 2;
+-    process.scanAttr.actcData[0]->prior = 10;
+-    process.scanAttr.actcData[1]->prior = 1;
+-
+-    MOCKER(GetNrLocalNuma).stubs().will(returnValue(4));
+-    MOCKER(CalcMigrateNumByFreq).stubs().will(returnValue(1000));
+-    MOCKER(BaseStrategyInner).stubs().will(returnValue(0));
+-    MOCKER(FreeMlist).stubs().will(ignoreReturnValue());
+-
+-    int ret = BaseStrategy(&process, mlist, rawMigrateNum, dir);
+-    EXPECT_EQ(0, ret);
+-    EXPECT_EQ(900, mlist[0][4].nr);
+-    EXPECT_EQ(1000, mlist[4][0].nr);
+-
+-    for (int i = 0; i < MAX_NODES; i++) {
+-        free(process.scanAttr.actcData[i]);
+-    }
+-}
+-
+-TEST_F(SeparateStrategyTest, TestBaseStrategyDirEqualsSWAP)
+-{
+-    ProcessAttr process = {};
+-    process.numaAttr.numaNodes = 0b00010001;
+-    uint64_t rawMigrateNum = 100;
+-    MigrateDirection dir = SWAP;
+-    struct MigList mlist[MAX_NODES][MAX_NODES] = {};
+-
+-    for (int i = 0; i < MAX_NODES; i++) {
+-        process.scanAttr.actcData[i] = (ActcData *)calloc(1, sizeof(ActcData));
+-    }
+-
+-    process.scanAttr.actcData[0]->freq = 1;
+-    process.scanAttr.actcData[1]->freq = 2;
+-    process.scanAttr.actcData[0]->prior = 10;
+-    process.scanAttr.actcData[1]->prior = 1;
+-
+-    MOCKER(IsHugeMode).stubs().will(returnValue(true));
+-    MOCKER(GetNrFreeHugePagesByNode).stubs().will(returnValue(100));
+-    MOCKER(GetNrLocalNuma).stubs().will(returnValue(4));
+-    MOCKER(CalcMigrateNumByFreq).stubs().will(returnValue(1000));
+-    MOCKER(BaseStrategyInner).stubs().will(returnValue(0));
+-    MOCKER(FreeMlist).stubs().will(ignoreReturnValue());
+-
+-    int ret = BaseStrategy(&process, mlist, rawMigrateNum, dir);
+-    EXPECT_EQ(0, ret);
+-    EXPECT_EQ(100, mlist[0][4].nr);
+-    EXPECT_EQ(100, mlist[4][0].nr);
+-
+-    GlobalMockObject::verify();
+-    MOCKER(IsHugeMode).stubs().will(returnValue(true));
+-    MOCKER(GetNrFreeHugePagesByNode).stubs().will(returnValue(1000));
+-    MOCKER(GetNrLocalNuma).stubs().will(returnValue(4));
+-    MOCKER(CalcMigrateNumByFreq).stubs().will(returnValue(1000));
+-    MOCKER(BaseStrategyInner).stubs().will(returnValue(0));
+-    MOCKER(FreeMlist).stubs().will(ignoreReturnValue());
+-
+-    ret = BaseStrategy(&process, mlist, rawMigrateNum, dir);
+-    EXPECT_EQ(0, ret);
+-    EXPECT_EQ(1000, mlist[0][4].nr);
+-    EXPECT_EQ(1000, mlist[4][0].nr);
+-    
+-    for (int i = 0; i < MAX_NODES; i++) {
+-        free(process.scanAttr.actcData[i]);
+-    }
+-}
+-
+-
+-TEST_F(SeparateStrategyTest, TestBaseStrategyTwo)
+-{
+-    ProcessAttr process = {};
+-    process.numaAttr.numaNodes = 0b00010001;
+-    uint64_t rawMigrateNum = 100;
+-    MigrateDirection dir = DEMOTE;
+-    struct MigList mlist[MAX_NODES][MAX_NODES] = {};
+-
+-    for (int i = 0; i < MAX_NODES; i++) {
+-        process.scanAttr.actcData[i] = (ActcData *)calloc(1, sizeof(ActcData));
+-    }
+-
+-    process.scanAttr.actcData[0]->freq = 2;
+-    process.scanAttr.actcData[1]->freq = 3;
+-    process.scanAttr.actcData[0]->prior = 11;
+-    process.scanAttr.actcData[1]->prior = 10;
+-
+-    MOCKER(GetNrLocalNuma).stubs().will(returnValue(4));
+-    MOCKER(CalcMigrateNumByFreq).stubs().will(returnValue(1000));
+-    MOCKER(BaseStrategyInner).stubs().will(returnValue(0));
+-    MOCKER(FreeMlist).stubs().will(ignoreReturnValue());
+-
+-    int ret = BaseStrategy(&process, mlist, rawMigrateNum, dir);
+-    EXPECT_EQ(0, ret);
+-
+-    for (int i = 0; i < MAX_NODES; i++) {
+-        free(process.scanAttr.actcData[i]);
+-    }
+-}
+-
+-TEST_F(SeparateStrategyTest, TestBaseStrategyThree)
+-{
+-    ProcessAttr process = {};
+-    process.numaAttr.numaNodes = 0b00010001;
+-    uint64_t rawMigrateNum = 100;
+-    MigrateDirection dir = PROMOTE;
+-    struct MigList mlist[MAX_NODES][MAX_NODES] = {};
+-
+-    for (int i = 0; i < MAX_NODES; i++) {
+-        process.scanAttr.actcData[i] = (ActcData *)calloc(1, sizeof(ActcData));
+-    }
+-
+-    process.scanAttr.actcData[0]->freq = 20;
+-    process.scanAttr.actcData[1]->freq = 100;
+-    process.scanAttr.actcData[0]->prior = 0;
+-    process.scanAttr.actcData[1]->prior = 20;
+-
+-    MOCKER(GetNrLocalNuma).stubs().will(returnValue(4));
+-    MOCKER(CalcMigrateNumByFreq).stubs().will(returnValue(1000));
+-    MOCKER(BaseStrategyInner).stubs().will(returnValue(0));
+-    MOCKER(FreeMlist).stubs().will(ignoreReturnValue());
+-
+-    int ret = BaseStrategy(&process, mlist, rawMigrateNum, dir);
+-    EXPECT_EQ(0, ret);
+-
+-    for (int i = 0; i < MAX_NODES; i++) {
+-        free(process.scanAttr.actcData[i]);
+-    }
+-}
+-
+-TEST_F(SeparateStrategyTest, TestBaseStrategyFour)
+-{
+-    ProcessAttr process = {};
+-    process.numaAttr.numaNodes = 0b00010001;
+-    uint64_t rawMigrateNum = 100;
+-    MigrateDirection dir = PROMOTE;
+-    struct MigList mlist[MAX_NODES][MAX_NODES] = {};
+-
+-    for (int i = 0; i < MAX_NODES; i++) {
+-        process.scanAttr.actcData[i] = (ActcData *)calloc(1, sizeof(ActcData));
+-    }
+-
+-    process.scanAttr.actcData[0]->freq = 20;
+-    process.scanAttr.actcData[1]->freq = 100;
+-    process.scanAttr.actcData[0]->prior = -1;
+-    process.scanAttr.actcData[1]->prior = -3;
+-
+-    MOCKER(GetNrLocalNuma).stubs().will(returnValue(4));
+-    MOCKER(CalcMigrateNumByFreq).stubs().will(returnValue(1000));
+-    MOCKER(BaseStrategyInner).stubs().will(returnValue(0));
+-    MOCKER(FreeMlist).stubs().will(ignoreReturnValue());
+-
+-    int ret = BaseStrategy(&process, mlist, rawMigrateNum, dir);
+-    EXPECT_EQ(0, ret);
+-
+-    for (int i = 0; i < MAX_NODES; i++) {
+-        free(process.scanAttr.actcData[i]);
+-    }
+-}
+-
+-extern "C" void SortActcData(ProcessAttr *process);
+-TEST_F(SeparateStrategyTest, TestSortActcData)
+-{
+-    ProcessAttr process = {};
+-    process.numaAttr.numaNodes = 0b00010001;
+-    for (int i = 0; i < MAX_NODES; i++) {
+-        process.scanAttr.actcData[i] = (ActcData *)calloc(1, sizeof(ActcData));
+-        process.scanAttr.actcLen[i] = 1;
+-    }
+-
+-    MOCKER(GetNrLocalNuma).stubs().will(returnValue(4));
+-    SortActcData(&process);
+-    for (int i = 0; i < MAX_NODES; i++) {
+-        free(process.scanAttr.actcData[i]);
+-    }
+-}
+-
+ TEST_F(SeparateStrategyTest, TestSeparateStrategy4KShouldMigrate)
+ {
+     ProcessAttr process;
+@@ -740,7 +144,7 @@ TEST_F(SeparateStrategyTest, TestSeparateStrategy4KShouldMigrate)
+     MOCKER(InitSeparateParam).stubs().will(ignoreReturnValue());
+     MOCKER(CalcMaxMigrate).stubs().will(ignoreReturnValue());
+     MOCKER(ShouldMigrate).stubs().will(returnValue(false));
+-    int ret = SeparateStrategy4K(&process, mlist);
++    int ret = SeparateStrategy(&process, mlist);
+ 
+     EXPECT_EQ(0, ret);
+ }
+@@ -757,10 +161,9 @@ TEST_F(SeparateStrategyTest, TestSeparateStrategy4KAbnormal)
+     MOCKER(InitSeparateParam).stubs().will(ignoreReturnValue());
+     MOCKER(CalcMaxMigrate).stubs().will(ignoreReturnValue());
+     MOCKER(ShouldMigrate).stubs().will(returnValue(true));
+-    MOCKER(SortActcData).stubs().will(ignoreReturnValue());
+     MOCKER(BuildSelectKMlistAddr).stubs().will(returnValue(-ENOMEM));
+     MOCKER(FreeMlist).stubs().will(ignoreReturnValue());
+-    int ret = SeparateStrategy4K(&process, mlist);
++    int ret = SeparateStrategy(&process, mlist);
+ 
+     EXPECT_EQ(-ENOMEM, ret);
+ }
+@@ -774,10 +177,9 @@ TEST_F(SeparateStrategyTest, TestSeparateStrategy4KNormal)
+     MOCKER(InitSeparateParam).stubs().will(ignoreReturnValue());
+     MOCKER(CalcMaxMigrate).stubs().will(ignoreReturnValue());
+     MOCKER(ShouldMigrate).stubs().will(returnValue(true));
+-    MOCKER(SortActcData).stubs().will(ignoreReturnValue());
+     MOCKER(BuildSelectKMlistAddr).stubs().will(returnValue(0));
+     MOCKER(FreeMlist).stubs().will(ignoreReturnValue());
+-    int ret = SeparateStrategy4K(&process, mlist);
++    int ret = SeparateStrategy(&process, mlist);
+ 
+     EXPECT_EQ(0, ret);
+ }
+@@ -790,7 +192,6 @@ void BuildActcData(int nid, const uint16_t data[], int size, ScanAttribute *scan
+     for (int i = 0; i < size; i++) {
+         uint16_t freq = data[i];
+         actcData[i].freq = freq;
+-        actcData[i].addr = nid * 1000000 + i * 10000 + freq;
+         scanAttribute->actCount[nid].freqMax = std::max(scanAttribute->actCount[nid].freqMax, freq);
+         scanAttribute->actCount[nid].freqMin = std::min(scanAttribute->actCount[nid].freqMin, freq);
+         if (freq == 0) {
+@@ -837,7 +238,7 @@ TEST_F(SeparateStrategyTest, TestSeparateStrategy4KSwapBasic)
+     MOCKER(GetNrFreePagesByNode).stubs().will(returnValue(10));
+     MOCKER(GetNrLocalNuma).stubs().will(returnValue(4));
+ 
+-    int ret = SeparateStrategy4K(&process, mlist);
++    int ret = SeparateStrategy(&process, mlist);
+ 
+     EXPECT_EQ(0, ret);
+ }
+@@ -865,7 +266,7 @@ TEST_F(SeparateStrategyTest, TestSeparateStrategy4KSwapBasicDemote)
+     MOCKER(GetNrFreePagesByNode).stubs().will(returnValue(10));
+     MOCKER(GetNrLocalNuma).stubs().will(returnValue(4));
+ 
+-    int ret = SeparateStrategy4K(&process, mlist);
++    int ret = SeparateStrategy(&process, mlist);
+ 
+     EXPECT_EQ(0, ret);
+ }
+@@ -893,7 +294,7 @@ TEST_F(SeparateStrategyTest, TestSeparateStrategy4KSwapBasicPromote)
+     MOCKER(GetNrFreePagesByNode).stubs().will(returnValue(10));
+     MOCKER(GetNrLocalNuma).stubs().will(returnValue(4));
+ 
+-    int ret = SeparateStrategy4K(&process, mlist);
++    int ret = SeparateStrategy(&process, mlist);
+ 
+     EXPECT_EQ(0, ret);
+ }
+@@ -926,7 +327,7 @@ TEST_F(SeparateStrategyTest, TestSeparateStrategy4KSwapMultiNode)
+     MOCKER(GetNrFreePagesByNode).stubs().will(returnValue(20));
+     MOCKER(GetNrLocalNuma).stubs().will(returnValue(4));
+ 
+-    int ret = SeparateStrategy4K(&process, mlist);
++    int ret = SeparateStrategy(&process, mlist);
+ 
+     EXPECT_EQ(0, ret);
+     EXPECT_EQ(0, mlist[0][5].nr);
+@@ -963,7 +364,7 @@ TEST_F(SeparateStrategyTest, TestSeparateStrategy4KSwapLimitByFreePage)
+     MOCKER(GetNrFreePagesByNode).stubs().will(returnValue(6));
+     MOCKER(GetNrLocalNuma).stubs().will(returnValue(4));
+ 
+-    int ret = SeparateStrategy4K(&process, mlist);
++    int ret = SeparateStrategy(&process, mlist);
+ 
+     EXPECT_EQ(0, ret);
+ }
+@@ -1212,13 +613,6 @@ TEST_F(SeparateStrategyTest, TestPromoteMultiNumaVmStrategy)
+     remoteMigInfo[0].dir = PROMOTE;
+     ret = PromoteMultiNumaVmStrategy(&process, mlist, remoteMigInfo, nrLocalNuma);
+     EXPECT_EQ(-MULTI_NUMA_VM_OOM, ret);
+-
+-    nrLocalNuma = 1;
+-    process.numaAttr.numaNodes = 0b0000001;
+-    MOCKER(GetNrFreeHugePagesByNode).stubs().will(returnValue((uint64_t)1));
+-    ret = PromoteMultiNumaVmStrategy(&process, mlist, remoteMigInfo, nrLocalNuma);
+-    EXPECT_EQ(0, ret);
+-    EXPECT_EQ(0, remoteMigInfo[0].nrMig);
+ }
+ 
+ TEST_F(SeparateStrategyTest, TestBuildLevelActcData)
+diff --git a/plugins/smap/test/user/strategy/test_strategy.cpp b/plugins/smap/test/user/strategy/test_strategy.cpp
+index c6c7a83..deff9bd 100644
+--- a/plugins/smap/test/user/strategy/test_strategy.cpp
++++ b/plugins/smap/test/user/strategy/test_strategy.cpp
+@@ -38,7 +38,7 @@ TEST_F(StrategyTest, TestRunStrategyOne)
+     struct MigList mlist[MAX_NODES][MAX_NODES] = {};
+     MOCKER(IsHugeMode).stubs().will(returnValue(true));
+     MOCKER(SeparateStrategy).stubs().will(returnValue(0));
+-    MOCKER(SeparateStrategy4K).stubs().will(returnValue(0));
++    MOCKER(SeparateStrategy).stubs().will(returnValue(0));
+     int ret = RunStrategy(&process, mlist, mlistSize);
+     EXPECT_EQ(-EINVAL, ret);
+ }
+@@ -52,7 +52,7 @@ TEST_F(StrategyTest, TestRunStrategyTwo)
+     struct MigList mlist[MAX_NODES][MAX_NODES] = {};
+     MOCKER(IsHugeMode).stubs().will(returnValue(false));
+     MOCKER(SeparateStrategy).stubs().will(returnValue(0));
+-    MOCKER(SeparateStrategy4K).stubs().will(returnValue(0));
++    MOCKER(SeparateStrategy).stubs().will(returnValue(0));
+     int ret = RunStrategy(&process, mlist, mlistSize);
+     EXPECT_EQ(-EINVAL, ret);
+ }
+@@ -63,7 +63,7 @@ TEST_F(StrategyTest, TestRunStrategyThree)
+     ProcessAttr process;
+     struct MigList mlist[MAX_NODES][MAX_NODES] = {};
+     MOCKER(SeparateStrategy).stubs().will(returnValue(0));
+-    MOCKER(SeparateStrategy4K).stubs().will(returnValue(0));
++    MOCKER(SeparateStrategy).stubs().will(returnValue(0));
+     int ret = RunStrategy(&process, mlist, mlistSize);
+     EXPECT_EQ(-EINVAL, ret);
+ }
+diff --git a/plugins/smap/test/user/test_interface.cpp b/plugins/smap/test/user/test_interface.cpp
+index 2ceccbd..9cb326c 100644
+--- a/plugins/smap/test/user/test_interface.cpp
++++ b/plugins/smap/test/user/test_interface.cpp
+@@ -2192,8 +2192,8 @@ TEST_F(InterfaceTest, TestQueryVMFreqFromUserNormalOne)
+     struct ProcessManager manager;
+     ProcessAttr attr = { .pid = 1, .next = nullptr };
+     EnvAtomicSet(&g_status, 1);
+-    ActcData actcData1[3] = { { .addr = 0, .freq = 0 }, { .addr = 0, .freq = 1 }, { .addr = 0, .freq = 2 } };
+-    ActcData actcData2[2] = { { .addr = 0, .freq = 3 }, { .addr = 0, .freq = 4 } };
++    ActcData actcData1[3] = { { .freq = 0 }, { .freq = 1 }, { .freq = 2 } };
++    ActcData actcData2[2] = { { .freq = 3 }, { .freq = 4 } };
+     int len1 = sizeof(actcData1) / sizeof(ActcData);
+     int len2 = sizeof(actcData2) / sizeof(ActcData);
+     attr.scanAttr.actcData[0] = actcData1;
+@@ -2220,11 +2220,11 @@ TEST_F(InterfaceTest, TestQueryVMFreqFromUserNormalTwo)
+     size_t dataLen = sizeof(data) / sizeof(uint16_t);
+     struct ProcessManager manager;
+     ProcessAttr attr = { .pid = 1, .next = nullptr };
+-    ActcData actcData1[5] = { { .addr = 0, .freq = 0 },
+-                              { .addr = 0, .freq = 1 },
+-                              { .addr = 0, .freq = 2 },
+-                              { .addr = 0, .freq = 3 },
+-                              { .addr = 0, .freq = 4 } };
++    ActcData actcData1[5] = { { .freq = 0 },
++                              { .freq = 1 },
++                              { .freq = 2 },
++                              { .freq = 3 },
++                              { .freq = 4 } };
+     int len1 = sizeof(actcData1) / sizeof(ActcData);
+     EnvAtomicSet(&g_status, 1);
+     attr.scanAttr.actcData[0] = actcData1;
+@@ -2252,8 +2252,8 @@ TEST_F(InterfaceTest, TestQueryVMFreqFromUserNormalThree)
+     size_t dataLen = sizeof(data) / sizeof(uint16_t);
+     struct ProcessManager manager;
+     ProcessAttr attr = { .pid = 1, .next = nullptr };
+-    ActcData actcData1[2] = { { .addr = 0, .freq = 0 }, { .addr = 0, .freq = 1 } };
+-    ActcData actcData2[2] = { { .addr = 0, .freq = 2 }, { .addr = 0, .freq = 3 } };
++    ActcData actcData1[2] = { { .freq = 0 }, { .freq = 1 } };
++    ActcData actcData2[2] = { { .freq = 2 }, { .freq = 3 } };
+     int len1 = sizeof(actcData1) / sizeof(ActcData);
+     int len2 = sizeof(actcData2) / sizeof(ActcData);
+     EnvAtomicSet(&g_status, 1);
+-- 
+2.53.0.windows.3
+

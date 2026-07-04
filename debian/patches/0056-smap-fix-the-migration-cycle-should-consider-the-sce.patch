@@ -1,0 +1,45 @@
+From 4cab06ea9ac004097a2c58bb4868f65e28a650c7 Mon Sep 17 00:00:00 2001
+From: fffsfsaf <1825116237@qq.com>
+Date: Tue, 23 Jun 2026 14:46:07 +0800
+Subject: [PATCH 56/71] smap: fix: the migration cycle should consider the
+ scenario
+
+---
+ plugins/smap/src/user/manage/access_ioctl.c | 7 ++++++-
+ plugins/smap/src/user/manage/manage.c       | 2 +-
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/plugins/smap/src/user/manage/access_ioctl.c b/plugins/smap/src/user/manage/access_ioctl.c
+index 9a2d168..41ea01b 100644
+--- a/plugins/smap/src/user/manage/access_ioctl.c
++++ b/plugins/smap/src/user/manage/access_ioctl.c
+@@ -35,7 +35,12 @@ int AccessIoctlAddPid(int len, struct AccessAddPidPayload *payload)
+     }
+     struct ProcessManager *manager = GetProcessManager();
+     ThreadCtx *ctx = manager->threadCtx[0];
+-    uint32_t migrationPeriod = ctx ? ctx->period : LIGHT_STABLE_MIGRATE_CYCLE;
++    uint32_t migrationPeriod;
++    if (ctx) {
++        migrationPeriod = ctx->period;
++    } else {
++        migrationPeriod = IsHugeMode() ? LIGHT_STABLE_MIGRATE_CYCLE : PROCESS_LIGHT_STABLE_MIGRATE_CYCLE;
++    }
+ 
+     for (int i = 0; i < len; i++) {
+         accessMsg.payload[i].pid = payload[i].pid;
+diff --git a/plugins/smap/src/user/manage/manage.c b/plugins/smap/src/user/manage/manage.c
+index 5ea1f23..d3ad61b 100644
+--- a/plugins/smap/src/user/manage/manage.c
++++ b/plugins/smap/src/user/manage/manage.c
+@@ -1318,7 +1318,7 @@ static void CalcActcStats(ProcessAttr *attr)
+         for (uint64_t i = 0; i < actcLen; i++) {
+             actc_t freq = actc[i].freq;
+             uint16_t bucketIdx = MIN(freq, FREQ_BUCKETS_SIZE - 1);
+-            if (!actc[i].isWhiteListPage) {
++            if (nid >= nrLocalNuma || !actc[i].isWhiteListPage) {
+                 count->freqBuckets[bucketIdx]++;
+             }
+             if (freq != 0) {
+-- 
+2.53.0.windows.3
+

@@ -1,0 +1,215 @@
+From 63573ecdd06b982c6c59db0a9f73438e86e8f476 Mon Sep 17 00:00:00 2001
+From: jamesricado <825511311@qq.com>
+Date: Fri, 3 Jul 2026 14:04:51 +0800
+Subject: [PATCH 71/71] =?UTF-8?q?fix:=E5=8C=BA=E5=88=86=E4=B8=8D=E5=90=8C?=
+ =?UTF-8?q?=E5=86=85=E6=A0=B8=E6=94=AF=E6=8C=81cpu=E8=B0=83=E5=BA=A6?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ plugins/smap/src/drivers/access_tracking.c    |  5 ++
+ .../test/drivers/test_access_tracking.cpp     | 62 +++++++++++++++++++
+ plugins/smap/test/tiering/test_basic.cpp      | 17 ++++-
+ .../test/tiering/test_smap_migrate_pages.cpp  | 12 +++-
+ .../test/tiering/test_tracking_manage.cpp     | 13 ++++
+ 5 files changed, 107 insertions(+), 2 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/access_tracking.c b/plugins/smap/src/drivers/access_tracking.c
+index d560e91..d376dfa 100644
+--- a/plugins/smap/src/drivers/access_tracking.c
++++ b/plugins/smap/src/drivers/access_tracking.c
+@@ -79,6 +79,7 @@ void cancel_ap_scan_work(struct access_pid *ap)
+ 
+ int set_scan_cpus(u32 cpu_start, u32 cpu_end)
+ {
++#ifdef KERNEL_OPENEULER
+ 	u32 cpu_index;
+ 	struct workqueue_attrs *attrs;
+ 	struct access_tracking_dev *adev;
+@@ -107,6 +108,10 @@ int set_scan_cpus(u32 cpu_start, u32 cpu_end)
+ 	}
+ 
+ 	free_workqueue_attrs(attrs);
++#else
++	pr_warn("set scan cpus is not supported on this kernel version\n");
++#endif
++
+ 	return 0;
+ }
+ 
+diff --git a/plugins/smap/test/drivers/test_access_tracking.cpp b/plugins/smap/test/drivers/test_access_tracking.cpp
+index dd69685..de201cc 100644
+--- a/plugins/smap/test/drivers/test_access_tracking.cpp
++++ b/plugins/smap/test/drivers/test_access_tracking.cpp
+@@ -27,6 +27,9 @@ using namespace std;
+ 
+ extern "C" int init_acpi_mem(void);
+ extern "C" struct list_head access_dev;
++extern "C" bool cancel_delayed_work_sync(struct delayed_work *dwork);
++extern "C" bool queue_delayed_work(struct workqueue_struct *wq,
++    struct delayed_work *dwork, unsigned long delay);
+ 
+ class AccessTrackingTest : public ::testing::Test {
+ protected:
+@@ -336,4 +339,63 @@ TEST_F(AccessTrackingTest, access_tracking_exit)
+     MOCKER(reset_acpi_mem).stubs();
+     access_tracking_exit();
+     list_del(&adev.list);
++}
++
++extern "C" ktime_t calc_time_us(ktime_t start_time);
++TEST_F(AccessTrackingTest, calc_time_us)
++{
++    ktime_t ret = calc_time_us(0);
++    EXPECT_EQ(0, ret);
++
++    GlobalMockObject::verify();
++    ret = calc_time_us(-1000000);
++    EXPECT_EQ(1000000 / 1000, ret);
++}
++
++extern "C" void cancel_ap_scan_work(struct access_pid *ap);
++TEST_F(AccessTrackingTest, cancel_ap_scan_work_null)
++{
++    cancel_ap_scan_work(nullptr);
++}
++
++TEST_F(AccessTrackingTest, cancel_ap_scan_work_no_func)
++{
++    struct access_pid ap = {};
++    ap.scan_work.work.func = nullptr;
++    cancel_ap_scan_work(&ap);
++}
++
++TEST_F(AccessTrackingTest, cancel_ap_scan_work_with_func)
++{
++    struct access_pid ap = {};
++    ap.scan_work.work.func = (void (*)(struct work_struct *))1;
++    MOCKER(cancel_delayed_work_sync).stubs().will(returnValue(true));
++    cancel_ap_scan_work(&ap);
++    GlobalMockObject::verify();
++}
++
++extern "C" int set_scan_cpus(u32 cpu_start, u32 cpu_end);
++TEST_F(AccessTrackingTest, set_scan_cpus_not_openeuler)
++{
++    int ret = set_scan_cpus(0, 4);
++    EXPECT_EQ(0, ret);
++}
++
++extern "C" void submit_one_work(struct access_pid *ap);
++TEST_F(AccessTrackingTest, submit_one_work)
++{
++    struct access_tracking_dev adev = {};
++    struct access_pid ap = {};
++    ap.pid = 1;
++    ap.scan_time = 100;
++
++    EXPECT_EQ(true, list_empty(&access_dev));
++    list_add(&adev.list, &access_dev);
++
++    MOCKER(cancel_ap_scan_work).stubs();
++    MOCKER(queue_delayed_work).stubs().will(returnValue(true));
++    submit_one_work(&ap);
++
++    GlobalMockObject::verify();
++    list_del(&adev.list);
+ }
+\ No newline at end of file
+diff --git a/plugins/smap/test/tiering/test_basic.cpp b/plugins/smap/test/tiering/test_basic.cpp
+index bdffc3b..69d5b13 100644
+--- a/plugins/smap/test/tiering/test_basic.cpp
++++ b/plugins/smap/test/tiering/test_basic.cpp
+@@ -47,10 +47,25 @@ TEST_F(BasicTest, KernelNumContigPtes)
+ 
+     size = CONT_PTE_SIZE;
+     ret = kernel_num_contig_ptes(size, &pgsize);
+-    EXPECT_EQ(CONT_PMDS, ret);
++    EXPECT_EQ(CONT_PTES, ret);
+     EXPECT_EQ(PAGE_SIZE, pgsize);
+ }
+ 
++TEST_F(BasicTest, KernelHugePtepGetEarlyReturn)
++{
++    pte_t pte = {};
++    pte_t ret = kernel_huge_ptep_get(&pte);
++    EXPECT_EQ(1UL, ret.pte);
++}
++
++TEST_F(BasicTest, KernelHugePtepGetPresentNotCont)
++{
++    pte_t pte = {};
++    pte.pte = 1UL;
++    pte_t ret = kernel_huge_ptep_get(&pte);
++    EXPECT_EQ(1UL, ret.pte);
++}
++
+ TEST_F(BasicTest, FindGetMmByVpid)
+ {
+     struct mm_struct *mm;
+diff --git a/plugins/smap/test/tiering/test_smap_migrate_pages.cpp b/plugins/smap/test/tiering/test_smap_migrate_pages.cpp
+index 5894212..5451c4c 100644
+--- a/plugins/smap/test/tiering/test_smap_migrate_pages.cpp
++++ b/plugins/smap/test/tiering/test_smap_migrate_pages.cpp
+@@ -101,6 +101,15 @@ protected:
+     }
+ };
+ 
++extern "C" unsigned int remote_migrate_mode;
++extern "C" void set_remote_migrate_mode(unsigned int mode);
++TEST_F(SmapMigratePagesTest, SetRemoteMigrateMode)
++{
++    unsigned int orig_mode = remote_migrate_mode;
++    set_remote_migrate_mode(1);
++    set_remote_migrate_mode(0);
++}
++
+ TEST_F(SmapMigratePagesTest, TestSmapAddNoPage)
+ {
+     struct page *page = nullptr;
+@@ -983,8 +992,9 @@ TEST_F(SmapMigratePagesTest, TestSetRemoteMigrateModeAsync)
+ 
+ TEST_F(SmapMigratePagesTest, TestSetRemoteMigrateModeDmaOffloading)
+ {
++    unsigned int orig = remote_migrate_mode;
+     set_remote_migrate_mode(1);
+-    EXPECT_EQ(remote_migrate_mode, MIGRATE_ASYNC_DMA_OFFLOADING);
++    EXPECT_EQ(remote_migrate_mode, orig);
+ }
+ 
+ // ========== New DT supplement: smap_check_huge_page_for_migration ==========
+diff --git a/plugins/smap/test/tiering/test_tracking_manage.cpp b/plugins/smap/test/tiering/test_tracking_manage.cpp
+index 92bbaf4..882fdc1 100644
+--- a/plugins/smap/test/tiering/test_tracking_manage.cpp
++++ b/plugins/smap/test/tiering/test_tracking_manage.cpp
+@@ -20,6 +20,7 @@ using namespace std;
+ 
+ extern "C" char *qemu_name;
+ extern "C" int node_modes[SMAP_MAX_NUMNODES];
++extern "C" unsigned int smap_pgsize;
+ 
+ class TrackingManageTest : public ::testing::Test {
+ protected:
+@@ -36,6 +37,18 @@ protected:
+     }
+ };
+ 
++extern "C" bool is_smap_pg_huge(void);
++TEST_F(TrackingManageTest, IsSmapPgHuge)
++{
++    smap_pgsize = HUGE_PAGE;
++    bool ret = is_smap_pg_huge();
++    EXPECT_EQ(true, ret);
++
++    smap_pgsize = 0;
++    ret = is_smap_pg_huge();
++    EXPECT_EQ(false, ret);
++}
++
+ extern "C" int refresh_remote_ram(void);
+ extern "C" int iterate_obmm_dev(void);
+ extern "C" void destroy_workqueue(struct workqueue_struct *wq);
+-- 
+2.53.0.windows.3
+

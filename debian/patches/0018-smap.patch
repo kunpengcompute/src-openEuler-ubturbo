@@ -1,0 +1,1854 @@
+From 9b500e72a77ebfd951ef78a3106eb1a74a534758 Mon Sep 17 00:00:00 2001
+From: dszhu <2549951418@qq.com>
+Date: Tue, 9 Jun 2026 11:34:50 +0800
+Subject: [PATCH 18/71] =?UTF-8?q?smap:=E5=A2=9E=E5=8A=A0=E8=87=AA=E9=80=82?=
+ =?UTF-8?q?=E5=BA=94=E9=85=8D=E6=AF=94=E7=9A=84=E9=85=8D=E7=BD=AE=E5=BC=80?=
+ =?UTF-8?q?=E5=85=B3?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../smap/src/user/advanced-strategy/scene.c   |  10 +-
+ plugins/smap/src/user/manage/manage.c         |   6 +-
+ plugins/smap/src/user/manage/manage.h         |   2 +-
+ plugins/smap/src/user/smap_interface.c        |   2 +-
+ .../smap/src/user/strategy/grouped_strategy.c |   2 +-
+ plugins/smap/src/user/strategy/migration.c    |   7 +-
+ .../src/user/strategy/separate_strategy.c     |   2 +-
+ .../{period_config.c => strategy_config.c}    | 321 ++++++++++--------
+ .../{period_config.h => strategy_config.h}    |  10 +-
+ plugins/smap/test/CMakeLists.txt              |   2 +-
+ .../test/user/advanced-strategy/SceneTest.cpp |  45 ++-
+ plugins/smap/test/user/manage/ManageTest.cpp  |   2 +-
+ .../user/strategy/GroupedStrategyTest.cpp     |   2 +-
+ .../smap/test/user/strategy/MigrationTest.cpp |  30 +-
+ .../user/strategy/SeparateStrategyTest.cpp    |  80 ++++-
+ ...riodConfigTest.cpp => strategy_config.cpp} | 298 ++++++++++------
+ 16 files changed, 551 insertions(+), 270 deletions(-)
+ rename plugins/smap/src/user/strategy/{period_config.c => strategy_config.c} (64%)
+ rename plugins/smap/src/user/strategy/{period_config.h => strategy_config.h} (87%)
+ rename plugins/smap/test/user/strategy/{PeriodConfigTest.cpp => strategy_config.cpp} (59%)
+
+diff --git a/plugins/smap/src/user/advanced-strategy/scene.c b/plugins/smap/src/user/advanced-strategy/scene.c
+index 33b7f65..7ad031e 100644
+--- a/plugins/smap/src/user/advanced-strategy/scene.c
++++ b/plugins/smap/src/user/advanced-strategy/scene.c
+@@ -570,7 +570,7 @@ static void ConfigMultiVmRatioInGroups(struct ProcessManager *manager)
+     EnvMutexUnlock(&manager->lock);
+ }
+ 
+-static void ConfigMultiProcessRatio(struct ProcessManager *manager)
++static void SkipMultiProcessRatio(struct ProcessManager *manager)
+ {
+     EnvMutexLock(&manager->lock);
+     ProcessAttr *current = manager->processes;
+@@ -592,10 +592,12 @@ static void ConfigMultiProcessRatio(struct ProcessManager *manager)
+ void ConfigRatios(struct ProcessManager *manager)
+ {
+     if (GetPidType(manager) == VM_TYPE) {
+-        ConfigMultiVmRatioInGroups(manager);
+-    } else {
+-        ConfigMultiProcessRatio(manager);
++        if (GetAdaptMem()) {
++            ConfigMultiVmRatioInGroups(manager);
++            return;
++        }
+     }
++    SkipMultiProcessRatio(manager);
+ }
+ 
+ bool GetAdaptMem(void)
+diff --git a/plugins/smap/src/user/manage/manage.c b/plugins/smap/src/user/manage/manage.c
+index 5c67437..a59ebfd 100644
+--- a/plugins/smap/src/user/manage/manage.c
++++ b/plugins/smap/src/user/manage/manage.c
+@@ -30,7 +30,7 @@
+ #include "virt.h"
+ #include "advanced-strategy/scene.h"
+ #include "smap_config.h"
+-#include "strategy/period_config.h"
++#include "strategy/strategy_config.h"
+ #include "strategy/strategy.h"
+ #include "strategy/migration.h"
+ #include "manage.h"
+@@ -124,11 +124,11 @@ int ProcessManagerInit(uint32_t pageType)
+         SMAP_LOGGER_ERROR("Clear process manager memory failed: %d.", ret);
+         return -ret;
+     }
+-    ret = GeneratePeriodConfigFile(PERIOD_CONFIG_PATH);
++    ret = GenerateStrategyConfigFile(STRATEGY_CONFIG_PATH);
+     if (ret != 0) {
+         SMAP_LOGGER_ERROR("Generat period config file failed, ret is %d.", ret);
+     }
+-    PeriodConfigRead(PERIOD_CONFIG_PATH);
++    StrategyConfigRead(STRATEGY_CONFIG_PATH);
+     int size = sysconf(_SC_PAGESIZE);
+     if (size != PAGESIZE_4K && size != PAGESIZE_64K) {
+         SMAP_LOGGER_ERROR("Get pagesize failed.");
+diff --git a/plugins/smap/src/user/manage/manage.h b/plugins/smap/src/user/manage/manage.h
+index 47fe4d4..8795e47 100644
+--- a/plugins/smap/src/user/manage/manage.h
++++ b/plugins/smap/src/user/manage/manage.h
+@@ -66,7 +66,7 @@
+ #define MMAP_TYPE_SHARED_SEG1 "memAccess='shared'"
+ #define MMAP_TYPE_SHARED_SEG2 "access mode='shared'"
+ 
+-#define PERIOD_CONFIG_PATH "/opt/ubturbo/conf/smap/period.config"
++#define STRATEGY_CONFIG_PATH "/opt/ubturbo/conf/smap/period.config"
+ #define DEFAULT_NMEMB 1
+ #define MAX_MIGRATE_BACK_WAIT_TIME 60
+ #define MIGRATE_BACK_CHECK_PERIOD 1000
+diff --git a/plugins/smap/src/user/smap_interface.c b/plugins/smap/src/user/smap_interface.c
+index ea2e791..49492a7 100644
+--- a/plugins/smap/src/user/smap_interface.c
++++ b/plugins/smap/src/user/smap_interface.c
+@@ -36,7 +36,7 @@
+ #include "manage/virt.h"
+ #include "manage/smap_config.h"
+ #include "strategy/migration.h"
+-#include "strategy/period_config.h"
++#include "strategy/strategy_config.h"
+ #include "smap_interface.h"
+ #define DEFAULT_NODE_NUMBER_SIZE 16
+ #define REMOTE_NUMA_MEMORY_MAX (TIB / MIB)
+diff --git a/plugins/smap/src/user/strategy/grouped_strategy.c b/plugins/smap/src/user/strategy/grouped_strategy.c
+index e6b4342..687877c 100644
+--- a/plugins/smap/src/user/strategy/grouped_strategy.c
++++ b/plugins/smap/src/user/strategy/grouped_strategy.c
+@@ -19,7 +19,7 @@
+ #include "smap_user_log.h"
+ #include "strategy.h"
+ #include "grouped_strategy.h"
+-#include "period_config.h"
++#include "strategy_config.h"
+ 
+ #define GROUP_SWAP_READY_ROUNDS 2
+ #define GROUP_SWAP_PERCENT_BASE 100
+diff --git a/plugins/smap/src/user/strategy/migration.c b/plugins/smap/src/user/strategy/migration.c
+index d9430be..37f72a3 100644
+--- a/plugins/smap/src/user/strategy/migration.c
++++ b/plugins/smap/src/user/strategy/migration.c
+@@ -26,7 +26,7 @@
+ #include "manage/device.h"
+ #include "strategy.h"
+ #include "grouped_strategy.h"
+-#include "period_config.h"
++#include "strategy_config.h"
+ #include "securec.h"
+ #include "smap_env.h"
+ #include "migration.h"
+@@ -706,6 +706,10 @@ int ScanMigrateWork(ThreadCtx *ctx)
+         goto out;
+     }
+     SMAP_LOGGER_DEBUG("Tracking disabled.");
++    StrategyConfigRead(STRATEGY_CONFIG_PATH); // 从配置文件中读取策略配置
++    if (GetFileConfSwitchConfig()) {
++        SetAdaptMem(GetAdaptiveRatioEnableConfig());
++    }
+     // 由于进程销毁是异步，后续涉及ProcessAttr需要合理处理异常
+     CheckAndRemoveInvalidProcess();
+     ret = PerformMigrationPreparation(manager);
+@@ -720,7 +724,6 @@ int ScanMigrateWork(ThreadCtx *ctx)
+     ConfigRatios(manager);
+     SMAP_LOGGER_DEBUG("Ratio configured.");
+     // 处理迁移参数
+-    PeriodConfigRead(PERIOD_CONFIG_PATH); // 从配置文件中读取周期配置
+     if (GetFileConfSwitchConfig()) {
+         SMAP_LOGGER_DEBUG("Updating period from config.");
+         UpdatePeriodFromConfig(ctx);
+diff --git a/plugins/smap/src/user/strategy/separate_strategy.c b/plugins/smap/src/user/strategy/separate_strategy.c
+index 1e64338..c044544 100644
+--- a/plugins/smap/src/user/strategy/separate_strategy.c
++++ b/plugins/smap/src/user/strategy/separate_strategy.c
+@@ -18,7 +18,7 @@
+ #include "smap_user_log.h"
+ #include "manage/manage.h"
+ #include "strategy.h"
+-#include "period_config.h"
++#include "strategy_config.h"
+ #include "separate_strategy.h"
+ 
+ #define DEFAULT_FREQ_WT_2M 1
+diff --git a/plugins/smap/src/user/strategy/period_config.c b/plugins/smap/src/user/strategy/strategy_config.c
+similarity index 64%
+rename from plugins/smap/src/user/strategy/period_config.c
+rename to plugins/smap/src/user/strategy/strategy_config.c
+index e58e4db..960c05f 100644
+--- a/plugins/smap/src/user/strategy/period_config.c
++++ b/plugins/smap/src/user/strategy/strategy_config.c
+@@ -18,14 +18,14 @@
+ #include <fcntl.h>
+ #include "smap_user_log.h"
+ #include "securec.h"
+-#include "period_config.h"
++#include "strategy_config.h"
+ 
+-#define PERIOD_CONFIG_ENTRY 11
+-#define PERIOD_CONFIG_BUFFSIZE 500
++#define STRATEGY_CONFIG_ENTRY 12
++#define STRATEGY_CONFIG_BUFFSIZE 500
+ 
+ #define RETURN_OK 0
+ #define RETURN_ERROR (-1)
+-#define PERIOD_CONFIG_READ_OVER 100
++#define STRATEGY_CONFIG_READ_OVER 100
+ 
+ #define MAX_SLOW_THRESHOLD (MAX_MIGRATE_PERIOD / MIN_SCAN_PERIOD)
+ #define DEFAULT_SLOW_THRESHOLD 2
+@@ -70,97 +70,103 @@ typedef struct {
+     uint32_t groupSwapMinRemoteFreq;
+     uint32_t groupSwapMinFreqGain;
+     bool zeroFreqMigrateEnable;
++    bool adaptiveRatioEnable;
+     bool fileConfSwitch;
+     bool scanPeriodChanged;
+     bool migratePeriodChanged;
+-} PeriodConfig;
++} StrategyConfig;
+ 
+-static PeriodConfig g_tmpPeriodConfig;
++static StrategyConfig g_tmpStrategyConfig;
+ 
+-static PeriodConfig g_periodConfig;
++static StrategyConfig g_strategyConfig;
+ 
+-typedef int32_t (*PeriodConfigReadFunc)(char *substr, char *value);
++typedef int32_t (*StrategyConfigReadFunc)(char *substr, char *value);
+ 
+ typedef struct {
+     char *substr;
+-    PeriodConfigReadFunc func;
++    StrategyConfigReadFunc func;
+     uint32_t needCfg;
+     uint32_t realCfg;
+-} PeriodConfigReadElem;
++} StrategyConfigReadElem;
+ 
+ uint32_t GetScanPeriodConfig(void)
+ {
+-    return g_periodConfig.scanPeriod;
++    return g_strategyConfig.scanPeriod;
+ }
+ 
+ uint32_t GetMigratePeriodConfig(void)
+ {
+-    return g_periodConfig.migratePeriod;
++    return g_strategyConfig.migratePeriod;
+ }
+ 
+ uint32_t GetRemoteFreqPercentileConfig(void)
+ {
+-    return g_periodConfig.remoteFreqPercentile;
++    return g_strategyConfig.remoteFreqPercentile;
+ }
+ 
+ uint32_t GetSlowThresholdConfig(void)
+ {
+-    return g_periodConfig.slowThreshold;
++    return g_strategyConfig.slowThreshold;
+ }
+ 
+ uint64_t GetFreqWtConfig(void)
+ {
+-    return g_periodConfig.freqWt;
++    return g_strategyConfig.freqWt;
+ }
+ 
+ uint32_t GetRemoteHotThreshold(void)
+ {
+-    return g_periodConfig.remoteHotThreshold;
++    return g_strategyConfig.remoteHotThreshold;
+ }
+ 
+ uint32_t GetGroupSwapRatioConfig(void)
+ {
+-    return g_periodConfig.groupSwapRatio;
++    return g_strategyConfig.groupSwapRatio;
+ }
+ 
+ uint32_t GetGroupSwapMinRemoteFreqConfig(void)
+ {
+-    return g_periodConfig.groupSwapMinRemoteFreq;
++    return g_strategyConfig.groupSwapMinRemoteFreq;
+ }
+ 
+ uint32_t GetGroupSwapMinFreqGainConfig(void)
+ {
+-    return g_periodConfig.groupSwapMinFreqGain;
++    return g_strategyConfig.groupSwapMinFreqGain;
+ }
+ 
+ bool GetZeroFreqMigrateEnableConfig(void)
+ {
+-    return g_periodConfig.zeroFreqMigrateEnable;
++    return g_strategyConfig.zeroFreqMigrateEnable;
++}
++
++bool GetAdaptiveRatioEnableConfig(void)
++{
++    return g_strategyConfig.adaptiveRatioEnable;
+ }
+ 
+ bool GetFileConfSwitchConfig(void)
+ {
+-    return g_periodConfig.fileConfSwitch;
++    return g_strategyConfig.fileConfSwitch;
+ }
+ 
+ bool GetScanPeriodChanged(void)
+ {
+-    return g_periodConfig.scanPeriodChanged;
++    return g_strategyConfig.scanPeriodChanged;
+ }
+ 
+ bool GetMigratePeriodChanged(void)
+ {
+-    return g_periodConfig.migratePeriodChanged;
++    return g_strategyConfig.migratePeriodChanged;
+ }
+ 
+ void SetScanPeriodChanged(bool val)
+ {
+-    g_periodConfig.scanPeriodChanged = val;
++    g_strategyConfig.scanPeriodChanged = val;
+ }
+ 
+ void SetMigratePeriodChanged(bool val)
+ {
+-    g_periodConfig.migratePeriodChanged = val;
++    g_strategyConfig.migratePeriodChanged = val;
+ }
+ 
+ static int32_t ConfigReadValueToInt(char *pvalue, uint32_t *resultvalue)
+@@ -185,18 +191,18 @@ static int32_t ConfigReadValueToInt(char *pvalue, uint32_t *resultvalue)
+ static int32_t ConfigScanPeriod(char *substr, char *value)
+ {
+     SMAP_LOGGER_DEBUG("Read config key:%s, value:%s.", substr, value);
+-    int32_t ret = ConfigReadValueToInt(value, &g_tmpPeriodConfig.scanPeriod);
++    int32_t ret = ConfigReadValueToInt(value, &g_tmpStrategyConfig.scanPeriod);
+     if (ret != RETURN_OK) {
+         SMAP_LOGGER_ERROR("Config scan period read failed, key:%s.", substr);
+         return ret;
+     }
+-    if (g_tmpPeriodConfig.scanPeriod < MIN_SCAN_PERIOD || g_tmpPeriodConfig.scanPeriod > MAX_SCAN_PERIOD) {
+-        SMAP_LOGGER_ERROR("Config scan period(%d) invalid, range(%d-%d), key:%s.", g_tmpPeriodConfig.scanPeriod,
++    if (g_tmpStrategyConfig.scanPeriod < MIN_SCAN_PERIOD || g_tmpStrategyConfig.scanPeriod > MAX_SCAN_PERIOD) {
++        SMAP_LOGGER_ERROR("Config scan period(%d) invalid, range(%d-%d), key:%s.", g_tmpStrategyConfig.scanPeriod,
+                           MIN_SCAN_PERIOD, MAX_SCAN_PERIOD, substr);
+         return RETURN_ERROR;
+     }
+-    if (g_tmpPeriodConfig.scanPeriod % SCAN_MULTIPLE != 0) {
+-        SMAP_LOGGER_ERROR("Scan period(%d) must be a multiple of %d, key:%s.", g_tmpPeriodConfig.scanPeriod,
++    if (g_tmpStrategyConfig.scanPeriod % SCAN_MULTIPLE != 0) {
++        SMAP_LOGGER_ERROR("Scan period(%d) must be a multiple of %d, key:%s.", g_tmpStrategyConfig.scanPeriod,
+                           SCAN_MULTIPLE, substr);
+         return RETURN_ERROR;
+     }
+@@ -206,13 +212,14 @@ static int32_t ConfigScanPeriod(char *substr, char *value)
+ static int32_t ConfigMigratePeriod(char *substr, char *value)
+ {
+     SMAP_LOGGER_DEBUG("Read config key:%s, value:%s.", substr, value);
+-    int32_t ret = ConfigReadValueToInt(value, &g_tmpPeriodConfig.migratePeriod);
++    int32_t ret = ConfigReadValueToInt(value, &g_tmpStrategyConfig.migratePeriod);
+     if (ret != RETURN_OK) {
+         SMAP_LOGGER_ERROR("Config migrate period read failed, key:%s.", substr);
+         return ret;
+     }
+-    if (g_tmpPeriodConfig.migratePeriod < MIN_MIGRATE_PERIOD || g_tmpPeriodConfig.migratePeriod > MAX_MIGRATE_PERIOD) {
+-        SMAP_LOGGER_ERROR("Config migrate period(%d) invalid, range(%d-%d), key:%s.", g_tmpPeriodConfig.migratePeriod,
++    if (g_tmpStrategyConfig.migratePeriod < MIN_MIGRATE_PERIOD ||
++        g_tmpStrategyConfig.migratePeriod > MAX_MIGRATE_PERIOD) {
++        SMAP_LOGGER_ERROR("Config migrate period(%d) invalid, range(%d-%d), key:%s.", g_tmpStrategyConfig.migratePeriod,
+                           MIN_MIGRATE_PERIOD, MAX_MIGRATE_PERIOD, substr);
+         return RETURN_ERROR;
+     }
+@@ -222,15 +229,15 @@ static int32_t ConfigMigratePeriod(char *substr, char *value)
+ static int32_t ConfigRemoteFreqPercentile(char *substr, char *value)
+ {
+     SMAP_LOGGER_DEBUG("Read config key:%s, value:%s.", substr, value);
+-    int32_t ret = ConfigReadValueToInt(value, &g_tmpPeriodConfig.remoteFreqPercentile);
++    int32_t ret = ConfigReadValueToInt(value, &g_tmpStrategyConfig.remoteFreqPercentile);
+     if (ret != RETURN_OK) {
+         SMAP_LOGGER_ERROR("Config remote freq percentile read failed, key:%s.", substr);
+         return ret;
+     }
+-    if (g_tmpPeriodConfig.remoteFreqPercentile < MIN_REMOTE_FREQ_PERCENTILE ||
+-        g_tmpPeriodConfig.remoteFreqPercentile > MAX_REMOTE_FREQ_PERCENTILE) {
++    if (g_tmpStrategyConfig.remoteFreqPercentile < MIN_REMOTE_FREQ_PERCENTILE ||
++        g_tmpStrategyConfig.remoteFreqPercentile > MAX_REMOTE_FREQ_PERCENTILE) {
+         SMAP_LOGGER_ERROR("Config remote freq percentile(%d) invalid, range(%d-%d), key:%s.",
+-                          g_tmpPeriodConfig.remoteFreqPercentile, MIN_REMOTE_FREQ_PERCENTILE,
++                          g_tmpStrategyConfig.remoteFreqPercentile, MIN_REMOTE_FREQ_PERCENTILE,
+                           MAX_REMOTE_FREQ_PERCENTILE, substr);
+         return RETURN_ERROR;
+     }
+@@ -240,13 +247,14 @@ static int32_t ConfigRemoteFreqPercentile(char *substr, char *value)
+ static int32_t ConfigSlowThreshold(char *substr, char *value)
+ {
+     SMAP_LOGGER_DEBUG("Read config key:%s, value:%s.", substr, value);
+-    int32_t ret = ConfigReadValueToInt(value, &g_tmpPeriodConfig.slowThreshold);
++    int32_t ret = ConfigReadValueToInt(value, &g_tmpStrategyConfig.slowThreshold);
+     if (ret != RETURN_OK) {
+         SMAP_LOGGER_ERROR("Config slow threshold read failed, key:%s.", substr);
+         return ret;
+     }
+-    if (g_tmpPeriodConfig.slowThreshold < MIN_SLOW_THRESHOLD || g_tmpPeriodConfig.slowThreshold > MAX_SLOW_THRESHOLD) {
+-        SMAP_LOGGER_ERROR("Config slow threshold(%d) invalid, range(%d-%d), key:%s.", g_tmpPeriodConfig.slowThreshold,
++    if (g_tmpStrategyConfig.slowThreshold < MIN_SLOW_THRESHOLD ||
++        g_tmpStrategyConfig.slowThreshold > MAX_SLOW_THRESHOLD) {
++        SMAP_LOGGER_ERROR("Config slow threshold(%d) invalid, range(%d-%d), key:%s.", g_tmpStrategyConfig.slowThreshold,
+                           MIN_SLOW_THRESHOLD, MAX_SLOW_THRESHOLD, substr);
+         return RETURN_ERROR;
+     }
+@@ -263,11 +271,11 @@ static int32_t ConfigFreqWt(char *substr, char *value)
+         return ret;
+     }
+     if (tempFreqWt < MIN_FREQ_WT || tempFreqWt > MAX_FREQ_WT) {
+-        SMAP_LOGGER_ERROR("Config freq wt(%d) invalid, range(%d-%d), key:%s.", g_tmpPeriodConfig.freqWt, MIN_FREQ_WT,
++        SMAP_LOGGER_ERROR("Config freq wt(%d) invalid, range(%d-%d), key:%s.", g_tmpStrategyConfig.freqWt, MIN_FREQ_WT,
+                           MAX_FREQ_WT, substr);
+         return RETURN_ERROR;
+     }
+-    g_tmpPeriodConfig.freqWt = tempFreqWt;
++    g_tmpStrategyConfig.freqWt = tempFreqWt;
+     return RETURN_OK;
+ }
+ 
+@@ -285,22 +293,22 @@ static int32_t ConfigRemoteHotThreshold(char *substr, char *value)
+                           MIN_REMOTE_FREQ_PERCENTILE, MAX_REMOTE_HOT_THRESHOLD, substr);
+         return RETURN_ERROR;
+     }
+-    g_tmpPeriodConfig.remoteHotThreshold = remoteHotThreshold;
++    g_tmpStrategyConfig.remoteHotThreshold = remoteHotThreshold;
+     return RETURN_OK;
+ }
+ 
+ static int32_t ConfigGroupSwapRatio(char *substr, char *value)
+ {
+     SMAP_LOGGER_DEBUG("Read config key:%s, value:%s.", substr, value);
+-    int32_t ret = ConfigReadValueToInt(value, &g_tmpPeriodConfig.groupSwapRatio);
++    int32_t ret = ConfigReadValueToInt(value, &g_tmpStrategyConfig.groupSwapRatio);
+     if (ret != RETURN_OK) {
+         SMAP_LOGGER_ERROR("Config group swap ratio read failed, key:%s.", substr);
+         return ret;
+     }
+-    if (g_tmpPeriodConfig.groupSwapRatio < MIN_GROUP_SWAP_RATIO ||
+-        g_tmpPeriodConfig.groupSwapRatio > MAX_GROUP_SWAP_RATIO) {
++    if (g_tmpStrategyConfig.groupSwapRatio < MIN_GROUP_SWAP_RATIO ||
++        g_tmpStrategyConfig.groupSwapRatio > MAX_GROUP_SWAP_RATIO) {
+         SMAP_LOGGER_ERROR("Config group swap ratio(%u) invalid, range(%d-%d), key:%s.",
+-                          g_tmpPeriodConfig.groupSwapRatio, MIN_GROUP_SWAP_RATIO, MAX_GROUP_SWAP_RATIO, substr);
++                          g_tmpStrategyConfig.groupSwapRatio, MIN_GROUP_SWAP_RATIO, MAX_GROUP_SWAP_RATIO, substr);
+         return RETURN_ERROR;
+     }
+     return RETURN_OK;
+@@ -309,15 +317,15 @@ static int32_t ConfigGroupSwapRatio(char *substr, char *value)
+ static int32_t ConfigGroupSwapMinRemoteFreq(char *substr, char *value)
+ {
+     SMAP_LOGGER_DEBUG("Read config key:%s, value:%s.", substr, value);
+-    int32_t ret = ConfigReadValueToInt(value, &g_tmpPeriodConfig.groupSwapMinRemoteFreq);
++    int32_t ret = ConfigReadValueToInt(value, &g_tmpStrategyConfig.groupSwapMinRemoteFreq);
+     if (ret != RETURN_OK) {
+         SMAP_LOGGER_ERROR("Config group swap min remote freq read failed, key:%s.", substr);
+         return ret;
+     }
+-    if (g_tmpPeriodConfig.groupSwapMinRemoteFreq < MIN_GROUP_SWAP_MIN_REMOTE_FREQ ||
+-        g_tmpPeriodConfig.groupSwapMinRemoteFreq > MAX_GROUP_SWAP_MIN_REMOTE_FREQ) {
++    if (g_tmpStrategyConfig.groupSwapMinRemoteFreq < MIN_GROUP_SWAP_MIN_REMOTE_FREQ ||
++        g_tmpStrategyConfig.groupSwapMinRemoteFreq > MAX_GROUP_SWAP_MIN_REMOTE_FREQ) {
+         SMAP_LOGGER_ERROR("Config group swap min remote freq(%u) invalid, range(%d-%d), key:%s.",
+-                          g_tmpPeriodConfig.groupSwapMinRemoteFreq, MIN_GROUP_SWAP_MIN_REMOTE_FREQ,
++                          g_tmpStrategyConfig.groupSwapMinRemoteFreq, MIN_GROUP_SWAP_MIN_REMOTE_FREQ,
+                           MAX_GROUP_SWAP_MIN_REMOTE_FREQ, substr);
+         return RETURN_ERROR;
+     }
+@@ -327,15 +335,15 @@ static int32_t ConfigGroupSwapMinRemoteFreq(char *substr, char *value)
+ static int32_t ConfigGroupSwapMinFreqGain(char *substr, char *value)
+ {
+     SMAP_LOGGER_DEBUG("Read config key:%s, value:%s.", substr, value);
+-    int32_t ret = ConfigReadValueToInt(value, &g_tmpPeriodConfig.groupSwapMinFreqGain);
++    int32_t ret = ConfigReadValueToInt(value, &g_tmpStrategyConfig.groupSwapMinFreqGain);
+     if (ret != RETURN_OK) {
+         SMAP_LOGGER_ERROR("Config group swap min freq gain read failed, key:%s.", substr);
+         return ret;
+     }
+-    if (g_tmpPeriodConfig.groupSwapMinFreqGain < MIN_GROUP_SWAP_MIN_FREQ_GAIN ||
+-        g_tmpPeriodConfig.groupSwapMinFreqGain > MAX_GROUP_SWAP_MIN_FREQ_GAIN) {
++    if (g_tmpStrategyConfig.groupSwapMinFreqGain < MIN_GROUP_SWAP_MIN_FREQ_GAIN ||
++        g_tmpStrategyConfig.groupSwapMinFreqGain > MAX_GROUP_SWAP_MIN_FREQ_GAIN) {
+         SMAP_LOGGER_ERROR("Config group swap min freq gain(%u) invalid, range(%d-%d), key:%s.",
+-                          g_tmpPeriodConfig.groupSwapMinFreqGain, MIN_GROUP_SWAP_MIN_FREQ_GAIN,
++                          g_tmpStrategyConfig.groupSwapMinFreqGain, MIN_GROUP_SWAP_MIN_FREQ_GAIN,
+                           MAX_GROUP_SWAP_MIN_FREQ_GAIN, substr);
+         return RETURN_ERROR;
+     }
+@@ -346,9 +354,9 @@ static int32_t ConfigZeroFreqMigrateEnable(char *substr, char *value)
+ {
+     SMAP_LOGGER_DEBUG("Read config key:%s, value:%s.", substr, value);
+     if (strcmp(value, "true") == 0) {
+-        g_tmpPeriodConfig.zeroFreqMigrateEnable = true;
++        g_tmpStrategyConfig.zeroFreqMigrateEnable = true;
+     } else if (strcmp(value, "false") == 0) {
+-        g_tmpPeriodConfig.zeroFreqMigrateEnable = false;
++        g_tmpStrategyConfig.zeroFreqMigrateEnable = false;
+     } else {
+         SMAP_LOGGER_ERROR("Config zero freq migrate enable(%s) failed, need config true or false, key:%s.", value,
+                           substr);
+@@ -357,13 +365,27 @@ static int32_t ConfigZeroFreqMigrateEnable(char *substr, char *value)
+     return RETURN_OK;
+ }
+ 
++static int32_t ConfigAdaptiveRatioEnable(char *substr, char *value)
++{
++    SMAP_LOGGER_DEBUG("Read config key:%s, value:%s.", substr, value);
++    if (strcmp(value, "true") == 0) {
++        g_tmpStrategyConfig.adaptiveRatioEnable = true;
++    } else if (strcmp(value, "false") == 0) {
++        g_tmpStrategyConfig.adaptiveRatioEnable = false;
++    } else {
++        SMAP_LOGGER_ERROR("Config adaptive ratio enable(%s) failed, need config true or false, key:%s.", value, substr);
++        return RETURN_ERROR;
++    }
++    return RETURN_OK;
++}
++
+ static int32_t ConfigFileConfSwitch(char *substr, char *value)
+ {
+     SMAP_LOGGER_DEBUG("Read config key:%s, value:%s.", substr, value);
+     if (strcmp(value, "true") == 0) {
+-        g_tmpPeriodConfig.fileConfSwitch = true;
++        g_tmpStrategyConfig.fileConfSwitch = true;
+     } else if (strcmp(value, "false") == 0) {
+-        g_tmpPeriodConfig.fileConfSwitch = false;
++        g_tmpStrategyConfig.fileConfSwitch = false;
+     } else {
+         SMAP_LOGGER_ERROR("Config file conf switch(%s) failed, need config true or false, key:%s.", value, substr);
+         return RETURN_ERROR;
+@@ -371,7 +393,7 @@ static int32_t ConfigFileConfSwitch(char *substr, char *value)
+     return RETURN_OK;
+ }
+ 
+-static PeriodConfigReadElem g_periodConfigRead[] = {
++static StrategyConfigReadElem g_strategyConfigRead[] = {
+     {
+         "smap.scan.period",
+         ConfigScanPeriod,
+@@ -432,6 +454,12 @@ static PeriodConfigReadElem g_periodConfigRead[] = {
+         1UL,
+         0UL,
+     },
++    {
++        "smap.adaptive.ratio.enable",
++        ConfigAdaptiveRatioEnable,
++        1UL,
++        0UL,
++    },
+     {
+         "smap.period.file.config.switch",
+         ConfigFileConfSwitch,
+@@ -476,16 +504,16 @@ static char *ConfigReadSearchSubString(const char *buf, const char *substr)
+     return ret;
+ }
+ 
+-static int PeriodConfigAnalyze(const char *str)
++static int StrategyConfigAnalyze(const char *str)
+ {
+-    size_t len = sizeof(g_periodConfigRead) / sizeof(PeriodConfigReadElem);
++    size_t len = sizeof(g_strategyConfigRead) / sizeof(StrategyConfigReadElem);
+ 
+     for (size_t index = 0; index < len; index++) {
+-        char *config = g_periodConfigRead[index].substr;
++        char *config = g_strategyConfigRead[index].substr;
+         char *substr = ConfigReadSearchSubString(str, config);
+         if (substr != NULL) {
+-            g_periodConfigRead[index].realCfg = 1;
+-            return g_periodConfigRead[index].func(config, substr);
++            g_strategyConfigRead[index].realCfg = 1;
++            return g_strategyConfigRead[index].func(config, substr);
+         }
+     }
+     return 0;
+@@ -501,13 +529,13 @@ static int32_t ConfigReadByLine(FILE *fp, char *buf, int32_t n)
+     if (ferror(fp)) {
+         return RETURN_ERROR;
+     }
+-    return PERIOD_CONFIG_READ_OVER;
++    return STRATEGY_CONFIG_READ_OVER;
+ }
+ 
+ static int ConfigReadReadFile(const char *filepath)
+ {
+     FILE *fp = NULL;
+-    char buf[PERIOD_CONFIG_BUFFSIZE] = { 0 };
++    char buf[STRATEGY_CONFIG_BUFFSIZE] = { 0 };
+     int ret = RETURN_OK;
+     char path[PATH_MAX + 1] = { 0 };
+ 
+@@ -522,12 +550,12 @@ static int ConfigReadReadFile(const char *filepath)
+     }
+ 
+     while (true) {
+-        ret = memset_s(buf, PERIOD_CONFIG_BUFFSIZE, 0, PERIOD_CONFIG_BUFFSIZE);
++        ret = memset_s(buf, STRATEGY_CONFIG_BUFFSIZE, 0, STRATEGY_CONFIG_BUFFSIZE);
+         if (ret != 0) {
+             break;
+         }
+-        ret = ConfigReadByLine(fp, buf, PERIOD_CONFIG_BUFFSIZE);
+-        if (ret == PERIOD_CONFIG_READ_OVER) {
++        ret = ConfigReadByLine(fp, buf, STRATEGY_CONFIG_BUFFSIZE);
++        if (ret == STRATEGY_CONFIG_READ_OVER) {
+             SMAP_LOGGER_INFO("Read config over.");
+             ret = RETURN_OK;
+             break;
+@@ -535,7 +563,7 @@ static int ConfigReadReadFile(const char *filepath)
+             SMAP_LOGGER_ERROR("Read config failed.");
+             break;
+         }
+-        ret = PeriodConfigAnalyze(buf);
++        ret = StrategyConfigAnalyze(buf);
+         if (ret != 0) {
+             SMAP_LOGGER_ERROR("Analyze config failed(%s), str(%s).", filepath, (char *)buf);
+             break;
+@@ -546,20 +574,20 @@ static int ConfigReadReadFile(const char *filepath)
+     return ret;
+ }
+ 
+-static int32_t PeriodConfigReview(void)
++static int32_t StrategyConfigReview(void)
+ {
+-    size_t num = sizeof(g_periodConfigRead) / sizeof(PeriodConfigReadElem);
++    size_t num = sizeof(g_strategyConfigRead) / sizeof(StrategyConfigReadElem);
+     size_t index;
+ 
+     for (index = 0; index < num; index++) {
+-        if (g_periodConfigRead[index].needCfg == 1UL && g_periodConfigRead[index].realCfg == 0UL) {
+-            SMAP_LOGGER_ERROR("Read config key:%s, failed.", g_periodConfigRead[index].substr);
++        if (g_strategyConfigRead[index].needCfg == 1UL && g_strategyConfigRead[index].realCfg == 0UL) {
++            SMAP_LOGGER_ERROR("Read config key:%s, failed.", g_strategyConfigRead[index].substr);
+             return RETURN_ERROR;
+         }
+     }
+-    if (g_tmpPeriodConfig.scanPeriod > g_tmpPeriodConfig.migratePeriod) {
+-        SMAP_LOGGER_ERROR("Scan period(%d) must be less than migrate period(%d).", g_tmpPeriodConfig.scanPeriod,
+-                          g_tmpPeriodConfig.migratePeriod);
++    if (g_tmpStrategyConfig.scanPeriod > g_tmpStrategyConfig.migratePeriod) {
++        SMAP_LOGGER_ERROR("Scan period(%d) must be less than migrate period(%d).", g_tmpStrategyConfig.scanPeriod,
++                          g_tmpStrategyConfig.migratePeriod);
+         return RETURN_ERROR;
+     }
+     return RETURN_OK;
+@@ -567,29 +595,30 @@ static int32_t PeriodConfigReview(void)
+ 
+ static void PeriodConifgReset(void)
+ {
+-    size_t num = sizeof(g_periodConfigRead) / sizeof(PeriodConfigReadElem);
++    size_t num = sizeof(g_strategyConfigRead) / sizeof(StrategyConfigReadElem);
+     size_t index;
+ 
+     for (index = 0; index < num; index++) {
+-        g_periodConfigRead[index].realCfg = 0;
++        g_strategyConfigRead[index].realCfg = 0;
+     }
+ }
+ 
+-static void InitPeriodConfig(void)
++static void InitStrategyConfig(void)
+ {
+-    g_periodConfig.scanPeriod = DEFAULT_SCAN_PERIOD;
+-    g_periodConfig.migratePeriod = DEFAULT_MIGRATE_PERIOD;
+-    g_periodConfig.remoteFreqPercentile = DEFAULT_REMOTE_FREQ_PERCENTILE;
+-    g_periodConfig.slowThreshold = DEFAULT_SLOW_THRESHOLD;
+-    g_periodConfig.freqWt = DEFAULT_FREQ_WT;
+-    g_periodConfig.remoteHotThreshold = DEFAULT_REMOTE_HOT_THRESHOLD;
+-    g_periodConfig.groupSwapRatio = DEFAULT_GROUP_SWAP_RATIO;
+-    g_periodConfig.groupSwapMinRemoteFreq = DEFAULT_GROUP_SWAP_MIN_REMOTE_FREQ;
+-    g_periodConfig.groupSwapMinFreqGain = DEFAULT_GROUP_SWAP_MIN_FREQ_GAIN;
+-    g_periodConfig.zeroFreqMigrateEnable = true;
+-    g_periodConfig.fileConfSwitch = false;
+-    g_periodConfig.scanPeriodChanged = false;
+-    g_periodConfig.migratePeriodChanged = false;
++    g_strategyConfig.scanPeriod = DEFAULT_SCAN_PERIOD;
++    g_strategyConfig.migratePeriod = DEFAULT_MIGRATE_PERIOD;
++    g_strategyConfig.remoteFreqPercentile = DEFAULT_REMOTE_FREQ_PERCENTILE;
++    g_strategyConfig.slowThreshold = DEFAULT_SLOW_THRESHOLD;
++    g_strategyConfig.freqWt = DEFAULT_FREQ_WT;
++    g_strategyConfig.remoteHotThreshold = DEFAULT_REMOTE_HOT_THRESHOLD;
++    g_strategyConfig.groupSwapRatio = DEFAULT_GROUP_SWAP_RATIO;
++    g_strategyConfig.groupSwapMinRemoteFreq = DEFAULT_GROUP_SWAP_MIN_REMOTE_FREQ;
++    g_strategyConfig.groupSwapMinFreqGain = DEFAULT_GROUP_SWAP_MIN_FREQ_GAIN;
++    g_strategyConfig.zeroFreqMigrateEnable = true;
++    g_strategyConfig.adaptiveRatioEnable = true;
++    g_strategyConfig.fileConfSwitch = false;
++    g_strategyConfig.scanPeriodChanged = false;
++    g_strategyConfig.migratePeriodChanged = false;
+ }
+ 
+ static int32_t EnsureDirectoryExists(const char *dirPath)
+@@ -613,7 +642,7 @@ static int32_t EnsureDirectoryExists(const char *dirPath)
+     return RETURN_OK;
+ }
+ 
+-static int32_t InitPeriodConfigFileBuffer(char periodDefaultConfig[PERIOD_CONFIG_ENTRY][PERIOD_CONFIG_BUFFSIZE])
++static int32_t InitStrategyConfigFileBuffer(char strategyDefaultConfig[STRATEGY_CONFIG_ENTRY][STRATEGY_CONFIG_BUFFSIZE])
+ {
+     int32_t ret;
+ 
+@@ -636,8 +665,8 @@ static int32_t InitPeriodConfigFileBuffer(char periodDefaultConfig[PERIOD_CONFIG
+ 
+     // 使用循环处理snprintf_s部分
+     for (size_t i = 0; i < numConfigs; i++) {
+-        ret = snprintf_s(periodDefaultConfig[i], PERIOD_CONFIG_BUFFSIZE, PERIOD_CONFIG_BUFFSIZE - 1, configs[i].format,
+-                         configs[i].value);
++        ret = snprintf_s(strategyDefaultConfig[i], STRATEGY_CONFIG_BUFFSIZE, STRATEGY_CONFIG_BUFFSIZE - 1,
++                         configs[i].format, configs[i].value);
+         if (ret < 0) {
+             SMAP_LOGGER_ERROR("Snprintf failed for config index %zu.", i);
+             return RETURN_ERROR;
+@@ -645,15 +674,23 @@ static int32_t InitPeriodConfigFileBuffer(char periodDefaultConfig[PERIOD_CONFIG
+     }
+     const char *zeroFreqMigrateEnableStr = "smap.zero.freq.migrate.enable = true\n";
+     size_t zeroFreqStrLen = strlen(zeroFreqMigrateEnableStr);
+-    errno_t res = strncpy_s(periodDefaultConfig[numConfigs], PERIOD_CONFIG_BUFFSIZE, zeroFreqMigrateEnableStr,
++    errno_t res = strncpy_s(strategyDefaultConfig[numConfigs], STRATEGY_CONFIG_BUFFSIZE, zeroFreqMigrateEnableStr,
+                             zeroFreqStrLen);
+     if (res != EOK) {
+         SMAP_LOGGER_ERROR("Strncpy smap zero freq migrate enable failed.");
+         return RETURN_ERROR;
+     }
++    const char *adaptiveRatioEnableStr = "smap.adaptive.ratio.enable = true\n";
++    size_t adaptiveRatioStrLen = strlen(adaptiveRatioEnableStr);
++    res = strncpy_s(strategyDefaultConfig[numConfigs + 1], STRATEGY_CONFIG_BUFFSIZE, adaptiveRatioEnableStr,
++                    adaptiveRatioStrLen);
++    if (res != EOK) {
++        SMAP_LOGGER_ERROR("Strncpy smap adaptive ratio enable failed.");
++        return RETURN_ERROR;
++    }
+     const char *switchConfigStr = "smap.period.file.config.switch = false\n";
+     size_t configStrLen = strlen(switchConfigStr);
+-    res = strncpy_s(periodDefaultConfig[numConfigs + 1], PERIOD_CONFIG_BUFFSIZE, switchConfigStr, configStrLen);
++    res = strncpy_s(strategyDefaultConfig[numConfigs + 2], STRATEGY_CONFIG_BUFFSIZE, switchConfigStr, configStrLen);
+     if (res != EOK) {
+         SMAP_LOGGER_ERROR("Strncpy smap period switch failed.");
+         return RETURN_ERROR;
+@@ -661,11 +698,11 @@ static int32_t InitPeriodConfigFileBuffer(char periodDefaultConfig[PERIOD_CONFIG
+     return RETURN_OK;
+ }
+ 
+-int32_t GeneratePeriodConfigFile(const char *configFile)
++int32_t GenerateStrategyConfigFile(const char *configFile)
+ {
+-    InitPeriodConfig();
+-    char periodDefaultConfig[PERIOD_CONFIG_ENTRY][PERIOD_CONFIG_BUFFSIZE];
+-    int32_t res = InitPeriodConfigFileBuffer(periodDefaultConfig);
++    InitStrategyConfig();
++    char strategyDefaultConfig[STRATEGY_CONFIG_ENTRY][STRATEGY_CONFIG_BUFFSIZE];
++    int32_t res = InitStrategyConfigFileBuffer(strategyDefaultConfig);
+     if (res != RETURN_OK) {
+         return res;
+     }
+@@ -704,9 +741,9 @@ int32_t GeneratePeriodConfigFile(const char *configFile)
+         return RETURN_ERROR;
+     }
+ 
+-    size_t arraySize = sizeof(periodDefaultConfig) / sizeof(periodDefaultConfig[0]);
++    size_t arraySize = sizeof(strategyDefaultConfig) / sizeof(strategyDefaultConfig[0]);
+     for (size_t i = 0; i < arraySize; i++) {
+-        ret = dprintf(fd, periodDefaultConfig[i]);
++        ret = dprintf(fd, strategyDefaultConfig[i]);
+         if (ret < 0) {
+             SMAP_LOGGER_ERROR("Dprintf file %s error: %s.", configFile, strerror(errno));
+             (void)close(fd);
+@@ -718,7 +755,7 @@ int32_t GeneratePeriodConfigFile(const char *configFile)
+     return RETURN_OK;
+ }
+ 
+-static bool UpdatePeriodConfigChanged(void)
++static bool UpdateStrategyConfigChanged(void)
+ {
+     uint32_t oldScanPeriod, oldMigratePeriod, oldRemoteHotThreshold, scanPeriod, migratePeriod, remoteHotThreshold;
+     uint32_t oldRemoteFreqPercentile, oldSlowThreshold, remoteFreqPercentile, slowThreshold;
+@@ -726,47 +763,50 @@ static bool UpdatePeriodConfigChanged(void)
+     uint32_t groupSwapRatio, groupSwapMinRemoteFreq, groupSwapMinFreqGain;
+     uint64_t oldFreqWt, freqWt;
+     bool oldZeroFreqMigrateEnable, zeroFreqMigrateEnable;
++    bool oldAdaptiveRatioEnable, adaptiveRatioEnable;
+ 
+-    if (!g_tmpPeriodConfig.fileConfSwitch) {
++    if (!g_tmpStrategyConfig.fileConfSwitch) {
+         return false;
+     }
+ 
+-    oldScanPeriod = g_periodConfig.scanPeriod;
+-    oldMigratePeriod = g_periodConfig.migratePeriod;
+-    oldRemoteFreqPercentile = g_periodConfig.remoteFreqPercentile;
+-    oldSlowThreshold = g_periodConfig.slowThreshold;
+-    oldFreqWt = g_periodConfig.freqWt;
+-    oldRemoteHotThreshold = g_periodConfig.remoteHotThreshold;
+-    oldGroupSwapRatio = g_periodConfig.groupSwapRatio;
+-    oldGroupSwapMinRemoteFreq = g_periodConfig.groupSwapMinRemoteFreq;
+-    oldGroupSwapMinFreqGain = g_periodConfig.groupSwapMinFreqGain;
+-    oldZeroFreqMigrateEnable = g_periodConfig.zeroFreqMigrateEnable;
+-
+-    scanPeriod = g_tmpPeriodConfig.scanPeriod;
+-    migratePeriod = g_tmpPeriodConfig.migratePeriod;
+-    remoteFreqPercentile = g_tmpPeriodConfig.remoteFreqPercentile;
+-    slowThreshold = g_tmpPeriodConfig.slowThreshold;
+-    freqWt = g_tmpPeriodConfig.freqWt;
+-    remoteHotThreshold = g_tmpPeriodConfig.remoteHotThreshold;
+-    groupSwapRatio = g_tmpPeriodConfig.groupSwapRatio;
+-    groupSwapMinRemoteFreq = g_tmpPeriodConfig.groupSwapMinRemoteFreq;
+-    groupSwapMinFreqGain = g_tmpPeriodConfig.groupSwapMinFreqGain;
+-    zeroFreqMigrateEnable = g_tmpPeriodConfig.zeroFreqMigrateEnable;
++    oldScanPeriod = g_strategyConfig.scanPeriod;
++    oldMigratePeriod = g_strategyConfig.migratePeriod;
++    oldRemoteFreqPercentile = g_strategyConfig.remoteFreqPercentile;
++    oldSlowThreshold = g_strategyConfig.slowThreshold;
++    oldFreqWt = g_strategyConfig.freqWt;
++    oldRemoteHotThreshold = g_strategyConfig.remoteHotThreshold;
++    oldGroupSwapRatio = g_strategyConfig.groupSwapRatio;
++    oldGroupSwapMinRemoteFreq = g_strategyConfig.groupSwapMinRemoteFreq;
++    oldGroupSwapMinFreqGain = g_strategyConfig.groupSwapMinFreqGain;
++    oldZeroFreqMigrateEnable = g_strategyConfig.zeroFreqMigrateEnable;
++    oldAdaptiveRatioEnable = g_strategyConfig.adaptiveRatioEnable;
++
++    scanPeriod = g_tmpStrategyConfig.scanPeriod;
++    migratePeriod = g_tmpStrategyConfig.migratePeriod;
++    remoteFreqPercentile = g_tmpStrategyConfig.remoteFreqPercentile;
++    slowThreshold = g_tmpStrategyConfig.slowThreshold;
++    freqWt = g_tmpStrategyConfig.freqWt;
++    remoteHotThreshold = g_tmpStrategyConfig.remoteHotThreshold;
++    groupSwapRatio = g_tmpStrategyConfig.groupSwapRatio;
++    groupSwapMinRemoteFreq = g_tmpStrategyConfig.groupSwapMinRemoteFreq;
++    groupSwapMinFreqGain = g_tmpStrategyConfig.groupSwapMinFreqGain;
++    zeroFreqMigrateEnable = g_tmpStrategyConfig.zeroFreqMigrateEnable;
++    adaptiveRatioEnable = g_tmpStrategyConfig.adaptiveRatioEnable;
+ 
+     if (oldScanPeriod == scanPeriod && oldMigratePeriod == migratePeriod &&
+         oldRemoteHotThreshold == remoteHotThreshold && oldRemoteFreqPercentile == remoteFreqPercentile &&
+         oldSlowThreshold == slowThreshold && oldFreqWt == freqWt && oldGroupSwapRatio == groupSwapRatio &&
+         oldGroupSwapMinRemoteFreq == groupSwapMinRemoteFreq && oldGroupSwapMinFreqGain == groupSwapMinFreqGain &&
+-        oldZeroFreqMigrateEnable == zeroFreqMigrateEnable) {
++        oldZeroFreqMigrateEnable == zeroFreqMigrateEnable && oldAdaptiveRatioEnable == adaptiveRatioEnable) {
+         return false;
+     }
+ 
+     if (oldScanPeriod != scanPeriod) {
+-        g_tmpPeriodConfig.scanPeriodChanged = true;
++        g_tmpStrategyConfig.scanPeriodChanged = true;
+     }
+ 
+     if (oldMigratePeriod != migratePeriod) {
+-        g_tmpPeriodConfig.migratePeriodChanged = true;
++        g_tmpStrategyConfig.migratePeriodChanged = true;
+     }
+ 
+     if (oldRemoteFreqPercentile != remoteFreqPercentile) {
+@@ -799,13 +839,18 @@ static bool UpdatePeriodConfigChanged(void)
+ 
+     if (oldZeroFreqMigrateEnable != zeroFreqMigrateEnable) {
+         SMAP_LOGGER_INFO("Start update zero freq migrate enable from config to %s.",
+-                          zeroFreqMigrateEnable ? "true" : "false");
++                         zeroFreqMigrateEnable ? "true" : "false");
++    }
++
++    if (oldAdaptiveRatioEnable != adaptiveRatioEnable) {
++        SMAP_LOGGER_INFO("Start update adaptive ratio enable from config to %s.",
++                         adaptiveRatioEnable ? "true" : "false");
+     }
+ 
+     return true;
+ }
+ 
+-void PeriodConfigRead(const char *configFile)
++void StrategyConfigRead(const char *configFile)
+ {
+     int ret = ConfigReadReadFile(configFile);
+     if (ret != RETURN_OK) {
+@@ -814,17 +859,17 @@ void PeriodConfigRead(const char *configFile)
+         return;
+     }
+ 
+-    ret = PeriodConfigReview();
++    ret = StrategyConfigReview();
+     if (ret != RETURN_OK) {
+         PeriodConifgReset();
+         SMAP_LOGGER_ERROR("Review period config failed, ret(%d).", ret);
+         return;
+     }
+-    if (UpdatePeriodConfigChanged()) {
+-        g_periodConfig = g_tmpPeriodConfig;
++    if (UpdateStrategyConfigChanged()) {
++        g_strategyConfig = g_tmpStrategyConfig;
+     }
+     PeriodConifgReset();
+-    SMAP_LOGGER_DEBUG("Scan: %d, Migrate: %d, FileConfSwitch: %d.", g_periodConfig.scanPeriod,
+-                      g_periodConfig.migratePeriod, g_periodConfig.fileConfSwitch);
++    SMAP_LOGGER_DEBUG("Scan: %d, Migrate: %d, FileConfSwitch: %d.", g_strategyConfig.scanPeriod,
++                      g_strategyConfig.migratePeriod, g_strategyConfig.fileConfSwitch);
+     return;
+ }
+diff --git a/plugins/smap/src/user/strategy/period_config.h b/plugins/smap/src/user/strategy/strategy_config.h
+similarity index 87%
+rename from plugins/smap/src/user/strategy/period_config.h
+rename to plugins/smap/src/user/strategy/strategy_config.h
+index 26d7b0a..317540b 100644
+--- a/plugins/smap/src/user/strategy/period_config.h
++++ b/plugins/smap/src/user/strategy/strategy_config.h
+@@ -10,8 +10,8 @@
+  * See the Mulan PSL v2 for more details.
+  */
+ 
+-#ifndef PERIOD_CONFIG_H
+-#define PERIOD_CONFIG_H
++#ifndef STRATEGY_CONFIG_H
++#define STRATEGY_CONFIG_H
+ 
+ #include <stdint.h>
+ 
+@@ -47,9 +47,11 @@ uint32_t GetGroupSwapMinFreqGainConfig(void);
+ 
+ bool GetZeroFreqMigrateEnableConfig(void);
+ 
++bool GetAdaptiveRatioEnableConfig(void);
++
+ bool GetFileConfSwitchConfig(void);
+ 
+-int32_t GeneratePeriodConfigFile(const char *configFile);
++int32_t GenerateStrategyConfigFile(const char *configFile);
+ 
+ bool GetScanPeriodChanged(void);
+ 
+@@ -59,7 +61,7 @@ void SetScanPeriodChanged(bool val);
+ 
+ void SetMigratePeriodChanged(bool val);
+ 
+-void PeriodConfigRead(const char *configFile);
++void StrategyConfigRead(const char *configFile);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/plugins/smap/test/CMakeLists.txt b/plugins/smap/test/CMakeLists.txt
+index b2fe5d5..e3c0645 100644
+--- a/plugins/smap/test/CMakeLists.txt
++++ b/plugins/smap/test/CMakeLists.txt
+@@ -133,7 +133,7 @@ list(APPEND TEST_SRC ${SMAP_SRC}/src/user/manage/access_ioctl.c)
+ list(APPEND TEST_SRC ${SMAP_SRC}/src/user/manage/oom_migrate.c)
+ list(APPEND TEST_SRC ${SMAP_SRC}/src/user/manage/virt.c)
+ list(APPEND TEST_SRC ${SMAP_SRC}/src/user/manage/smap_config.c)
+-list(APPEND TEST_SRC ${SMAP_SRC}/src/user/strategy/period_config.c)
++list(APPEND TEST_SRC ${SMAP_SRC}/src/user/strategy/strategy_config.c)
+ list(APPEND TEST_SRC ${SMAP_SRC}/src/user/strategy/migration.c)
+ list(APPEND TEST_SRC ${SMAP_SRC}/src/user/strategy/separate_strategy.c)
+ list(APPEND TEST_SRC ${SMAP_SRC}/src/user/strategy/strategy.c)
+diff --git a/plugins/smap/test/user/advanced-strategy/SceneTest.cpp b/plugins/smap/test/user/advanced-strategy/SceneTest.cpp
+index 7e57d6d..52ad70e 100644
+--- a/plugins/smap/test/user/advanced-strategy/SceneTest.cpp
++++ b/plugins/smap/test/user/advanced-strategy/SceneTest.cpp
+@@ -533,8 +533,8 @@ TEST_F(SceneTest, TestConfigMultiVmRatioInGroupsTwo)
+     EXPECT_EQ(false, current.adaptMem.enableAdaptMem);
+ }
+ 
+-extern "C" void ConfigMultiProcessRatio(struct ProcessManager *manager);
+-TEST_F(SceneTest, TestConfigMultiProcessRatio)
++extern "C" void SkipMultiProcessRatio(struct ProcessManager *manager);
++TEST_F(SceneTest, TestSkipMultiProcessRatio)
+ {
+     struct ProcessManager manager = {};
+     ProcessAttr current = {};
+@@ -544,12 +544,14 @@ TEST_F(SceneTest, TestConfigMultiProcessRatio)
+     current.strategyAttr.l2RemoteMemRatio[0][0] = 30;
+     current.strategyAttr.l3RemoteMemRatio[0][0] = 10;
+ 
+-    ConfigMultiProcessRatio(&manager);
++    SkipMultiProcessRatio(&manager);
+     EXPECT_EQ(30, current.strategyAttr.l3RemoteMemRatio[0][0]);
+ }
+ 
+ extern "C" void ConfigRatios(struct ProcessManager *manager);
+-TEST_F(SceneTest, TestConfigRatios)
++extern "C" PidType GetPidType(struct ProcessManager *manager);
++extern "C" void ConfigMultiVmRatioInGroups(struct ProcessManager *manager);
++TEST_F(SceneTest, TestConfigRatiosProcessType)
+ {
+     struct ProcessManager manager = {};
+     ProcessAttr current = {};
+@@ -560,8 +562,39 @@ TEST_F(SceneTest, TestConfigRatios)
+     current.strategyAttr.l2RemoteMemRatio[0][0] = 30;
+     current.strategyAttr.l3RemoteMemRatio[0][0] = 10;
+ 
+-    ConfigMultiProcessRatio(&manager);
+-    EXPECT_EQ(30, current.strategyAttr.l3RemoteMemRatio[0][0]);
++    MOCKER(GetPidType).stubs().will(returnValue(PROCESS_TYPE));
++    MOCKER(SkipMultiProcessRatio).expects(once());
++    ConfigRatios(&manager);
++}
++
++TEST_F(SceneTest, TestConfigRatiosVmTypeAdaptMemTrue)
++{
++    struct ProcessManager manager = {};
++    ProcessAttr current = {};
++    manager.processes = &current;
++    manager.tracking.pageSize = PAGESIZE_4K;
++    current.next = NULL;
++
++    MOCKER(GetPidType).stubs().will(returnValue(VM_TYPE));
++    MOCKER(GetAdaptMem).stubs().will(returnValue(true));
++    MOCKER(ConfigMultiVmRatioInGroups).expects(once());
++    ConfigRatios(&manager);
++}
++
++TEST_F(SceneTest, TestConfigRatiosVmTypeAdaptMemFalse)
++{
++    struct ProcessManager manager = {};
++    ProcessAttr current = {};
++    manager.processes = &current;
++    manager.tracking.pageSize = PAGESIZE_4K;
++    current.next = NULL;
++    current.strategyAttr.l2RemoteMemRatio[0][0] = 30;
++    current.strategyAttr.l3RemoteMemRatio[0][0] = 10;
++
++    MOCKER(GetPidType).stubs().will(returnValue(VM_TYPE));
++    MOCKER(GetAdaptMem).stubs().will(returnValue(false));
++    MOCKER(SkipMultiProcessRatio).expects(once());
++    ConfigRatios(&manager);
+ }
+ 
+ extern "C" bool GetAdaptMem(void);
+diff --git a/plugins/smap/test/user/manage/ManageTest.cpp b/plugins/smap/test/user/manage/ManageTest.cpp
+index 486e3b4..9b5ee25 100644
+--- a/plugins/smap/test/user/manage/ManageTest.cpp
++++ b/plugins/smap/test/user/manage/ManageTest.cpp
+@@ -11,7 +11,7 @@
+ #include "manage/access_ioctl.h"
+ #include "manage/smap_config.h"
+ #include "manage/manage.h"
+-#include "strategy/period_config.h"
++#include "strategy/strategy_config.h"
+ #include "securec.h"
+ 
+ using namespace std;
+diff --git a/plugins/smap/test/user/strategy/GroupedStrategyTest.cpp b/plugins/smap/test/user/strategy/GroupedStrategyTest.cpp
+index b14e5ec..e72b71e 100644
+--- a/plugins/smap/test/user/strategy/GroupedStrategyTest.cpp
++++ b/plugins/smap/test/user/strategy/GroupedStrategyTest.cpp
+@@ -10,7 +10,7 @@
+ #include "manage/manage.h"
+ #include "strategy/strategy.h"
+ #include "strategy/grouped_strategy.h"
+-#include "strategy/period_config.h"
++#include "strategy/strategy_config.h"
+ 
+ class GroupedStrategyTest : public ::testing::Test {
+ protected:
+diff --git a/plugins/smap/test/user/strategy/MigrationTest.cpp b/plugins/smap/test/user/strategy/MigrationTest.cpp
+index e7d3015..2d8e1f6 100644
+--- a/plugins/smap/test/user/strategy/MigrationTest.cpp
++++ b/plugins/smap/test/user/strategy/MigrationTest.cpp
+@@ -13,7 +13,9 @@
+ #include "manage/thread.h"
+ #include "manage/device.h"
+ #include "advanced-strategy/scene_info.h"
++#include "advanced-strategy/scene.h"
+ #include "strategy/strategy.h"
++#include "strategy/strategy_config.h"
+ #include "strategy/migration.h"
+ 
+ using namespace std;
+@@ -356,7 +358,31 @@ extern "C" int ScanMigrateWork(ThreadCtx *ctx);
+ extern "C" int PerformMigration(struct ProcessManager *manager);
+ extern "C" int HandleScene(ThreadCtx *ctx);
+ extern "C" void UpdateScene(struct ProcessManager *manager);
+-TEST_F(MigrationTest, TestScanMigrateWork)
++extern "C" void UpdatePeriodFromConfig(ThreadCtx *ctx);
++TEST_F(MigrationTest, TestScanMigrateWorkFileConfOn)
++{
++    int ret;
++    ProcessAttr process = { .pid = 1025 };
++    struct ProcessManager manager = { .processes = &process };
++    ThreadCtx ctx = { .processManager = &manager };
++
++    MOCKER(DisableTracking).stubs().will(returnValue(0));
++    MOCKER(StrategyConfigRead).stubs().will(ignoreReturnValue());
++    MOCKER(GetFileConfSwitchConfig).stubs().will(returnValue(true));
++    MOCKER(SetAdaptMem).expects(once()).will(ignoreReturnValue());
++    MOCKER(GetAdaptiveRatioEnableConfig).stubs().will(returnValue(true));
++    MOCKER(CheckAndRemoveInvalidProcess).stubs();
++    MOCKER(PerformMigrationPreparation).stubs().will(returnValue(0));
++    MOCKER(UpdateScene).stubs();
++    MOCKER(EnvMutexLock).stubs().will(ignoreReturnValue());
++    MOCKER(EnvMutexUnlock).stubs().will(ignoreReturnValue());
++    MOCKER(UpdatePeriodFromConfig).stubs().will(ignoreReturnValue());
++    MOCKER(PerformMigration).stubs().will(returnValue(0));
++    ret = ScanMigrateWork(&ctx);
++    EXPECT_EQ(0, ret);
++}
++
++TEST_F(MigrationTest, TestScanMigrateWorkFileConfOff)
+ {
+     int ret;
+     ProcessAttr process = { .pid = 1025 };
+@@ -364,6 +390,8 @@ TEST_F(MigrationTest, TestScanMigrateWork)
+     ThreadCtx ctx = { .processManager = &manager };
+ 
+     MOCKER(DisableTracking).stubs().will(returnValue(0));
++    MOCKER(StrategyConfigRead).stubs().will(ignoreReturnValue());
++    MOCKER(GetFileConfSwitchConfig).stubs().will(returnValue(false));
+     MOCKER(CheckAndRemoveInvalidProcess).stubs();
+     MOCKER(PerformMigrationPreparation).stubs().will(returnValue(0));
+     MOCKER(UpdateScene).stubs();
+diff --git a/plugins/smap/test/user/strategy/SeparateStrategyTest.cpp b/plugins/smap/test/user/strategy/SeparateStrategyTest.cpp
+index fab80f4..3acb0fa 100644
+--- a/plugins/smap/test/user/strategy/SeparateStrategyTest.cpp
++++ b/plugins/smap/test/user/strategy/SeparateStrategyTest.cpp
+@@ -12,7 +12,7 @@
+ #include "manage/manage.h"
+ #include "strategy/strategy.h"
+ #include "strategy/separate_strategy.h"
+-#include "strategy/period_config.h"
++#include "strategy/strategy_config.h"
+ #include "smap_user_log.h"
+ 
+ #include "gtest/gtest.h"
+@@ -48,9 +48,10 @@ extern "C" int InitSeparateParam(ProcessAttr *process);
+ TEST_F(SeparateStrategyTest, TestInitSeparateParam)
+ {
+     ProcessAttr process;
++    MOCKER(GetSlowThresholdConfig).stubs().will(returnValue(40));
+     InitSeparateParam(&process);
+     EXPECT_EQ(DEFAULT_FREQ_WT_2M, process.separateParam.freqWt);
+-    EXPECT_EQ(DEFAULT_SLOW_THRED_2M, process.separateParam.slowThred);
++    EXPECT_EQ(40, process.separateParam.slowThred);
+ }
+ 
+ extern "C" bool ShouldMigrate(ProcessAttr *process);
+@@ -166,10 +167,81 @@ TEST_F(SeparateStrategyTest, TestCalcMigrateNumByFreqOne)
+     process.scanAttr.actcData[1] = actcDataL2;
+ 
+     MOCKER(GetNrFreeHugePagesByNode).stubs().will(returnValue(3));
++    MOCKER(GetZeroFreqMigrateEnableConfig).stubs().will(returnValue(true));
+     uint64_t ret = CalcMigrateNumByFreq(&process);
+     EXPECT_EQ(0, ret);
+ }
+ 
++TEST_F(SeparateStrategyTest, TestCalcMigrateNumByFreqZeroFreqDisabled)
++{
++    ProcessAttr process = {};
++
++    process.numaAttr.numaNodes = 0b00010001;
++    process.scanAttr.actcLen[0] = 3;
++    process.scanAttr.actcLen[4] = 3;
++    process.separateParam.maxMigrate = 4;
++    process.scanAttr.actCount[0].freqMax = 3;
++    process.scanAttr.actCount[4].freqMax = 5;
++    process.scanAttr.actCount[4].freqNum = 3;
++    process.separateParam.freqWt = 5;
++    process.separateParam.slowThred = 1;
++    process.enableSwap = true;
++
++    ActcData actcDataL1[3];
++    ActcData actcDataL2[3];
++    actcDataL1[0].freq = 0;
++    actcDataL1[1].freq = 2;
++    actcDataL1[2].freq = 3;
++
++    actcDataL2[0].freq = 5;
++    actcDataL2[1].freq = 2;
++    actcDataL2[2].freq = 3;
++    process.scanAttr.actcData[0] = actcDataL1;
++    process.scanAttr.actcData[4] = actcDataL2;
++
++    MOCKER(GetNrFreeHugePagesByNode).stubs().will(returnValue(4));
++    MOCKER(GetZeroFreqMigrateEnableConfig).stubs().will(returnValue(false));
++    uint64_t ret = CalcMigrateNumByFreq(&process);
++    // zero freq migrate disabled, freqL1=0 no longer triggers migration
++    // without slowThred condition, mid=1: freqL1=5*0=0, freqL2=5, 0+5<5 is false -> high=0
++    EXPECT_EQ(0, ret);
++}
++
++TEST_F(SeparateStrategyTest, TestCalcMigrateNumByFreqZeroFreqEnabled)
++{
++    ProcessAttr process = {};
++
++    process.numaAttr.numaNodes = 0b00010001;
++    process.scanAttr.actcLen[0] = 3;
++    process.scanAttr.actcLen[4] = 3;
++    process.separateParam.maxMigrate = 4;
++    process.scanAttr.actCount[0].freqMax = 3;
++    process.scanAttr.actCount[4].freqMax = 5;
++    process.scanAttr.actCount[4].freqNum = 3;
++    process.separateParam.freqWt = 5;
++    process.separateParam.slowThred = 1;
++    process.enableSwap = true;
++
++    ActcData actcDataL1[3];
++    ActcData actcDataL2[3];
++    actcDataL1[0].freq = 0;
++    actcDataL1[1].freq = 2;
++    actcDataL1[2].freq = 3;
++
++    actcDataL2[0].freq = 5;
++    actcDataL2[1].freq = 2;
++    actcDataL2[2].freq = 3;
++    process.scanAttr.actcData[0] = actcDataL1;
++    process.scanAttr.actcData[4] = actcDataL2;
++
++    MOCKER(GetNrFreeHugePagesByNode).stubs().will(returnValue(4));
++    MOCKER(GetZeroFreqMigrateEnableConfig).stubs().will(returnValue(true));
++    uint64_t ret = CalcMigrateNumByFreq(&process);
++    // zero freq migrate enabled, freqL1=0 && freqL2>0 triggers migration
++    // mid=1: freqL1=5*0=0, freqL2=5, (true && 0==0 && 5>0) is true -> low=1
++    EXPECT_EQ(1, ret);
++}
++
+ TEST_F(SeparateStrategyTest, TestCalcMigrateNumByFreqLowSmallerThanHigh)
+ {
+     ProcessAttr process = {};
+@@ -369,10 +441,10 @@ TEST_F(SeparateStrategyTest, TestSeparateStrategyall)
+ 
+ TEST_F(SeparateStrategyTest, TestPeriodConfig)
+ {
+-    int ret = GeneratePeriodConfigFile("./example2.config");
++    int ret = GenerateStrategyConfigFile("./example2.config");
+     EXPECT_EQ(0, ret);
+ 
+-    PeriodConfigRead("./example2.config");
++    StrategyConfigRead("./example2.config");
+ }
+ 
+ TEST_F(SeparateStrategyTest, TestShouldMigrate)
+diff --git a/plugins/smap/test/user/strategy/PeriodConfigTest.cpp b/plugins/smap/test/user/strategy/strategy_config.cpp
+similarity index 59%
+rename from plugins/smap/test/user/strategy/PeriodConfigTest.cpp
+rename to plugins/smap/test/user/strategy/strategy_config.cpp
+index b954537..05d4913 100644
+--- a/plugins/smap/test/user/strategy/PeriodConfigTest.cpp
++++ b/plugins/smap/test/user/strategy/strategy_config.cpp
+@@ -15,7 +15,7 @@
+ #include <unistd.h>
+ #include "smap_user_log.h"
+ #include "securec.h"
+-#include "strategy/period_config.h"
++#include "strategy/strategy_config.h"
+ 
+ using namespace std;
+ 
+@@ -36,7 +36,7 @@ protected:
+ 
+ constexpr int RETURN_ERROR = -1;
+ 
+-using PeriodConfigReadFunc = int32_t (*)(char*, char*);
++using StrategyConfigReadFunc = int32_t (*)(char*, char*);
+ 
+ typedef struct {
+     uint32_t scanPeriod;
+@@ -49,26 +49,27 @@ typedef struct {
+     uint32_t groupSwapMinRemoteFreq;
+     uint32_t groupSwapMinFreqGain;
+     bool zeroFreqMigrateEnable;
++    bool adaptiveRatioEnable;
+     bool fileConfSwitch;
+     bool scanPeriodChanged;
+     bool migratePeriodChanged;
+-} PeriodConfig;
++} StrategyConfig;
+ 
+ typedef struct {
+     char *substr;
+-    PeriodConfigReadFunc func;
++    StrategyConfigReadFunc func;
+     uint32_t needCfg;
+     uint32_t realCfg;
+-} PeriodConfigReadElem;
++} StrategyConfigReadElem;
+ 
+-extern "C" PeriodConfig g_tmpPeriodConfig;
+-extern "C" PeriodConfig g_periodConfig;
+-extern "C" PeriodConfigReadElem g_periodConfigRead[];
++extern "C" StrategyConfig g_tmpStrategyConfig;
++extern "C" StrategyConfig g_strategyConfig;
++extern "C" StrategyConfigReadElem g_strategyConfigRead[];
+ 
+ extern "C" uint32_t GetScanPeriodConfig(void);
+ TEST_F(PeriodConfigTest, GetScanPeriodConfigTest)
+ {
+-    g_periodConfig.scanPeriod = 1;
++    g_strategyConfig.scanPeriod = 1;
+     uint32_t ret = GetScanPeriodConfig();
+     EXPECT_EQ(1, ret);
+ }
+@@ -76,7 +77,7 @@ TEST_F(PeriodConfigTest, GetScanPeriodConfigTest)
+ extern "C" uint32_t GetMigratePeriodConfig(void);
+ TEST_F(PeriodConfigTest, GetMigratePeriodConfigTest)
+ {
+-    g_periodConfig.migratePeriod = 2;
++    g_strategyConfig.migratePeriod = 2;
+     uint32_t ret = GetMigratePeriodConfig();
+     EXPECT_EQ(2, ret);
+ }
+@@ -84,18 +85,29 @@ TEST_F(PeriodConfigTest, GetMigratePeriodConfigTest)
+ extern "C" bool GetZeroFreqMigrateEnableConfig(void);
+ TEST_F(PeriodConfigTest, GetZeroFreqMigrateEnableConfigTest)
+ {
+-    g_periodConfig.zeroFreqMigrateEnable = true;
++    g_strategyConfig.zeroFreqMigrateEnable = true;
+     bool ret = GetZeroFreqMigrateEnableConfig();
+     EXPECT_EQ(true, ret);
+-    g_periodConfig.zeroFreqMigrateEnable = false;
++    g_strategyConfig.zeroFreqMigrateEnable = false;
+     ret = GetZeroFreqMigrateEnableConfig();
+     EXPECT_EQ(false, ret);
+ }
+ 
++extern "C" bool GetAdaptiveRatioEnableConfig(void);
++TEST_F(PeriodConfigTest, GetAdaptiveRatioEnableConfigTest)
++{
++    g_strategyConfig.adaptiveRatioEnable = true;
++    bool ret = GetAdaptiveRatioEnableConfig();
++    EXPECT_EQ(true, ret);
++    g_strategyConfig.adaptiveRatioEnable = false;
++    ret = GetAdaptiveRatioEnableConfig();
++    EXPECT_EQ(false, ret);
++}
++
+ extern "C" bool GetFileConfSwitchConfig(void);
+ TEST_F(PeriodConfigTest, GetFileConfSwitchConfigTest)
+ {
+-    g_periodConfig.fileConfSwitch = true;
++    g_strategyConfig.fileConfSwitch = true;
+     bool ret = GetFileConfSwitchConfig();
+     EXPECT_EQ(true, ret);
+ }
+@@ -103,7 +115,7 @@ TEST_F(PeriodConfigTest, GetFileConfSwitchConfigTest)
+ extern "C" uint32_t GetGroupSwapRatioConfig(void);
+ TEST_F(PeriodConfigTest, GetGroupSwapRatioConfigTest)
+ {
+-    g_periodConfig.groupSwapRatio = 1;
++    g_strategyConfig.groupSwapRatio = 1;
+     uint32_t ret = GetGroupSwapRatioConfig();
+     EXPECT_EQ(1, ret);
+ }
+@@ -111,7 +123,7 @@ TEST_F(PeriodConfigTest, GetGroupSwapRatioConfigTest)
+ extern "C" uint32_t GetGroupSwapMinRemoteFreqConfig(void);
+ TEST_F(PeriodConfigTest, GetGroupSwapMinRemoteFreqConfigTest)
+ {
+-    g_periodConfig.groupSwapMinRemoteFreq = 5;
++    g_strategyConfig.groupSwapMinRemoteFreq = 5;
+     uint32_t ret = GetGroupSwapMinRemoteFreqConfig();
+     EXPECT_EQ(5, ret);
+ }
+@@ -119,7 +131,7 @@ TEST_F(PeriodConfigTest, GetGroupSwapMinRemoteFreqConfigTest)
+ extern "C" uint32_t GetGroupSwapMinFreqGainConfig(void);
+ TEST_F(PeriodConfigTest, GetGroupSwapMinFreqGainConfigTest)
+ {
+-    g_periodConfig.groupSwapMinFreqGain = 3;
++    g_strategyConfig.groupSwapMinFreqGain = 3;
+     uint32_t ret = GetGroupSwapMinFreqGainConfig();
+     EXPECT_EQ(3, ret);
+ }
+@@ -127,7 +139,7 @@ TEST_F(PeriodConfigTest, GetGroupSwapMinFreqGainConfigTest)
+ extern "C" bool GetScanPeriodChanged(void);
+ TEST_F(PeriodConfigTest, GetScanPeriodChangedTest)
+ {
+-    g_periodConfig.scanPeriodChanged = true;
++    g_strategyConfig.scanPeriodChanged = true;
+     bool ret = GetScanPeriodChanged();
+     EXPECT_EQ(true, ret);
+ }
+@@ -135,7 +147,7 @@ TEST_F(PeriodConfigTest, GetScanPeriodChangedTest)
+ extern "C" bool GetMigratePeriodChanged(void);
+ TEST_F(PeriodConfigTest, GetMigratePeriodChangedTest)
+ {
+-    g_periodConfig.migratePeriodChanged = true;
++    g_strategyConfig.migratePeriodChanged = true;
+     bool ret = GetMigratePeriodChanged();
+     EXPECT_EQ(true, ret);
+ }
+@@ -143,17 +155,17 @@ TEST_F(PeriodConfigTest, GetMigratePeriodChangedTest)
+ extern "C" void SetScanPeriodChanged(bool val);
+ TEST_F(PeriodConfigTest, SetScanPeriodChangedTest)
+ {
+-    g_periodConfig.scanPeriodChanged = true;
++    g_strategyConfig.scanPeriodChanged = true;
+     SetScanPeriodChanged(false);
+-    EXPECT_EQ(false, g_periodConfig.scanPeriodChanged);
++    EXPECT_EQ(false, g_strategyConfig.scanPeriodChanged);
+ }
+ 
+ extern "C" void SetMigratePeriodChanged(bool val);
+ TEST_F(PeriodConfigTest, SetMigratePeriodChangedTest)
+ {
+-    g_periodConfig.migratePeriodChanged = false;
++    g_strategyConfig.migratePeriodChanged = false;
+     SetMigratePeriodChanged(true);
+-    EXPECT_EQ(true, g_periodConfig.migratePeriodChanged);
++    EXPECT_EQ(true, g_strategyConfig.migratePeriodChanged);
+ }
+ 
+ extern "C" int32_t ConfigReadValueToInt(char *pvalue, uint32_t *resultvalue);
+@@ -182,12 +194,12 @@ TEST_F(PeriodConfigTest, ConfigScanPeriodTest)
+ 
+     char* substr2 = "scanPeriod";
+     char* value2 = "123";
+-    g_tmpPeriodConfig.scanPeriod = 0;
++    g_tmpStrategyConfig.scanPeriod = 0;
+     MOCKER(ConfigReadValueToInt).stubs().will(returnValue(0));
+     ret = ConfigScanPeriod(substr2, value2);
+     EXPECT_EQ(RETURN_ERROR, ret);
+ 
+-    g_tmpPeriodConfig.scanPeriod = 0;
++    g_tmpStrategyConfig.scanPeriod = 0;
+     MOCKER(ConfigReadValueToInt).stubs().will(returnValue(0));
+     ret = ConfigScanPeriod(substr2, value2);
+     EXPECT_EQ(RETURN_ERROR, ret);
+@@ -198,7 +210,7 @@ TEST_F(PeriodConfigTest, ConfigScanPeriodTestSuccess)
+     int ret;
+     char* substr2 = "scanPeriod";
+     char* value2 = "123";
+-    g_tmpPeriodConfig.scanPeriod = 100UL;
++    g_tmpStrategyConfig.scanPeriod = 100UL;
+     MOCKER(ConfigReadValueToInt).stubs().will(returnValue(0));
+     ret = ConfigScanPeriod(substr2, value2);
+     EXPECT_EQ(0, ret);
+@@ -213,13 +225,13 @@ TEST_F(PeriodConfigTest, ConfigMigratePeriodTest)
+     int32_t ret = ConfigMigratePeriod(substr, value);
+     EXPECT_EQ(-1, ret);
+ 
+-    g_tmpPeriodConfig.migratePeriod = 0;
++    g_tmpStrategyConfig.migratePeriod = 0;
+     GlobalMockObject::verify();
+     MOCKER(ConfigReadValueToInt).stubs().will(returnValue(0));
+     ret = ConfigMigratePeriod(substr, value);
+     EXPECT_EQ(RETURN_ERROR, ret);
+ 
+-    g_tmpPeriodConfig.migratePeriod = 1000;
++    g_tmpStrategyConfig.migratePeriod = 1000;
+     GlobalMockObject::verify();
+     MOCKER(ConfigReadValueToInt).stubs().will(returnValue(0));
+     ret = ConfigMigratePeriod(substr, value);
+@@ -235,17 +247,17 @@ TEST_F(PeriodConfigTest, ConfigRemoteFreqPercentileTest)
+     int32_t ret = ConfigRemoteFreqPercentile(substr, value);
+     EXPECT_EQ(-1, ret);
+ 
+-    g_tmpPeriodConfig.remoteFreqPercentile = 0;
++    g_tmpStrategyConfig.remoteFreqPercentile = 0;
+     GlobalMockObject::verify();
+     ret = ConfigRemoteFreqPercentile(substr, value);
+     EXPECT_EQ(RETURN_ERROR, ret);
+-    EXPECT_EQ(101, g_tmpPeriodConfig.remoteFreqPercentile);
++    EXPECT_EQ(101, g_tmpStrategyConfig.remoteFreqPercentile);
+ 
+     GlobalMockObject::verify();
+     char *value1 = "100";
+     ret = ConfigRemoteFreqPercentile(substr, value1);
+     EXPECT_EQ(0, ret);
+-    EXPECT_EQ(100, g_tmpPeriodConfig.remoteFreqPercentile);
++    EXPECT_EQ(100, g_tmpStrategyConfig.remoteFreqPercentile);
+ }
+ 
+ extern "C" int32_t ConfigSlowThreshold(char *substr, char *value);
+@@ -257,17 +269,17 @@ TEST_F(PeriodConfigTest, ConfigSlowThresholdTest)
+     int32_t ret = ConfigSlowThreshold(substr, value);
+     EXPECT_EQ(-1, ret);
+ 
+-    g_tmpPeriodConfig.slowThreshold = 0;
++    g_tmpStrategyConfig.slowThreshold = 0;
+     GlobalMockObject::verify();
+     ret = ConfigSlowThreshold(substr, value);
+     EXPECT_EQ(RETURN_ERROR, ret);
+-    EXPECT_EQ(1201, g_tmpPeriodConfig.slowThreshold);
++    EXPECT_EQ(1201, g_tmpStrategyConfig.slowThreshold);
+ 
+     GlobalMockObject::verify();
+     char *value1 = "40";
+     ret = ConfigSlowThreshold(substr, value1);
+     EXPECT_EQ(0, ret);
+-    EXPECT_EQ(40, g_tmpPeriodConfig.slowThreshold);
++    EXPECT_EQ(40, g_tmpStrategyConfig.slowThreshold);
+ }
+ 
+ extern "C" int32_t ConfigFreqWt(char *substr, char *value);
+@@ -279,17 +291,17 @@ TEST_F(PeriodConfigTest, ConfigFreqWtTest)
+     int32_t ret = ConfigFreqWt(substr, value);
+     EXPECT_EQ(-1, ret);
+ 
+-    g_tmpPeriodConfig.freqWt = 0;
++    g_tmpStrategyConfig.freqWt = 0;
+     GlobalMockObject::verify();
+     ret = ConfigFreqWt(substr, value);
+     EXPECT_EQ(RETURN_ERROR, ret);
+-    EXPECT_EQ(0, g_tmpPeriodConfig.freqWt);
++    EXPECT_EQ(0, g_tmpStrategyConfig.freqWt);
+ 
+     GlobalMockObject::verify();
+     char *value1 = "40";
+     ret = ConfigFreqWt(substr, value1);
+     EXPECT_EQ(0, ret);
+-    EXPECT_EQ(40, g_tmpPeriodConfig.freqWt);
++    EXPECT_EQ(40, g_tmpStrategyConfig.freqWt);
+ }
+ 
+ extern "C" int32_t ConfigZeroFreqMigrateEnable(char *substr, char *value);
+@@ -297,15 +309,15 @@ TEST_F(PeriodConfigTest, ConfigZeroFreqMigrateEnableTest)
+ {
+     char *substr = "test";
+     char *value1 = "true";
+-    g_tmpPeriodConfig.zeroFreqMigrateEnable = false;
++    g_tmpStrategyConfig.zeroFreqMigrateEnable = false;
+     int32_t ret = ConfigZeroFreqMigrateEnable(substr, value1);
+-    EXPECT_EQ(true, g_tmpPeriodConfig.zeroFreqMigrateEnable);
++    EXPECT_EQ(true, g_tmpStrategyConfig.zeroFreqMigrateEnable);
+     EXPECT_EQ(0, ret);
+ 
+     char *value2 = "false";
+-    g_tmpPeriodConfig.zeroFreqMigrateEnable = true;
++    g_tmpStrategyConfig.zeroFreqMigrateEnable = true;
+     ret = ConfigZeroFreqMigrateEnable(substr, value2);
+-    EXPECT_EQ(false, g_tmpPeriodConfig.zeroFreqMigrateEnable);
++    EXPECT_EQ(false, g_tmpStrategyConfig.zeroFreqMigrateEnable);
+     EXPECT_EQ(0, ret);
+ 
+     char *value3 = "test";
+@@ -313,6 +325,27 @@ TEST_F(PeriodConfigTest, ConfigZeroFreqMigrateEnableTest)
+     EXPECT_EQ(-1, ret);
+ }
+ 
++extern "C" int32_t ConfigAdaptiveRatioEnable(char *substr, char *value);
++TEST_F(PeriodConfigTest, ConfigAdaptiveRatioEnableTest)
++{
++    char *substr = "test";
++    char *value1 = "true";
++    g_tmpStrategyConfig.adaptiveRatioEnable = false;
++    int32_t ret = ConfigAdaptiveRatioEnable(substr, value1);
++    EXPECT_EQ(true, g_tmpStrategyConfig.adaptiveRatioEnable);
++    EXPECT_EQ(0, ret);
++
++    char *value2 = "false";
++    g_tmpStrategyConfig.adaptiveRatioEnable = true;
++    ret = ConfigAdaptiveRatioEnable(substr, value2);
++    EXPECT_EQ(false, g_tmpStrategyConfig.adaptiveRatioEnable);
++    EXPECT_EQ(0, ret);
++
++    char *value3 = "test";
++    ret = ConfigAdaptiveRatioEnable(substr, value3);
++    EXPECT_EQ(-1, ret);
++}
++
+ extern "C" int32_t ConfigFileConfSwitch(char *substr, char *value);
+ extern "C" int32_t ConfigGroupSwapRatio(char *substr, char *value);
+ TEST_F(PeriodConfigTest, ConfigGroupSwapRatioTest)
+@@ -323,17 +356,17 @@ TEST_F(PeriodConfigTest, ConfigGroupSwapRatioTest)
+     int32_t ret = ConfigGroupSwapRatio(substr, value);
+     EXPECT_EQ(-1, ret);
+ 
+-    g_tmpPeriodConfig.groupSwapRatio = 101;
++    g_tmpStrategyConfig.groupSwapRatio = 101;
+     GlobalMockObject::verify();
+     ret = ConfigGroupSwapRatio(substr, value);
+     EXPECT_EQ(RETURN_ERROR, ret);
+-    EXPECT_EQ(101, g_tmpPeriodConfig.groupSwapRatio);
++    EXPECT_EQ(101, g_tmpStrategyConfig.groupSwapRatio);
+ 
+     GlobalMockObject::verify();
+     char *value1 = "1";
+     ret = ConfigGroupSwapRatio(substr, value1);
+     EXPECT_EQ(0, ret);
+-    EXPECT_EQ(1, g_tmpPeriodConfig.groupSwapRatio);
++    EXPECT_EQ(1, g_tmpStrategyConfig.groupSwapRatio);
+ }
+ 
+ extern "C" int32_t ConfigGroupSwapMinRemoteFreq(char *substr, char *value);
+@@ -345,17 +378,17 @@ TEST_F(PeriodConfigTest, ConfigGroupSwapMinRemoteFreqTest)
+     int32_t ret = ConfigGroupSwapMinRemoteFreq(substr, value);
+     EXPECT_EQ(-1, ret);
+ 
+-    g_tmpPeriodConfig.groupSwapMinRemoteFreq = 65536;
++    g_tmpStrategyConfig.groupSwapMinRemoteFreq = 65536;
+     GlobalMockObject::verify();
+     ret = ConfigGroupSwapMinRemoteFreq(substr, value);
+     EXPECT_EQ(RETURN_ERROR, ret);
+-    EXPECT_EQ(65536, g_tmpPeriodConfig.groupSwapMinRemoteFreq);
++    EXPECT_EQ(65536, g_tmpStrategyConfig.groupSwapMinRemoteFreq);
+ 
+     GlobalMockObject::verify();
+     char *value1 = "5";
+     ret = ConfigGroupSwapMinRemoteFreq(substr, value1);
+     EXPECT_EQ(0, ret);
+-    EXPECT_EQ(5, g_tmpPeriodConfig.groupSwapMinRemoteFreq);
++    EXPECT_EQ(5, g_tmpStrategyConfig.groupSwapMinRemoteFreq);
+ }
+ 
+ extern "C" int32_t ConfigGroupSwapMinFreqGain(char *substr, char *value);
+@@ -367,31 +400,31 @@ TEST_F(PeriodConfigTest, ConfigGroupSwapMinFreqGainTest)
+     int32_t ret = ConfigGroupSwapMinFreqGain(substr, value);
+     EXPECT_EQ(-1, ret);
+ 
+-    g_tmpPeriodConfig.groupSwapMinFreqGain = 65536;
++    g_tmpStrategyConfig.groupSwapMinFreqGain = 65536;
+     GlobalMockObject::verify();
+     ret = ConfigGroupSwapMinFreqGain(substr, value);
+     EXPECT_EQ(RETURN_ERROR, ret);
+-    EXPECT_EQ(65536, g_tmpPeriodConfig.groupSwapMinFreqGain);
++    EXPECT_EQ(65536, g_tmpStrategyConfig.groupSwapMinFreqGain);
+ 
+     GlobalMockObject::verify();
+     char *value1 = "3";
+     ret = ConfigGroupSwapMinFreqGain(substr, value1);
+     EXPECT_EQ(0, ret);
+-    EXPECT_EQ(3, g_tmpPeriodConfig.groupSwapMinFreqGain);
++    EXPECT_EQ(3, g_tmpStrategyConfig.groupSwapMinFreqGain);
+ }
+ 
+ TEST_F(PeriodConfigTest, ConfigFileConfSwitchTest)
+ {
+     char* substr = "test";
+     char* value1 = "true";
+-    g_tmpPeriodConfig.fileConfSwitch = false;
++    g_tmpStrategyConfig.fileConfSwitch = false;
+     int32_t ret = ConfigFileConfSwitch(substr, value1);
+-    EXPECT_EQ(true, g_tmpPeriodConfig.fileConfSwitch);
++    EXPECT_EQ(true, g_tmpStrategyConfig.fileConfSwitch);
+ 
+     char* value2 = "false";
+-    g_tmpPeriodConfig.fileConfSwitch = true;
++    g_tmpStrategyConfig.fileConfSwitch = true;
+     ret = ConfigFileConfSwitch(substr, value2);
+-    EXPECT_EQ(false, g_tmpPeriodConfig.fileConfSwitch);
++    EXPECT_EQ(false, g_tmpStrategyConfig.fileConfSwitch);
+ 
+     char* value3 = "test";
+     ret = ConfigFileConfSwitch(substr, value3);
+@@ -420,12 +453,12 @@ TEST_F(PeriodConfigTest, ConfigReadSearchSubStringTest)
+     EXPECT_EQ('2', res[0]);
+ }
+ 
+-extern "C" int PeriodConfigAnalyze(const char *str);
++extern "C" int StrategyConfigAnalyze(const char *str);
+ TEST_F(PeriodConfigTest, PeriodConfigAnalyzeTest)
+ {
+     char *str = "smap";
+     MOCKER(ConfigReadSearchSubString).stubs().will(returnValue(static_cast<char *>(nullptr)));
+-    uint32_t ret = PeriodConfigAnalyze(str);
++    uint32_t ret = StrategyConfigAnalyze(str);
+     EXPECT_EQ(0, ret);
+ }
+ 
+@@ -445,27 +478,27 @@ TEST_F(PeriodConfigTest, ConfigReadByLineTest)
+ }
+ 
+ extern "C" int ConfigReadReadFile(const char *configFile);
+-extern "C" int32_t PeriodConfigReview(void);
++extern "C" int32_t StrategyConfigReview(void);
+ TEST_F(PeriodConfigTest, PeriodConfigReviewTest)
+ {
+-    g_periodConfigRead[0].needCfg = 1UL;
+-    g_periodConfigRead[0].realCfg = 0UL;
+-    int32_t ret = PeriodConfigReview();
++    g_strategyConfigRead[0].needCfg = 1UL;
++    g_strategyConfigRead[0].realCfg = 0UL;
++    int32_t ret = StrategyConfigReview();
+     EXPECT_EQ(-1, ret);
+ 
+-    uint32_t num = 11;
++    uint32_t num = 12;
+     for (int i = 0; i < num; i++) {
+-        g_periodConfigRead[i].needCfg = 2UL;
+-        g_periodConfigRead[i].realCfg = 2UL;
++        g_strategyConfigRead[i].needCfg = 2UL;
++        g_strategyConfigRead[i].realCfg = 2UL;
+     }
+-    g_tmpPeriodConfig.scanPeriod = 1000;
+-    g_tmpPeriodConfig.migratePeriod = 500;
+-    ret = PeriodConfigReview();
++    g_tmpStrategyConfig.scanPeriod = 1000;
++    g_tmpStrategyConfig.migratePeriod = 500;
++    ret = StrategyConfigReview();
+     EXPECT_EQ(-1, ret);
+ 
+-    g_tmpPeriodConfig.scanPeriod = 500;
+-    g_tmpPeriodConfig.migratePeriod = 1000;
+-    ret = PeriodConfigReview();
++    g_tmpStrategyConfig.scanPeriod = 500;
++    g_tmpStrategyConfig.migratePeriod = 1000;
++    ret = StrategyConfigReview();
+     EXPECT_EQ(0, ret);
+ }
+ 
+@@ -473,31 +506,32 @@ extern "C" void PeriodConifgReset(void);
+ TEST_F(PeriodConfigTest, PeriodConifgResetTest)
+ {
+     for (int i = 0; i < 3; i++) {
+-        g_periodConfigRead[i].realCfg = 1;
++        g_strategyConfigRead[i].realCfg = 1;
+     }
+     PeriodConifgReset();
+-    EXPECT_EQ(0, g_periodConfigRead[0].realCfg);
++    EXPECT_EQ(0, g_strategyConfigRead[0].realCfg);
+ }
+ 
+-extern "C" void InitPeriodConfig(void);
++extern "C" void InitStrategyConfig(void);
+ TEST_F(PeriodConfigTest, InitPeriodConfigTest)
+ {
+-    g_periodConfig.scanPeriod = 10;
+-    g_periodConfig.migratePeriod = 10;
+-    g_periodConfig.fileConfSwitch = true;
+-    g_periodConfig.scanPeriodChanged = true;
+-    g_periodConfig.migratePeriodChanged = true;
+-
+-    InitPeriodConfig();
+-    EXPECT_EQ(200, g_periodConfig.scanPeriod);
+-    EXPECT_EQ(2000, g_periodConfig.migratePeriod);
+-    EXPECT_EQ(1, g_periodConfig.groupSwapRatio);
+-    EXPECT_EQ(0, g_periodConfig.groupSwapMinRemoteFreq);
+-    EXPECT_EQ(0, g_periodConfig.groupSwapMinFreqGain);
+-    EXPECT_EQ(true, g_periodConfig.zeroFreqMigrateEnable);
+-    EXPECT_EQ(false, g_periodConfig.fileConfSwitch);
+-    EXPECT_EQ(false, g_periodConfig.scanPeriodChanged);
+-    EXPECT_EQ(false, g_periodConfig.migratePeriodChanged);
++    g_strategyConfig.scanPeriod = 10;
++    g_strategyConfig.migratePeriod = 10;
++    g_strategyConfig.fileConfSwitch = true;
++    g_strategyConfig.scanPeriodChanged = true;
++    g_strategyConfig.migratePeriodChanged = true;
++
++    InitStrategyConfig();
++    EXPECT_EQ(200, g_strategyConfig.scanPeriod);
++    EXPECT_EQ(2000, g_strategyConfig.migratePeriod);
++    EXPECT_EQ(1, g_strategyConfig.groupSwapRatio);
++    EXPECT_EQ(0, g_strategyConfig.groupSwapMinRemoteFreq);
++    EXPECT_EQ(0, g_strategyConfig.groupSwapMinFreqGain);
++    EXPECT_EQ(true, g_strategyConfig.zeroFreqMigrateEnable);
++    EXPECT_EQ(true, g_strategyConfig.adaptiveRatioEnable);
++    EXPECT_EQ(false, g_strategyConfig.fileConfSwitch);
++    EXPECT_EQ(false, g_strategyConfig.scanPeriodChanged);
++    EXPECT_EQ(false, g_strategyConfig.migratePeriodChanged);
+ }
+ 
+ extern "C" int32_t EnsureDirectoryExists(const char *dirPath);
+@@ -511,46 +545,108 @@ TEST_F(PeriodConfigTest, TestEnsureDirectoryExists)
+     EXPECT_EQ(-1, ret);
+ }
+ 
+-extern "C" bool UpdatePeriodConfigChanged(void);
++extern "C" bool UpdateStrategyConfigChanged(void);
+ TEST_F(PeriodConfigTest, TestUpdatePeriodConfigChanged)
+ {
+-    g_tmpPeriodConfig.fileConfSwitch = true;
+-    g_periodConfig.scanPeriod = 500;
+-    g_periodConfig.migratePeriod = 1000;
+-    g_tmpPeriodConfig.scanPeriod = 1500;
+-    g_tmpPeriodConfig.migratePeriod = 2000;
++    g_tmpStrategyConfig.fileConfSwitch = true;
++    g_strategyConfig.scanPeriod = 500;
++    g_strategyConfig.migratePeriod = 1000;
++    g_tmpStrategyConfig.scanPeriod = 1500;
++    g_tmpStrategyConfig.migratePeriod = 2000;
++
++    bool ret = UpdateStrategyConfigChanged();
++    EXPECT_EQ(true, ret);
++}
++
++TEST_F(PeriodConfigTest, TestUpdatePeriodConfigChangedNoChange)
++{
++    g_tmpStrategyConfig.fileConfSwitch = true;
++    g_strategyConfig.scanPeriod = 500;
++    g_strategyConfig.migratePeriod = 1000;
++    g_strategyConfig.remoteHotThreshold = 10;
++    g_strategyConfig.remoteFreqPercentile = 95;
++    g_strategyConfig.slowThreshold = 40;
++    g_strategyConfig.freqWt = 5;
++    g_strategyConfig.groupSwapRatio = 1;
++    g_strategyConfig.groupSwapMinRemoteFreq = 5;
++    g_strategyConfig.groupSwapMinFreqGain = 3;
++    g_strategyConfig.zeroFreqMigrateEnable = true;
++    g_strategyConfig.adaptiveRatioEnable = true;
++    g_tmpStrategyConfig.scanPeriod = 500;
++    g_tmpStrategyConfig.migratePeriod = 1000;
++    g_tmpStrategyConfig.remoteHotThreshold = 10;
++    g_tmpStrategyConfig.remoteFreqPercentile = 95;
++    g_tmpStrategyConfig.slowThreshold = 40;
++    g_tmpStrategyConfig.freqWt = 5;
++    g_tmpStrategyConfig.groupSwapRatio = 1;
++    g_tmpStrategyConfig.groupSwapMinRemoteFreq = 5;
++    g_tmpStrategyConfig.groupSwapMinFreqGain = 3;
++    g_tmpStrategyConfig.zeroFreqMigrateEnable = true;
++    g_tmpStrategyConfig.adaptiveRatioEnable = true;
++
++    bool ret = UpdateStrategyConfigChanged();
++    EXPECT_EQ(false, ret);
++}
++
++TEST_F(PeriodConfigTest, TestUpdatePeriodConfigChangedZeroFreqChanged)
++{
++    g_tmpStrategyConfig.fileConfSwitch = true;
++    g_strategyConfig.scanPeriod = 500;
++    g_strategyConfig.migratePeriod = 1000;
++    g_strategyConfig.zeroFreqMigrateEnable = true;
++    g_strategyConfig.adaptiveRatioEnable = true;
++    g_tmpStrategyConfig.scanPeriod = 500;
++    g_tmpStrategyConfig.migratePeriod = 1000;
++    g_tmpStrategyConfig.zeroFreqMigrateEnable = false;
++    g_tmpStrategyConfig.adaptiveRatioEnable = true;
++
++    bool ret = UpdateStrategyConfigChanged();
++    EXPECT_EQ(true, ret);
++}
++
++TEST_F(PeriodConfigTest, TestUpdatePeriodConfigChangedAdaptiveRatioChanged)
++{
++    g_tmpStrategyConfig.fileConfSwitch = true;
++    g_strategyConfig.scanPeriod = 500;
++    g_strategyConfig.migratePeriod = 1000;
++    g_strategyConfig.zeroFreqMigrateEnable = true;
++    g_strategyConfig.adaptiveRatioEnable = true;
++    g_tmpStrategyConfig.scanPeriod = 500;
++    g_tmpStrategyConfig.migratePeriod = 1000;
++    g_tmpStrategyConfig.zeroFreqMigrateEnable = true;
++    g_tmpStrategyConfig.adaptiveRatioEnable = false;
+ 
+-    bool ret = UpdatePeriodConfigChanged();
++    bool ret = UpdateStrategyConfigChanged();
+     EXPECT_EQ(true, ret);
+ }
+ 
+-extern "C" void PeriodConfigRead(const char *configFile);
++extern "C" void StrategyConfigRead(const char *configFile);
+ TEST_F(PeriodConfigTest, PeriodConfigReadTestReadFileFailed)
+ {
+     const char *configFile = "/test";
+     MOCKER(ConfigReadReadFile).stubs().will(returnValue(-1));
+     MOCKER(PeriodConifgReset).stubs().will(ignoreReturnValue());
+ 
+-    PeriodConfigRead(configFile);
++    StrategyConfigRead(configFile);
+ }
+ 
+ TEST_F(PeriodConfigTest, PeriodConfigReadTestConfigReviewFailed)
+ {
+     const char *configFile = "/test";
+     MOCKER(ConfigReadReadFile).stubs().will(returnValue(0));
+-    MOCKER(PeriodConfigReview).stubs().will(returnValue(-1));
++    MOCKER(StrategyConfigReview).stubs().will(returnValue(-1));
+     MOCKER(PeriodConifgReset).stubs().will(ignoreReturnValue());
+ 
+-    PeriodConfigRead(configFile);
++    StrategyConfigRead(configFile);
+ }
+ 
+ TEST_F(PeriodConfigTest, PeriodConfigReadTestSuccess)
+ {
+     const char *configFile = "/test";
+     MOCKER(ConfigReadReadFile).stubs().will(returnValue(0));
+-    MOCKER(PeriodConfigReview).stubs().will(returnValue(0));
+-    MOCKER(UpdatePeriodConfigChanged).stubs().will(returnValue(false));
++    MOCKER(StrategyConfigReview).stubs().will(returnValue(0));
++    MOCKER(UpdateStrategyConfigChanged).stubs().will(returnValue(false));
+     MOCKER(PeriodConifgReset).stubs().will(ignoreReturnValue());
+ 
+-    PeriodConfigRead(configFile);
++    StrategyConfigRead(configFile);
+ }
+-- 
+2.53.0.windows.3
+

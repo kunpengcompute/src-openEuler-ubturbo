@@ -1,0 +1,86 @@
+From b6835d32e92ec8588ce15094d669c896c8d755a7 Mon Sep 17 00:00:00 2001
+From: discrete_brain <discrete_brain@163.com>
+Date: Tue, 9 Jun 2026 16:08:10 +0800
+Subject: [PATCH 20/71] fix: fix calculation bug for processes in
+ MIG_MEMSIZE_MODE under waterline mode when migrating remote numa
+
+---
+ plugins/smap/src/user/manage/manage.c  | 16 +++++++++++++++-
+ plugins/smap/src/user/smap_interface.c | 13 +++++++++++--
+ 2 files changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/plugins/smap/src/user/manage/manage.c b/plugins/smap/src/user/manage/manage.c
+index a59ebfd..41575a0 100644
+--- a/plugins/smap/src/user/manage/manage.c
++++ b/plugins/smap/src/user/manage/manage.c
+@@ -2351,14 +2351,23 @@ static void ChangePidRemoteMemory(ProcessAttr *attr, int srcNodeIndex, int destN
+     int l1node;
+     if (GetRunMode() == WATERLINE_MODE) {
+         l1node = GetAttrL1(attr);
+-        if (ratio >= attr->strategyAttr.initRemoteMemRatio[l1node][srcNodeIndex]) {
++        if (attr->migrateMode == MIG_MEMSIZE_MODE) {
+             ClearNodeBit(&attr->numaAttr.numaNodes, srcNodeIndex + LOCAL_NUMA_BITS);
++            attr->migrateParam[0].nid = destNodeIndex + nrLocalNuma;
++        } else {
++            if (ratio >= attr->strategyAttr.initRemoteMemRatio[l1node][srcNodeIndex]) {
++                ClearNodeBit(&attr->numaAttr.numaNodes, srcNodeIndex + LOCAL_NUMA_BITS);
++            }
+         }
+         for (int i = 0; i < g_processManager.nrLocalNuma; i++) {
+             attr->strategyAttr.initRemoteMemRatio[i][destNodeIndex] += ratio;
+             attr->strategyAttr.initRemoteMemRatio[i][srcNodeIndex] -= ratio;
+             attr->strategyAttr.memSize[i][destNodeIndex] = attr->strategyAttr.memSize[i][srcNodeIndex];
+             attr->strategyAttr.memSize[i][srcNodeIndex] = 0;
++
++            SMAP_LOGGER_INFO("[change_remote] pid=%d local=%d old_remote=%d new_remote=%d old_sz=%llu new_sz=%llu",
++                             attr->pid, i, srcNodeIndex, destNodeIndex, attr->strategyAttr.memSize[i][srcNodeIndex],
++                             attr->strategyAttr.memSize[i][destNodeIndex]);
+         }
+     } else if (GetRunMode() == MEM_POOL_MODE) {
+         uint64_t srcMemSize = 0;
+@@ -2386,6 +2395,11 @@ static void ChangePidRemoteMemory(ProcessAttr *attr, int srcNodeIndex, int destN
+     }
+ 
+     AddAttrL2(attr, destNodeIndex + nrLocalNuma);
++
++    if (GetRunMode() == WATERLINE_MODE && attr->migrateMode == MIG_MEMSIZE_MODE) {
++        return;
++    }
++
+     attr->remoteNumaCnt = GetL2Count(attr->numaAttr.numaNodes);
+     SMAP_LOGGER_INFO("========= remoteNumaCnt %d", attr->remoteNumaCnt);
+     int targetIdx = -1;
+diff --git a/plugins/smap/src/user/smap_interface.c b/plugins/smap/src/user/smap_interface.c
+index 49492a7..46ee29e 100644
+--- a/plugins/smap/src/user/smap_interface.c
++++ b/plugins/smap/src/user/smap_interface.c
+@@ -2816,7 +2816,7 @@ static int SmapMigratePidRemoteNumaCheck(struct MigrateEscapeMsg *msg)
+ 
+     for (int i = 0; i < msg->count; i++) {
+         if (msg->payload[i].srcNid == msg->payload[i].destNid) {
+-            SMAP_LOGGER_ERROR("srcNid must not equal destNid.");
++            SMAP_LOGGER_ERROR("[%d] srcNid == destNid == %d", i, msg->payload[i].srcNid);
+             return -EINVAL;
+         }
+         if (!IsOnlineRemoteNidValid(msg->payload[i].srcNid)) {
+@@ -2889,7 +2889,16 @@ static int BuildMigRemoteNumaMsg(struct MigrateEscapeMsg *msg, struct MigPidRemo
+         int srcRatio = GetAttrNidInitRatio(msg->payload[i].pid, msg->payload[i].srcNid);
+         ioctlMsg->payloads[i].keepRatio = srcRatio - msg->payload[i].ratio;
+         ioctlMsg->payloads[i].memSize = msg->payload[i].memSize;
+-        ioctlMsg->payloads[i].isRatioMode = GetRunMode() == WATERLINE_MODE ? true : false;
++        if (GetRunMode() == WATERLINE_MODE && msg->payload[i].ratio != 0) {
++            ioctlMsg->payloads[i].isRatioMode = true;
++        } else {
++            ioctlMsg->payloads[i].isRatioMode = false;
++        }
++
++        SMAP_LOGGER_INFO("[escape_msg] pid=%d from=%d to=%d ratio=%d keep_ratio=%d memsize=%llu is_ratio_mode=%d",
++                         msg->payload[i].pid, msg->payload[i].srcNid, msg->payload[i].destNid, msg->payload[i].ratio,
++                         ioctlMsg->payloads[i].keepRatio, ioctlMsg->payloads[i].memSize,
++                         ioctlMsg->payloads[i].isRatioMode);
+     }
+     return 0;
+ }
+-- 
+2.53.0.windows.3
+

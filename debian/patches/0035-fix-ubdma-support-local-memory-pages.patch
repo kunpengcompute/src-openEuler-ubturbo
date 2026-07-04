@@ -1,0 +1,910 @@
+From 6b5ded5b559a1c4d4aac0c8648030642274673f5 Mon Sep 17 00:00:00 2001
+From: jamesricado <825511311@qq.com>
+Date: Mon, 15 Jun 2026 23:10:41 +0800
+Subject: [PATCH 35/71] fix:ubdma support local memory pages
+
+---
+ plugins/smap/src/tiering/Makefile             |  4 +
+ plugins/smap/src/tiering/critical.h           | 15 ++++
+ plugins/smap/src/tiering/mig_init.c           |  3 +
+ plugins/smap/src/tiering/smap_migrate_pages.c |  7 +-
+ plugins/smap/src/tiering/tracking_manage.c    |  3 +
+ plugins/smap/src/user/manage/access_ioctl.c   | 15 ++++
+ plugins/smap/src/user/manage/access_ioctl.h   |  1 +
+ plugins/smap/src/user/strategy/migration.c    |  2 +
+ .../smap/src/user/strategy/strategy_config.c  | 64 ++++++++++++-
+ .../smap/src/user/strategy/strategy_config.h  |  6 ++
+ .../user/strategy/test_strategy_config.cpp    | 89 ++++++++++++++++++-
+ plugins/ubdma/src/segment_manager.c           | 31 ++++++-
+ plugins/ubdma/src/segment_manager.h           |  9 +-
+ plugins/ubdma/src/ub_dma_main.c               | 86 +++++++++++++++++-
+ plugins/ubdma/src/urma.c                      | 70 ++++++++++++---
+ plugins/ubdma/src/urma.h                      | 17 +++-
+ 16 files changed, 390 insertions(+), 32 deletions(-)
+ create mode 100644 plugins/smap/src/tiering/critical.h
+
+diff --git a/plugins/smap/src/tiering/Makefile b/plugins/smap/src/tiering/Makefile
+index ef8b112..f79d8f8 100644
+--- a/plugins/smap/src/tiering/Makefile
++++ b/plugins/smap/src/tiering/Makefile
+@@ -20,6 +20,10 @@ else
+     ccflags-y += -DKERNEL_OPENEULER
+ endif
+ 
++ifeq ($(CRITICAL), 0)
++	ccflags-y += -DCRITICAL_OFF
++endif
++
+ .PHONY: modules
+ default: modules
+ 
+diff --git a/plugins/smap/src/tiering/critical.h b/plugins/smap/src/tiering/critical.h
+new file mode 100644
+index 0000000..062e073
+--- /dev/null
++++ b/plugins/smap/src/tiering/critical.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
++ * Description: SMAP critical module
++ */
++
++#ifndef _CRITICAL_H
++#define _CRITICAL_H
++
++static inline int node_is_critical_err(int nid)
++{
++	return 0;
++}
++
++#endif /* _CRITICAL_H */
+\ No newline at end of file
+diff --git a/plugins/smap/src/tiering/mig_init.c b/plugins/smap/src/tiering/mig_init.c
+index b85c9ae..5b3ebd9 100644
+--- a/plugins/smap/src/tiering/mig_init.c
++++ b/plugins/smap/src/tiering/mig_init.c
+@@ -20,6 +20,9 @@
+ #include "acpi_mem.h"
+ #include "iomem.h"
+ #include "smap_migrate_pages.h"
++#ifdef CRITICAL_OFF
++#include "critical.h"
++#endif
+ #include "mig_init.h"
+ 
+ #undef pr_fmt
+diff --git a/plugins/smap/src/tiering/smap_migrate_pages.c b/plugins/smap/src/tiering/smap_migrate_pages.c
+index 030e484..4630851 100644
+--- a/plugins/smap/src/tiering/smap_migrate_pages.c
++++ b/plugins/smap/src/tiering/smap_migrate_pages.c
+@@ -22,6 +22,9 @@
+ #include "iomem.h"
+ #include "smap_migrate_wrapper.h"
+ #include "common.h"
++#ifdef CRITICAL_OFF
++#include "critical.h"
++#endif
+ #include "smap_migrate_pages.h"
+ 
+ #define MAX_MIGRATE_NUMA_RETRY_TIME 10
+@@ -341,14 +344,14 @@ unsigned int smap_migrate(struct folio **folios, unsigned int nr_folios,
+ 	if (MIGRATE_TYPE_BACK == type) {
+ 		err = isolate_and_migrate_folios(
+ 			folios, nr_folios, smap_alloc_new_node_page_mig_back,
+-			NULL, to_node, MIGRATE_ASYNC, &nr_succeeded);
++			NULL, to_node, remote_migrate_mode, &nr_succeeded);
+ 		if (err) {
+ 			pr_err("failed to migrate back, ret: %d\n", err);
+ 		}
+ 	} else if (MIGRATE_TYPE_HOTNESS == type) {
+ 		err = isolate_and_migrate_folios(folios, nr_folios,
+ 						 smap_alloc_new_node_page, NULL,
+-						 to_node, MIGRATE_ASYNC,
++						 to_node, remote_migrate_mode,
+ 						 &nr_succeeded);
+ 		if (err) {
+ 			pr_err("failed to migrate, ret: %d\n", err);
+diff --git a/plugins/smap/src/tiering/tracking_manage.c b/plugins/smap/src/tiering/tracking_manage.c
+index 2003010..130e7e4 100644
+--- a/plugins/smap/src/tiering/tracking_manage.c
++++ b/plugins/smap/src/tiering/tracking_manage.c
+@@ -30,6 +30,9 @@
+ #include "ham_migration.h"
+ #endif
+ #include "pid_ioctl.h"
++#ifdef CRITICAL_OFF
++#include "critical.h"
++#endif
+ #include "tracking_manage.h"
+ 
+ #define SMAP_WATCH_NAME "smap_migrate_result"
+diff --git a/plugins/smap/src/user/manage/access_ioctl.c b/plugins/smap/src/user/manage/access_ioctl.c
+index c033723..9a2d168 100644
+--- a/plugins/smap/src/user/manage/access_ioctl.c
++++ b/plugins/smap/src/user/manage/access_ioctl.c
+@@ -19,6 +19,7 @@
+ #include "manage.h"
+ #include "device.h"
+ #include "access_ioctl.h"
++#include "smap_ioctl.h"
+ 
+ int AccessIoctlAddPid(int len, struct AccessAddPidPayload *payload)
+ {
+@@ -148,3 +149,17 @@ int AccessRead(size_t len, char *buf)
+     }
+     return 0;
+ }
++
++void IoctlUpdateUbDmaAvail(uint32_t value)
++{
++    struct ProcessManager *manager = GetProcessManager();
++
++    uint32_t val = value;
++    int ret = ioctl(manager->fds.migrate, SMAP_SET_UB_DMA_AVAIL, &val);
++    if (ret < 0) {
++        SMAP_LOGGER_ERROR("ioctl update ub dma avail failed: %d, errno %d", ret, errno);
++        return;
++    }
++
++    SMAP_LOGGER_INFO("ioctl update ub dma avail: %u", val);
++}
+diff --git a/plugins/smap/src/user/manage/access_ioctl.h b/plugins/smap/src/user/manage/access_ioctl.h
+index f6e3131..dfbd973 100644
+--- a/plugins/smap/src/user/manage/access_ioctl.h
++++ b/plugins/smap/src/user/manage/access_ioctl.h
+@@ -76,5 +76,6 @@ int AccessIoctlRemoveAllPid(void);
+ int AccessIoctlWalkPagemap(size_t *len);
+ int AccessIoctlCreateProcfs(struct UserInfo *ui);
+ int AccessRead(size_t len, char *buf);
++void IoctlUpdateUbDmaAvail(uint32_t value);
+ 
+ #endif /* __ACCESS_IOCTL_H__ */
+diff --git a/plugins/smap/src/user/strategy/migration.c b/plugins/smap/src/user/strategy/migration.c
+index 42b54a7..8e9dd9e 100644
+--- a/plugins/smap/src/user/strategy/migration.c
++++ b/plugins/smap/src/user/strategy/migration.c
+@@ -694,6 +694,8 @@ static void UpdatePeriodFromConfig(ThreadCtx *ctx)
+         UpdateAllProcessScanTime(ctx);
+         SetScanPeriodChanged(false);
+     }
++
++    IoctlUpdateUbDmaAvail(GetMigrateModeConfig());
+ }
+ 
+ // 管理线程函数
+diff --git a/plugins/smap/src/user/strategy/strategy_config.c b/plugins/smap/src/user/strategy/strategy_config.c
+index cd9f54c..2991b0a 100644
+--- a/plugins/smap/src/user/strategy/strategy_config.c
++++ b/plugins/smap/src/user/strategy/strategy_config.c
+@@ -20,7 +20,7 @@
+ #include "securec.h"
+ #include "strategy_config.h"
+ 
+-#define STRATEGY_CONFIG_ENTRY 12
++#define STRATEGY_CONFIG_ENTRY 13
+ #define STRATEGY_CONFIG_BUFFSIZE 500
+ 
+ #define RETURN_OK 0
+@@ -55,6 +55,10 @@
+ #define DEFAULT_GROUP_SWAP_MIN_FREQ_GAIN 0
+ #define MIN_GROUP_SWAP_MIN_FREQ_GAIN 0
+ 
++#define MAX_MIGRATE_MODE 2
++#define DEFAULT_MIGRATE_MODE 1
++#define MIN_MIGRATE_MODE 0
++
+ #define SCAN_MULTIPLE 1UL
+ 
+ #define RADIX_10 10UL
+@@ -69,6 +73,8 @@ typedef struct {
+     uint32_t groupSwapRatio;
+     uint32_t groupSwapMinRemoteFreq;
+     uint32_t groupSwapMinFreqGain;
++    uint32_t migrateMode;
++    bool migrateModeChanged;
+     bool zeroFreqMigrateEnable;
+     bool adaptiveRatioEnable;
+     bool fileConfSwitch;
+@@ -134,6 +140,21 @@ uint32_t GetGroupSwapMinFreqGainConfig(void)
+     return g_strategyConfig.groupSwapMinFreqGain;
+ }
+ 
++uint32_t GetMigrateModeConfig(void)
++{
++    return g_strategyConfig.migrateMode;
++}
++
++bool GetMigrateModeChanged(void)
++{
++    return g_strategyConfig.migrateModeChanged;
++}
++
++void SetMigrateModeChanged(bool val)
++{
++    g_strategyConfig.migrateModeChanged = val;
++}
++
+ bool GetZeroFreqMigrateEnableConfig(void)
+ {
+     return g_strategyConfig.zeroFreqMigrateEnable;
+@@ -350,6 +371,24 @@ static int32_t ConfigGroupSwapMinFreqGain(char *substr, char *value)
+     return RETURN_OK;
+ }
+ 
++static int32_t ConfigMigrateMode(char *substr, char *value)
++{
++    SMAP_LOGGER_DEBUG("Read config key:%s, value:%s.", substr, value);
++    uint32_t migrateMode;
++    int32_t ret = ConfigReadValueToInt(value, &migrateMode);
++    if (ret != RETURN_OK) {
++        SMAP_LOGGER_ERROR("Config migrate mode read failed, key:%s.", substr);
++        return ret;
++    }
++    if (migrateMode < MIN_MIGRATE_MODE || migrateMode > MAX_MIGRATE_MODE) {
++        SMAP_LOGGER_ERROR("Config migrate mode(%u) invalid, range(%d-%d), key:%s.", migrateMode, MIN_MIGRATE_MODE,
++                          MAX_MIGRATE_MODE, substr);
++        return RETURN_ERROR;
++    }
++    g_tmpStrategyConfig.migrateMode = migrateMode;
++    return RETURN_OK;
++}
++
+ static int32_t ConfigZeroFreqMigrateEnable(char *substr, char *value)
+ {
+     SMAP_LOGGER_DEBUG("Read config key:%s, value:%s.", substr, value);
+@@ -448,6 +487,12 @@ static StrategyConfigReadElem g_strategyConfigRead[] = {
+         1UL,
+         0UL,
+     },
++    {
++        "smap.migrate.mode",
++        ConfigMigrateMode,
++        1UL,
++        0UL,
++    },
+     {
+         "smap.zero.freq.migrate.enable",
+         ConfigZeroFreqMigrateEnable,
+@@ -614,6 +659,8 @@ static void InitStrategyConfig(void)
+     g_strategyConfig.groupSwapRatio = DEFAULT_GROUP_SWAP_RATIO;
+     g_strategyConfig.groupSwapMinRemoteFreq = DEFAULT_GROUP_SWAP_MIN_REMOTE_FREQ;
+     g_strategyConfig.groupSwapMinFreqGain = DEFAULT_GROUP_SWAP_MIN_FREQ_GAIN;
++    g_strategyConfig.migrateMode = DEFAULT_MIGRATE_MODE;
++    g_strategyConfig.migrateModeChanged = false;
+     g_strategyConfig.zeroFreqMigrateEnable = true;
+     g_strategyConfig.adaptiveRatioEnable = true;
+     g_strategyConfig.fileConfSwitch = false;
+@@ -660,6 +707,7 @@ static int32_t InitStrategyConfigFileBuffer(char strategyDefaultConfig[STRATEGY_
+         { "smap.group.swap.ratio = %d\n", DEFAULT_GROUP_SWAP_RATIO },
+         { "smap.group.swap.min.remote.freq = %d\n", DEFAULT_GROUP_SWAP_MIN_REMOTE_FREQ },
+         { "smap.group.swap.min.freq.gain = %d\n", DEFAULT_GROUP_SWAP_MIN_FREQ_GAIN },
++        { "smap.migrate.mode = %d\n", DEFAULT_MIGRATE_MODE },
+     };
+     size_t numConfigs = sizeof(configs) / sizeof(configs[0]);
+ 
+@@ -760,14 +808,16 @@ static bool UpdateStrategyConfigChanged(void)
+     uint32_t oldScanPeriod, oldMigratePeriod, oldRemoteHotThreshold, scanPeriod, migratePeriod, remoteHotThreshold;
+     uint32_t oldRemoteFreqPercentile, oldSlowThreshold, remoteFreqPercentile, slowThreshold;
+     uint32_t oldGroupSwapRatio, oldGroupSwapMinRemoteFreq, oldGroupSwapMinFreqGain;
+-    uint32_t groupSwapRatio, groupSwapMinRemoteFreq, groupSwapMinFreqGain;
++    uint32_t oldMigrateMode, groupSwapRatio, groupSwapMinRemoteFreq, groupSwapMinFreqGain, migrateMode;
+     uint64_t oldFreqWt, freqWt;
+     bool oldZeroFreqMigrateEnable, zeroFreqMigrateEnable;
+     bool oldAdaptiveRatioEnable, adaptiveRatioEnable;
+ 
+     if (!g_tmpStrategyConfig.fileConfSwitch) {
++        g_strategyConfig.fileConfSwitch = false;
+         return false;
+     }
++    g_strategyConfig.fileConfSwitch = true;
+ 
+     oldScanPeriod = g_strategyConfig.scanPeriod;
+     oldMigratePeriod = g_strategyConfig.migratePeriod;
+@@ -778,6 +828,7 @@ static bool UpdateStrategyConfigChanged(void)
+     oldGroupSwapRatio = g_strategyConfig.groupSwapRatio;
+     oldGroupSwapMinRemoteFreq = g_strategyConfig.groupSwapMinRemoteFreq;
+     oldGroupSwapMinFreqGain = g_strategyConfig.groupSwapMinFreqGain;
++    oldMigrateMode = g_strategyConfig.migrateMode;
+     oldZeroFreqMigrateEnable = g_strategyConfig.zeroFreqMigrateEnable;
+     oldAdaptiveRatioEnable = g_strategyConfig.adaptiveRatioEnable;
+ 
+@@ -790,6 +841,7 @@ static bool UpdateStrategyConfigChanged(void)
+     groupSwapRatio = g_tmpStrategyConfig.groupSwapRatio;
+     groupSwapMinRemoteFreq = g_tmpStrategyConfig.groupSwapMinRemoteFreq;
+     groupSwapMinFreqGain = g_tmpStrategyConfig.groupSwapMinFreqGain;
++    migrateMode = g_tmpStrategyConfig.migrateMode;
+     zeroFreqMigrateEnable = g_tmpStrategyConfig.zeroFreqMigrateEnable;
+     adaptiveRatioEnable = g_tmpStrategyConfig.adaptiveRatioEnable;
+ 
+@@ -797,7 +849,8 @@ static bool UpdateStrategyConfigChanged(void)
+         oldRemoteHotThreshold == remoteHotThreshold && oldRemoteFreqPercentile == remoteFreqPercentile &&
+         oldSlowThreshold == slowThreshold && oldFreqWt == freqWt && oldGroupSwapRatio == groupSwapRatio &&
+         oldGroupSwapMinRemoteFreq == groupSwapMinRemoteFreq && oldGroupSwapMinFreqGain == groupSwapMinFreqGain &&
+-        oldZeroFreqMigrateEnable == zeroFreqMigrateEnable && oldAdaptiveRatioEnable == adaptiveRatioEnable) {
++        oldMigrateMode == migrateMode && oldZeroFreqMigrateEnable == zeroFreqMigrateEnable &&
++        oldAdaptiveRatioEnable == adaptiveRatioEnable) {
+         return false;
+     }
+ 
+@@ -837,6 +890,11 @@ static bool UpdateStrategyConfigChanged(void)
+         SMAP_LOGGER_INFO("Start update group swap min freq gain from config to %u.", groupSwapMinFreqGain);
+     }
+ 
++    if (oldMigrateMode != migrateMode) {
++        g_tmpStrategyConfig.migrateModeChanged = true;
++        SMAP_LOGGER_INFO("Start update migrate mode from config to %u.", migrateMode);
++    }
++
+     if (oldZeroFreqMigrateEnable != zeroFreqMigrateEnable) {
+         SMAP_LOGGER_INFO("Start update zero freq migrate enable from config to %s.",
+                          zeroFreqMigrateEnable ? "true" : "false");
+diff --git a/plugins/smap/src/user/strategy/strategy_config.h b/plugins/smap/src/user/strategy/strategy_config.h
+index a9c7ea4..5a71be9 100644
+--- a/plugins/smap/src/user/strategy/strategy_config.h
++++ b/plugins/smap/src/user/strategy/strategy_config.h
+@@ -39,6 +39,12 @@ uint64_t GetFreqWtConfig(void);
+ 
+ uint32_t GetRemoteHotThreshold(void);
+ 
++uint32_t GetMigrateModeConfig(void);
++
++bool GetMigrateModeChanged(void);
++
++void SetMigrateModeChanged(bool val);
++
+ uint32_t GetGroupSwapRatioConfig(void);
+ 
+ uint32_t GetGroupSwapMinRemoteFreqConfig(void);
+diff --git a/plugins/smap/test/user/strategy/test_strategy_config.cpp b/plugins/smap/test/user/strategy/test_strategy_config.cpp
+index fc521e3..f62185f 100644
+--- a/plugins/smap/test/user/strategy/test_strategy_config.cpp
++++ b/plugins/smap/test/user/strategy/test_strategy_config.cpp
+@@ -48,6 +48,8 @@ typedef struct {
+     uint32_t groupSwapRatio;
+     uint32_t groupSwapMinRemoteFreq;
+     uint32_t groupSwapMinFreqGain;
++    uint32_t migrateMode;
++    bool migrateModeChanged;
+     bool zeroFreqMigrateEnable;
+     bool adaptiveRatioEnable;
+     bool fileConfSwitch;
+@@ -136,6 +138,60 @@ TEST_F(PeriodConfigTest, GetGroupSwapMinFreqGainConfigTest)
+     EXPECT_EQ(3, ret);
+ }
+ 
++extern "C" uint32_t GetMigrateModeConfig(void);
++TEST_F(PeriodConfigTest, GetMigrateModeConfigTest)
++{
++    g_strategyConfig.migrateMode = 1;
++    uint32_t ret = GetMigrateModeConfig();
++    EXPECT_EQ(1, ret);
++    g_strategyConfig.migrateMode = 2;
++    ret = GetMigrateModeConfig();
++    EXPECT_EQ(2, ret);
++}
++
++extern "C" bool GetMigrateModeChanged(void);
++TEST_F(PeriodConfigTest, GetMigrateModeChangedTest)
++{
++    g_strategyConfig.migrateModeChanged = true;
++    bool ret = GetMigrateModeChanged();
++    EXPECT_EQ(true, ret);
++    g_strategyConfig.migrateModeChanged = false;
++    ret = GetMigrateModeChanged();
++    EXPECT_EQ(false, ret);
++}
++
++extern "C" void SetMigrateModeChanged(bool val);
++TEST_F(PeriodConfigTest, SetMigrateModeChangedTest)
++{
++    g_strategyConfig.migrateModeChanged = true;
++    SetMigrateModeChanged(false);
++    EXPECT_EQ(false, g_strategyConfig.migrateModeChanged);
++    SetMigrateModeChanged(true);
++    EXPECT_EQ(true, g_strategyConfig.migrateModeChanged);
++}
++
++extern "C" int32_t ConfigReadValueToInt(char *pvalue, uint32_t *resultvalue);
++extern "C" int32_t ConfigMigrateMode(char *substr, char *value);
++TEST_F(PeriodConfigTest, ConfigMigrateModeTest)
++{
++    char *substr = "smap.migrate.mode";
++    char *value = "3";
++    MOCKER(ConfigReadValueToInt).stubs().will(returnValue(-1));
++    int32_t ret = ConfigMigrateMode(substr, value);
++    EXPECT_EQ(-1, ret);
++
++    g_tmpStrategyConfig.migrateMode = 0;
++    GlobalMockObject::verify();
++    ret = ConfigMigrateMode(substr, value);
++    EXPECT_EQ(-1, ret);
++
++    GlobalMockObject::verify();
++    char *value1 = "2";
++    ret = ConfigMigrateMode(substr, value1);
++    EXPECT_EQ(0, ret);
++    EXPECT_EQ(2, g_tmpStrategyConfig.migrateMode);
++}
++
+ extern "C" bool GetScanPeriodChanged(void);
+ TEST_F(PeriodConfigTest, GetScanPeriodChangedTest)
+ {
+@@ -488,7 +544,7 @@ TEST_F(PeriodConfigTest, PeriodConfigReviewTest)
+     int32_t ret = StrategyConfigReview();
+     EXPECT_EQ(-1, ret);
+ 
+-    uint32_t num = 12;
++    uint32_t num = 13;
+     for (int i = 0; i < num; i++) {
+         g_strategyConfigRead[i].needCfg = 2UL;
+         g_strategyConfigRead[i].realCfg = 2UL;
+@@ -519,6 +575,8 @@ TEST_F(PeriodConfigTest, InitPeriodConfigTest)
+ {
+     g_strategyConfig.scanPeriod = 10;
+     g_strategyConfig.migratePeriod = 10;
++    g_strategyConfig.migrateMode = 5;
++    g_strategyConfig.migrateModeChanged = true;
+     g_strategyConfig.fileConfSwitch = true;
+     g_strategyConfig.scanPeriodChanged = true;
+     g_strategyConfig.migratePeriodChanged = true;
+@@ -529,6 +587,8 @@ TEST_F(PeriodConfigTest, InitPeriodConfigTest)
+     EXPECT_EQ(1, g_strategyConfig.groupSwapRatio);
+     EXPECT_EQ(0, g_strategyConfig.groupSwapMinRemoteFreq);
+     EXPECT_EQ(0, g_strategyConfig.groupSwapMinFreqGain);
++    EXPECT_EQ(1, g_strategyConfig.migrateMode);
++    EXPECT_EQ(false, g_strategyConfig.migrateModeChanged);
+     EXPECT_EQ(true, g_strategyConfig.zeroFreqMigrateEnable);
+     EXPECT_EQ(true, g_strategyConfig.adaptiveRatioEnable);
+     EXPECT_EQ(false, g_strategyConfig.fileConfSwitch);
+@@ -553,8 +613,10 @@ TEST_F(PeriodConfigTest, TestUpdatePeriodConfigChanged)
+     g_tmpStrategyConfig.fileConfSwitch = true;
+     g_strategyConfig.scanPeriod = 500;
+     g_strategyConfig.migratePeriod = 1000;
++    g_strategyConfig.migrateMode = 1;
+     g_tmpStrategyConfig.scanPeriod = 1500;
+     g_tmpStrategyConfig.migratePeriod = 2000;
++    g_tmpStrategyConfig.migrateMode = 1;
+ 
+     bool ret = UpdateStrategyConfigChanged();
+     EXPECT_EQ(true, ret);
+@@ -572,6 +634,7 @@ TEST_F(PeriodConfigTest, TestUpdatePeriodConfigChangedNoChange)
+     g_strategyConfig.groupSwapRatio = 1;
+     g_strategyConfig.groupSwapMinRemoteFreq = 5;
+     g_strategyConfig.groupSwapMinFreqGain = 3;
++    g_strategyConfig.migrateMode = 1;
+     g_strategyConfig.zeroFreqMigrateEnable = true;
+     g_strategyConfig.adaptiveRatioEnable = true;
+     g_tmpStrategyConfig.scanPeriod = 500;
+@@ -583,6 +646,7 @@ TEST_F(PeriodConfigTest, TestUpdatePeriodConfigChangedNoChange)
+     g_tmpStrategyConfig.groupSwapRatio = 1;
+     g_tmpStrategyConfig.groupSwapMinRemoteFreq = 5;
+     g_tmpStrategyConfig.groupSwapMinFreqGain = 3;
++    g_tmpStrategyConfig.migrateMode = 1;
+     g_tmpStrategyConfig.zeroFreqMigrateEnable = true;
+     g_tmpStrategyConfig.adaptiveRatioEnable = true;
+ 
+@@ -595,10 +659,12 @@ TEST_F(PeriodConfigTest, TestUpdatePeriodConfigChangedZeroFreqChanged)
+     g_tmpStrategyConfig.fileConfSwitch = true;
+     g_strategyConfig.scanPeriod = 500;
+     g_strategyConfig.migratePeriod = 1000;
++    g_strategyConfig.migrateMode = 1;
+     g_strategyConfig.zeroFreqMigrateEnable = true;
+     g_strategyConfig.adaptiveRatioEnable = true;
+     g_tmpStrategyConfig.scanPeriod = 500;
+     g_tmpStrategyConfig.migratePeriod = 1000;
++    g_tmpStrategyConfig.migrateMode = 1;
+     g_tmpStrategyConfig.zeroFreqMigrateEnable = false;
+     g_tmpStrategyConfig.adaptiveRatioEnable = true;
+ 
+@@ -611,10 +677,12 @@ TEST_F(PeriodConfigTest, TestUpdatePeriodConfigChangedAdaptiveRatioChanged)
+     g_tmpStrategyConfig.fileConfSwitch = true;
+     g_strategyConfig.scanPeriod = 500;
+     g_strategyConfig.migratePeriod = 1000;
++    g_strategyConfig.migrateMode = 1;
+     g_strategyConfig.zeroFreqMigrateEnable = true;
+     g_strategyConfig.adaptiveRatioEnable = true;
+     g_tmpStrategyConfig.scanPeriod = 500;
+     g_tmpStrategyConfig.migratePeriod = 1000;
++    g_tmpStrategyConfig.migrateMode = 1;
+     g_tmpStrategyConfig.zeroFreqMigrateEnable = true;
+     g_tmpStrategyConfig.adaptiveRatioEnable = false;
+ 
+@@ -622,6 +690,25 @@ TEST_F(PeriodConfigTest, TestUpdatePeriodConfigChangedAdaptiveRatioChanged)
+     EXPECT_EQ(true, ret);
+ }
+ 
++TEST_F(PeriodConfigTest, TestUpdatePeriodConfigChangedMigrateModeChanged)
++{
++    g_tmpStrategyConfig.fileConfSwitch = true;
++    g_strategyConfig.scanPeriod = 500;
++    g_strategyConfig.migratePeriod = 1000;
++    g_strategyConfig.migrateMode = 1;
++    g_strategyConfig.zeroFreqMigrateEnable = true;
++    g_strategyConfig.adaptiveRatioEnable = true;
++    g_tmpStrategyConfig.scanPeriod = 500;
++    g_tmpStrategyConfig.migratePeriod = 1000;
++    g_tmpStrategyConfig.migrateMode = 2;
++    g_tmpStrategyConfig.zeroFreqMigrateEnable = true;
++    g_tmpStrategyConfig.adaptiveRatioEnable = true;
++
++    bool ret = UpdateStrategyConfigChanged();
++    EXPECT_EQ(true, ret);
++    EXPECT_EQ(true, g_tmpStrategyConfig.migrateModeChanged);
++}
++
+ extern "C" void StrategyConfigRead(const char *configFile);
+ TEST_F(PeriodConfigTest, PeriodConfigReadTestReadFileFailed)
+ {
+diff --git a/plugins/ubdma/src/segment_manager.c b/plugins/ubdma/src/segment_manager.c
+index 2e86a52..0111574 100644
+--- a/plugins/ubdma/src/segment_manager.c
++++ b/plugins/ubdma/src/segment_manager.c
+@@ -72,6 +72,31 @@ static inline bool is_target_segment(u64 start_va, u64 end_va, u64 addr,
+ 	return start_va <= addr && end_va >= (addr + len - 1) ? true : false;
+ }
+ 
++int get_single_urma_trans_segment(struct urma_trans_segment_info *info,
++				  bool is_i_seg)
++{
++	struct urma_sge_meta_node *sge;
++	u64 key = info->addr >> HASH_KEY_MASK_BIT;
++
++	read_lock(&g_mgr->sge_meta_lock);
++	hash_for_each_possible(g_mgr->sge_meta_hashtable, sge, node, key) {
++		if (sge->info.start_va <= info->addr &&
++		    sge->info.end_va >= (info->addr + info->len - 1)) {
++			if (is_i_seg) {
++				info->sge = sge->info.i_seg;
++			} else {
++				info->sge = sge->info.sge;
++			}
++			read_unlock(&g_mgr->sge_meta_lock);
++			return 0;
++		}
++	}
++
++	read_unlock(&g_mgr->sge_meta_lock);
++	ub_dma_log_err("failed to get single urma trans segment\n");
++	return -ENOENT;
++}
++
+ int get_urma_trans_segment(struct urma_trans_segment_info *src_info,
+ 			   struct urma_trans_segment_info *dst_info)
+ {
+@@ -79,7 +104,7 @@ int get_urma_trans_segment(struct urma_trans_segment_info *src_info,
+ 	u64 src_key = src_info->addr >> HASH_KEY_MASK_BIT;
+ 	u64 dst_key = dst_info->addr >> HASH_KEY_MASK_BIT;
+ 
+-	write_lock(&g_mgr->sge_meta_lock);
++	read_lock(&g_mgr->sge_meta_lock);
+ 	hash_for_each_possible(g_mgr->sge_meta_hashtable, sge, node, src_key) {
+ 		if (sge->info.start_va <= src_info->addr &&
+ 		    sge->info.end_va >= (src_info->addr + src_info->len - 1)) {
+@@ -95,12 +120,12 @@ int get_urma_trans_segment(struct urma_trans_segment_info *src_info,
+ 		}
+ 	}
+ 	if (!src_info->sge || !dst_info->sge) {
+-		write_unlock(&g_mgr->sge_meta_lock);
++		read_unlock(&g_mgr->sge_meta_lock);
+ 		ub_dma_log_err("fali to get urma trans sgemnet.\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	write_unlock(&g_mgr->sge_meta_lock);
++	read_unlock(&g_mgr->sge_meta_lock);
+ 	return 0;
+ }
+ 
+diff --git a/plugins/ubdma/src/segment_manager.h b/plugins/ubdma/src/segment_manager.h
+index 93bf8d2..2c927fd 100644
+--- a/plugins/ubdma/src/segment_manager.h
++++ b/plugins/ubdma/src/segment_manager.h
+@@ -9,14 +9,11 @@
+ 
+ #include "urma.h"
+ 
+-struct urma_trans_segment_info {
+-	uint64_t addr;
+-	uint32_t len;
+-	struct ubcore_target_seg *sge;
+-};
+-
+ int urma_meta_sge_init(void);
+ 
++int get_single_urma_trans_segment(struct urma_trans_segment_info *info,
++				  bool is_i_seg);
++
+ int get_urma_trans_segment(struct urma_trans_segment_info *src_info,
+ 			   struct urma_trans_segment_info *dst_info);
+ 
+diff --git a/plugins/ubdma/src/ub_dma_main.c b/plugins/ubdma/src/ub_dma_main.c
+index 3f5e8f0..07bdf27 100644
+--- a/plugins/ubdma/src/ub_dma_main.c
++++ b/plugins/ubdma/src/ub_dma_main.c
+@@ -17,6 +17,7 @@
+ #include <linux/io.h>
+ #include <linux/migrate.h>
+ #include <linux/dma-mapping.h>
++#include <linux/numa_remote.h>
+ 
+ #include "ub_dma_log.h"
+ #include "ub_dma_iomem.h"
+@@ -45,6 +46,7 @@ struct ub_dma_desc {
+ 	uint64_t src_addr;
+ 	uint64_t dest_addr;
+ 	size_t len;
++	struct tmp_urma_segment_info tmp_sge;
+ };
+ 
+ struct ub_dma_vchan {
+@@ -127,6 +129,73 @@ buid_urma_segment_info(struct ub_dma_desc *txd,
+ 	dst_info->addr = txd->dest_addr;
+ 	dst_info->len = txd->len;
+ 	dst_info->sge = NULL;
++	txd->tmp_sge.i_seg = NULL;
++	txd->tmp_sge.seg = NULL;
++}
++
++static int get_trans_segment(struct ub_dma_desc *txd,
++			     struct urma_trans_segment_info *src_info,
++			     struct urma_trans_segment_info *dst_info)
++{
++	struct page *src_page = virt_to_page(txd->src_addr);
++	struct page *dst_page = virt_to_page(txd->dest_addr);
++	int src_nid;
++	int dst_nid;
++	int ret;
++	bool dst_is_remote;
++	struct urma_trans_segment_info *remote_sge;
++	struct urma_trans_segment_info *local_sge;
++	bool is_i_seg;
++	bool need_import_sge;
++
++	if (!src_page || !dst_page) {
++		ub_dma_log_err("failed to get page for src or dst\n");
++		return -EINVAL;
++	}
++	src_nid = page_to_nid(src_page);
++	dst_nid = page_to_nid(dst_page);
++	if (!numa_is_remote_node(src_nid) && !numa_is_remote_node(dst_nid)) {
++		ub_dma_log_err(
++			"not support local memory to local memory, node %d to node %d\n",
++			src_nid, dst_nid);
++		return -EINVAL;
++	}
++	if (numa_is_remote_node(src_nid) && numa_is_remote_node(dst_nid)) {
++		ret = get_urma_trans_segment(src_info, dst_info);
++		if (ret) {
++			ub_dma_log_err("failed to get urma trans segment\n");
++		}
++		return ret;
++	}
++
++	dst_is_remote = numa_is_remote_node(dst_nid);
++	remote_sge = dst_is_remote ? dst_info : src_info;
++	local_sge = dst_is_remote ? src_info : dst_info;
++	is_i_seg = dst_is_remote ? true : false;
++	need_import_sge = dst_is_remote ? false : true;
++
++	ret = get_single_urma_trans_segment(remote_sge, is_i_seg);
++	if (ret) {
++		ub_dma_log_err("failed to get single urma trans segment\n");
++		return ret;
++	}
++	ret = urma_register_tmp_segment(local_sge, &txd->tmp_sge,
++					need_import_sge);
++	if (ret) {
++		ub_dma_log_err("failed to register temp segment\n");
++	}
++
++	return ret;
++}
++
++static inline void ub_dma_free_tmp_segment(struct ub_dma_desc *txd)
++{
++	if (txd->tmp_sge.i_seg) {
++		ubcore_unimport_seg(txd->tmp_sge.i_seg);
++	}
++	if (txd->tmp_sge.seg) {
++		ubcore_unregister_seg(txd->tmp_sge.seg);
++	}
+ }
+ 
+ static void ub_dma_issue_pending(struct dma_chan *chan)
+@@ -145,7 +214,7 @@ static void ub_dma_issue_pending(struct dma_chan *chan)
+ 			desc = vchan_next_desc(&vchan->vc);
+ 			txd = to_ub_dma_desc(&desc->tx);
+ 			buid_urma_segment_info(txd, &src_info, &dst_info);
+-			ret = get_urma_trans_segment(&src_info, &dst_info);
++			ret = get_trans_segment(txd, &src_info, &dst_info);
+ 			if (ret) {
+ 				list_del(&desc->node);
+ 				desc->tx_result.result = DMA_TRANS_WRITE_FAILED;
+@@ -158,7 +227,7 @@ static void ub_dma_issue_pending(struct dma_chan *chan)
+ 				list_del(&desc->node);
+ 				ub_dma_log_err("urma send failed\n");
+ 				desc->tx_result.result = DMA_TRANS_WRITE_FAILED;
+-				goto complete_dma_pending;
++				goto err_free_tmp_segment;
+ 			}
+ 		}
+ 	} else {
+@@ -167,6 +236,8 @@ static void ub_dma_issue_pending(struct dma_chan *chan)
+ 	spin_unlock_irqrestore(&vchan->vc.lock, flags);
+ 	return;
+ 
++err_free_tmp_segment:
++	ub_dma_free_tmp_segment(txd);
+ complete_dma_pending:
+ 	vchan_cookie_complete(desc);
+ 	spin_unlock_irqrestore(&vchan->vc.lock, flags);
+@@ -317,6 +388,7 @@ void urma_callback_free_desc(struct ubcore_jfc *jfc,
+ 	int ret;
+ 	struct ub_virt_dma_desc *desc;
+ 	struct ub_dma_vchan *vchan;
++	struct ub_dma_desc *txd;
+ 	int i;
+ 
+ 	ret = ubcore_rearm_jfc(jfc, false);
+@@ -334,6 +406,16 @@ void urma_callback_free_desc(struct ubcore_jfc *jfc,
+ 		desc->tx_result = res;
+ 		vchan->status = (res.result == DMA_TRANS_NOERROR) ? DMA_COMPLETE
+ 								  : DMA_ERROR;
++		txd = to_ub_dma_desc(&desc->tx);
++		if (txd->tmp_sge.i_seg) {
++			ubcore_unimport_seg(txd->tmp_sge.i_seg);
++			ubcore_unregister_seg(txd->tmp_sge.seg);
++			txd->tmp_sge.i_seg = NULL;
++			txd->tmp_sge.seg = NULL;
++		} else if (txd->tmp_sge.seg) {
++			ubcore_unregister_seg(txd->tmp_sge.seg);
++			txd->tmp_sge.seg = NULL;
++		}
+ 		vchan_cookie_complete(desc);
+ 		spin_unlock(&vchan->vc.lock);
+ 		ub_dma_log_debug(
+diff --git a/plugins/ubdma/src/urma.c b/plugins/ubdma/src/urma.c
+index b9a7292..026d079 100644
+--- a/plugins/ubdma/src/urma.c
++++ b/plugins/ubdma/src/urma.c
+@@ -14,7 +14,7 @@
+ #include "ub_dma_log.h"
+ #include "urma.h"
+ 
+-#define MIN_PORT_NUMA 7
++#define MIN_PORT_NUMA 2
+ 
+ #define JFS_CFG_PRIORITY 15
+ #define JFS_CFG_MAX_SGE 2
+@@ -181,10 +181,32 @@ static int post_client_jfs(struct ubcore_target_seg *src_seg,
+ 	return ret;
+ }
+ 
++static struct ubcore_target_seg *
++urma_import_segment(uint64_t start_va, uint64_t len,
++		    struct ubcore_target_seg *target_sge)
++{
++	struct ubcore_target_seg_cfg cfg = { 0 };
++	struct ubcore_target_seg *seg;
++
++	cfg.seg.ubva.va = start_va;
++	cfg.seg.ubva.eid = g_urma_jetty->eid_info.eid;
++	cfg.seg.len = len;
++	cfg.seg.token_id = target_sge->token_id->token_id;
++	cfg.seg.attr.bs.cacheable = UBCORE_CACHEABLE;
++	cfg.seg.attr.bs.access = UBCORE_ACCESS_READ | UBCORE_ACCESS_WRITE;
++
++	seg = ubcore_import_seg(g_urma_jetty->dev, &cfg, NULL);
++	if (IS_ERR_OR_NULL(seg)) {
++		ub_dma_log_err("fail to import segment\n");
++		return NULL;
++	}
++
++	return seg;
++}
++
+ int urma_register_segment(uint64_t start_va, uint64_t end_va,
+ 			  struct urma_sge_info *sge_info)
+ {
+-	struct ubcore_target_seg_cfg cfg = { 0 };
+ 	struct ubcore_target_seg *sge;
+ 	struct ubcore_target_seg *i_seg;
+ 	uint64_t len = end_va - start_va + 1;
+@@ -195,16 +217,9 @@ int urma_register_segment(uint64_t start_va, uint64_t end_va,
+ 		return -ENOMEM;
+ 	}
+ 
+-	cfg.seg.ubva.va = start_va;
+-	cfg.seg.ubva.eid = g_urma_jetty->eid_info.eid;
+-	cfg.seg.len = len;
+-	cfg.seg.token_id = sge->token_id->token_id;
+-	cfg.seg.attr.bs.cacheable = UBCORE_CACHEABLE;
+-	cfg.seg.attr.bs.access = UBCORE_ACCESS_READ | UBCORE_ACCESS_WRITE;
+-
+-	i_seg = ubcore_import_seg(g_urma_jetty->dev, &cfg, NULL);
++	i_seg = urma_import_segment(start_va, len, sge);
+ 	if (IS_ERR_OR_NULL(i_seg)) {
+-		ub_dma_log_err("fail to import dst_seg\n");
++		ub_dma_log_err("urma import segment failed\n");
+ 		ubcore_unregister_seg(sge);
+ 		return -ENOMEM;
+ 	}
+@@ -217,6 +232,39 @@ int urma_register_segment(uint64_t start_va, uint64_t end_va,
+ 	return 0;
+ }
+ 
++int urma_register_tmp_segment(struct urma_trans_segment_info *info,
++			      struct tmp_urma_segment_info *tmp_info,
++			      bool need_import_sge)
++{
++	struct ubcore_target_seg *sge;
++	struct ubcore_target_seg *i_seg;
++
++	sge = init_segment(info->addr, info->len, g_urma_jetty);
++	if (IS_ERR_OR_NULL(sge)) {
++		ub_dma_log_err(
++			"urma register trans segment failed to init seg\n");
++		return -ENOMEM;
++	}
++
++	if (need_import_sge) {
++		i_seg = urma_import_segment(info->addr, info->len, sge);
++		if (IS_ERR_OR_NULL(i_seg)) {
++			ub_dma_log_err("urma import segment failed\n");
++			ubcore_unregister_seg(sge);
++			return -ENOMEM;
++		}
++		tmp_info->seg = sge;
++		tmp_info->i_seg = i_seg;
++		info->sge = i_seg;
++	} else {
++		tmp_info->seg = sge;
++		tmp_info->i_seg = NULL;
++		info->sge = sge;
++	}
++
++	return 0;
++}
++
+ void unregister_urma_segment(struct urma_sge_info *sge_info)
+ {
+ 	ubcore_unimport_seg(sge_info->i_seg);
+diff --git a/plugins/ubdma/src/urma.h b/plugins/ubdma/src/urma.h
+index 6094bc7..3f5798d 100644
+--- a/plugins/ubdma/src/urma.h
++++ b/plugins/ubdma/src/urma.h
+@@ -22,10 +22,15 @@ struct urma_sge_info {
+ 	uint64_t end_va;
+ };
+ 
+-struct ub_register_sge {
+-	struct ubcore_target_seg *src_seg;
+-	struct ubcore_target_seg *dst_seg;
+-	struct ubcore_target_seg *i_dst_seg;
++struct urma_trans_segment_info {
++	uint64_t addr;
++	uint32_t len;
++	struct ubcore_target_seg *sge;
++};
++
++struct tmp_urma_segment_info {
++	struct ubcore_target_seg *seg;
++	struct ubcore_target_seg *i_seg;
+ };
+ 
+ struct urma_mem_trans {
+@@ -47,6 +52,10 @@ void release_urma_mem_trans(void);
+ int urma_register_segment(uint64_t start_va, uint64_t end_va,
+ 			  struct urma_sge_info *sge_info);
+ 
++int urma_register_tmp_segment(struct urma_trans_segment_info *info,
++			      struct tmp_urma_segment_info *tmp_info,
++			      bool need_import_sge);
++
+ void unregister_urma_segment(struct urma_sge_info *sge_info);
+ 
+ int urma_run_send(uint64_t src_va, uint64_t dst_va,
+-- 
+2.53.0.windows.3
+
