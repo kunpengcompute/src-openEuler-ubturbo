@@ -1,5 +1,5 @@
 %global version    1.0.0
-%global release_version 5
+%global release_version 6
 %global __strip /bin/true
 
 Name:          ubturbo
@@ -894,6 +894,8 @@ fi
 main "$@"
 
 %changelog
+* Sat Jun 27 2026 Huang Dewei <huangdewei@huawei.com> - 1.0.0-6
+- update: update ubturbo for anolis with 630 sp4
 * Thu May 21 2026 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-5
 - update: add ubturbo.rpm
 * Sun May 17 2026 Liu Jiangqi <liujiangqi1@huawei.com> - 1.0.0-4
