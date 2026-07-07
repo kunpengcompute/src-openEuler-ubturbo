@@ -1,0 +1,6 @@
+ubturbo (1.0.0-1) unstable; urgency=medium
+
+  * Initial Debian packaging based on RPM spec 1.0.0-5
+  * Add pre-migration remote available numa detection
+
+ -- Liu Jiangqi <liujiangqi1@huawei.com>  Mon, 1 Jun 2026 12:00:00 +0800
