@@ -94,7 +94,7 @@ This package contains the ubturbo framework developmemt kit
 
 %build
 #build ubdma
-cd %{_builddir}/ubturbo/plugins/ubdma/src && make -j`nproc` -C /lib/modules/6.6.0*/build M=%{_builddir}/ubturbo/plugins/ubdma/src modules
+cd %{_builddir}/ubturbo/plugins/ubdma/src && make -j`nproc` -C /lib/modules/6.6.*/build M=%{_builddir}/ubturbo/plugins/ubdma/src modules
 
 #build smap
 cd %{_builddir}
@@ -106,10 +106,10 @@ pwd
 tar -zxvf v1.11.0.tar.gz
 
 cd %{_builddir}
-cd %{_builddir}/ubturbo/plugins/smap/src/drivers && make -j`nproc` -C /lib/modules/6.6.0*/build M=%{_builddir}/ubturbo/plugins/smap/src/drivers modules
+cd %{_builddir}/ubturbo/plugins/smap/src/drivers && make -j`nproc` -C /lib/modules/6.6.*/build M=%{_builddir}/ubturbo/plugins/smap/src/drivers modules
 cp %{_builddir}/ubturbo/plugins/smap/src/drivers/Module.symvers %{_builddir}/ubturbo/plugins/smap/src/tiering/depends
-cd %{_builddir}/ubturbo/plugins/smap/src/tiering && make -j`nproc` -C /lib/modules/6.6.0*/build M=%{_builddir}/ubturbo/plugins/smap/src/tiering modules
-cd %{_builddir}/ubturbo/plugins/smap/src/ucache && make -j`nproc` -C /lib/modules/6.6.0*/build M=%{_builddir}/ubturbo/plugins/smap/src/ucache modules
+cd %{_builddir}/ubturbo/plugins/smap/src/tiering && make -j`nproc` -C /lib/modules/6.6.*/build M=%{_builddir}/ubturbo/plugins/smap/src/tiering modules
+cd %{_builddir}/ubturbo/plugins/smap/src/ucache && make -j`nproc` -C /lib/modules/6.6.*/build M=%{_builddir}/ubturbo/plugins/smap/src/ucache modules
 
 rm -rf %{_builddir}/ubturbo/plugins/smap/3rdparty/spdlog
 mv %{_builddir}/spdlog-1.11.0 %{_builddir}/spdlog
