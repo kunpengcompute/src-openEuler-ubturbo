@@ -238,7 +238,8 @@ rm -rf ${RPM_BUILD_ROOT}
 cd %{smap_dir}
 depmod -a
 echo "external 6.6.0-* %{smap_dir}" > /etc/depmod.d/smap.conf
-echo "external 6.6.0-* %{ucache_dir}" > /etc/depmod.d/ucache.conf
+echo "external 6.6.* %{smap_dir}" > /etc/depmod.d/smap.conf
+echo "external 6.6.* %{ucache_dir}" > /etc/depmod.d/ucache.conf
 depmod -a
 
 %preun smap
