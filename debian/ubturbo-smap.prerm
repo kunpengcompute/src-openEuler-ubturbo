@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+# ubturbo-smap prerm -- unload kernel modules before removing the package.
+# Mirrors RPM spec %preun smap.
+
+case "$1" in
+    remove)
+        # $1 == remove means full removal (analogous to RPM "$1" = 0).
+        for mod in smap_tiering smap_histogram_tracking smap_access_tracking \
+                   smap_tracking_core ucache; do
+            modprobe -r "$mod" 2>/dev/null || true
+        done
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

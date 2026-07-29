@@ -1,0 +1,32 @@
+#!/bin/sh
+set -e
+
+# ubturbo-smap postinst -- register external kernel module directories
+# with depmod and run udev.
+# Mirrors RPM spec %post smap.
+SMAP_DIR=/lib/modules/smap
+UCACHE_DIR=/lib/modules/ucache
+
+case "$1" in
+    configure)
+        # Refresh module dependencies.
+        depmod -a 2>/dev/null || true
+
+        # Register the external module directories so depmod can find
+        # the modules shipped outside /lib/modules/$(uname -r).
+        # The kernel version pattern follows the spec (6.6.0-*).
+        echo "external 6.6.0-* ${SMAP_DIR}"   > /etc/depmod.d/smap.conf
+        echo "external 6.6.0-* ${UCACHE_DIR}" > /etc/depmod.d/ucache.conf
+        depmod -a 2>/dev/null || true
+
+        # Reload udev so the shipped rule takes effect.
+        if command -v udevadm >/dev/null 2>&1; then
+            udevadm control --reload-rules 2>/dev/null || true
+            udevadm trigger 2>/dev/null || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

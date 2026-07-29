@@ -1,35 +1,34 @@
-#!/bin/bash
+#!/bin/sh
 set -e
 
-# ubturbo-rmrs prerm — stop and remove service before package removal
-# Translated from RPM spec %preun rmrs
-
+# ubturbo-rmrs prerm -- stop and remove service before package removal.
+# Mirrors RPM spec %preun rmrs.
 LOG_DIR="/var/log/ubturbo"
 LOG_FILE="$LOG_DIR/ubturbo-uninstall.log"
 
 log_message() {
-    local log_type="$1"
-    local message="$2"
-    mkdir -p "$LOG_DIR" 2>/dev/null || true
-    echo "[$(date)] [$log_type] $message" >> "$LOG_FILE" 2>/dev/null || true
+    log_type="$1"
+    message="$2"
+    if [ ! -d "$LOG_DIR" ]; then
+        mkdir -p "$LOG_DIR" || return 0
+    fi
+    printf '[%s] [%s] %s\n' "$(date)" "$log_type" "$message" >> "$LOG_FILE" 2>/dev/null || true
 }
 
-if [ "$1" = "remove" ]; then
-    log_message "INFO" "pre_uninstall.sh started"
-
-    # Stop and disable service
-    if systemctl list-units --type=service --all 2>/dev/null | grep -q "ubturbo.service"; then
-        systemctl stop ubturbo.service 2>/dev/null || true
-        systemctl disable ubturbo.service 2>/dev/null || true
-        systemctl reset-failed ubturbo.service 2>/dev/null || true
-    fi
-
-    # Remove service file
-    rm -f /etc/systemd/system/ubturbo.service
-    systemctl daemon-reload 2>/dev/null || true
-
-    log_message "INFO" "pre_uninstall.sh ended"
-fi
+case "$1" in
+    remove)
+        log_message INFO "pre_uninstall.sh started"
+        # Stop and disable the service; tolerate absence on a partial install.
+        if systemctl list-units --type=service --all 2>/dev/null | grep -q "ubturbo.service"; then
+            systemctl stop ubturbo.service 2>/dev/null || true
+            systemctl disable ubturbo.service 2>/dev/null || true
+            systemctl reset-failed ubturbo.service 2>/dev/null || true
+        fi
+        rm -f /etc/systemd/system/ubturbo.service
+        systemctl daemon-reload 2>/dev/null || true
+        log_message INFO "pre_uninstall.sh ended"
+        ;;
+esac
 
 #DEBHELPER#
 

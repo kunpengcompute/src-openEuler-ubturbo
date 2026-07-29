@@ -1,3 +1,23 @@
+ubturbo (1.0.0-9) unstable; urgency=medium
+
+  * Align Debian packaging with RPM spec 1.0.0-9
+  * Add ubturbo-smap and ubturbo-ucache binary packages to mirror the
+    RPM sub-packages defined in ubturbo.spec. The ubdma sub-package is
+    intentionally not built (its kernel module is not shipped).
+  * Build all components (smap, ucache, rmrs, devel) from debian/rules
+    instead of rmrs alone.
+  * Lintian cleanup:
+    - Add Rules-Requires-Root: binary-targets to the source stanza.
+    - Stop polluting the build host's /usr/lib64 during build; provide
+      libboundscheck via the multiarch symlink inside DESTDIR only.
+    - Remove redundant manual patch application from rules; rely on the
+      3.0 (quilt) source format to apply debian/patches/series.
+    - Replace fragile "mv ../*.deb ../../" in build-deb.sh with
+      deterministic artifact handling.
+    - Tighten maintainer-script permissions and sudoers handling.
+
+ -- openEuler Maintainers <maintainers@openeuler.org>  Mon, 13 Jul 2026 00:00:00 +0800
+
 ubturbo (1.0.0-1) unstable; urgency=medium
 
   * Initial Debian packaging based on RPM spec 1.0.0-5

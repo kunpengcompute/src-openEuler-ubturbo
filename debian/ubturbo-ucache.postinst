@@ -1,0 +1,29 @@
+#!/bin/sh
+set -e
+
+# ubturbo-ucache postinst -- tighten ownership/permissions of the ucache
+# plugin shipped under /opt/ubturbo.
+# Mirrors RPM spec %post ucache.
+PROGRAM_LIB_DIR=/opt/ubturbo/lib
+PROGRAM_CONF_DIR=/opt/ubturbo/conf
+SYSTEM_USER=ubturbo
+SYSTEM_GROUP=ubturbo
+
+case "$1" in
+    configure)
+        if [ -f "$PROGRAM_LIB_DIR/libucache_os_turbo_plugin.so" ]; then
+            chown "$SYSTEM_USER:$SYSTEM_GROUP" \
+                "$PROGRAM_LIB_DIR/libucache_os_turbo_plugin.so" 2>/dev/null || true
+            chmod 0640 "$PROGRAM_LIB_DIR/libucache_os_turbo_plugin.so" 2>/dev/null || true
+        fi
+        if [ -f "$PROGRAM_CONF_DIR/plugin_turbo_ucache.conf" ]; then
+            chown "$SYSTEM_USER:$SYSTEM_GROUP" \
+                "$PROGRAM_CONF_DIR/plugin_turbo_ucache.conf" 2>/dev/null || true
+            chmod 0640 "$PROGRAM_CONF_DIR/plugin_turbo_ucache.conf" 2>/dev/null || true
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

@@ -1,31 +1,30 @@
-#!/bin/bash
+#!/bin/sh
 set -e
 
-# ubturbo-rmrs postrm — remove user/group and log directory on purge
-# Translated from RPM spec %postun rmrs
+# ubturbo-rmrs postrm -- remove user/group and runtime state on purge.
+# Mirrors RPM spec %postun rmrs.
 
-if [ "$1" = "purge" ]; then
-    # Remove user and group
-    if id "ubturbo" > /dev/null 2>&1; then
-        userdel -r ubturbo 2>/dev/null || true
-    fi
-    if getent group "ubturbo" > /dev/null 2>&1; then
-        groupdel ubturbo 2>/dev/null || true
-    fi
+case "$1" in
+    purge)
+        # Remove system user and group.
+        if id ubturbo >/dev/null 2>&1; then
+            userdel -r ubturbo 2>/dev/null || true
+        fi
+        if getent group ubturbo >/dev/null 2>&1; then
+            groupdel ubturbo 2>/dev/null || true
+        fi
 
-    # Remove log directory
-    rm -rf /var/log/ubturbo
+        # Remove runtime directories, sudoers fragment and the client
+        # library installed into the system library path.
+        rm -rf /var/log/ubturbo
+        rm -f /etc/sudoers.d/ubturbo
+        rm -f /usr/lib64/libubturbo_client.so 2>/dev/null || true
+        rm -f /usr/lib/aarch64-linux-gnu/libubturbo_client.so 2>/dev/null || true
+        rm -f /usr/local/bin/cat.sh
 
-    # Remove sudoers file
-    rm -f /etc/sudoers.d/ubturbo
-
-    # Remove client library from system path
-    rm -f /usr/lib64/libubturbo_client.so 2>/dev/null || true
-    rm -f /usr/lib/aarch64-linux-gnu/libubturbo_client.so 2>/dev/null || true
-
-    # Remove cat.sh
-    rm -f /usr/local/bin/cat.sh
-fi
+        systemctl daemon-reload 2>/dev/null || true
+        ;;
+esac
 
 #DEBHELPER#
 

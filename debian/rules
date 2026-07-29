@@ -1,50 +1,137 @@
 #!/usr/bin/make -f
 
 export DH_VERBOSE = 1
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all,-format
+
+# Kernel version/build tree used for out-of-tree module compilation.
+#
+# Override KVER from the environment or make command line:
+#   KVER=6.6.95 dpkg-buildpackage ...
+#   make -f debian/rules binary KVER=6.6.95
+#
+# When KVER is unset, auto-select the newest /lib/modules/<ver>/build symlink
+# on the host. Filtering on the "build" symlink avoids picking up non-kernel
+# directories (smap, ucache) that this very package installs under
+# /lib/modules. Use Make patsubst (not shell prefix stripping) to extract
+# <ver> so the "/build" suffix is removed cleanly.
+ifeq ($(KVER),)
+KDIR := $(shell ls -d /lib/modules/*/build 2>/dev/null | sort -V | tail -n 1)
+KVER := $(patsubst /lib/modules/%/build,%,$(KDIR))
+else
+KDIR := /lib/modules/$(KVER)/build
+endif
+
+NUMJOBS = $(shell nproc)
 
 %:
 	dh $@
 
+# ---------------------------------------------------------------------------
+# Build all components defined in ubturbo.spec: smap, ucache, rmrs.
+# (ubdma is intentionally not built; its kernel module is not shipped.)
+# Quilt patches from debian/patches/series are applied at source preparation
+# time (see build-deb.sh -> dpkg-source --before-build), so rules does not
+# touch them.
+# ---------------------------------------------------------------------------
 override_dh_auto_build:
-	# Apply quilt patches (needed when source is extracted + debian/ copied manually)
-	if [ -f $(CURDIR)/debian/patches/remove-openEuler-release-dependency.patch ]; then \
-		cd $(CURDIR) && patch -p1 --forward --dry-run < debian/patches/remove-openEuler-release-dependency.patch > /dev/null 2>&1 && \
-		patch -p1 --forward < debian/patches/remove-openEuler-release-dependency.patch || \
-		echo "Patch already applied or not needed" ; \
+	@echo "==> Building with kernel $(KVER) (KDIR=$(KDIR))"
+	@if [ -z "$(KDIR)" ] || [ ! -d "$(KDIR)" ]; then \
+		echo "E: No usable kernel build tree found (KDIR='$(KDIR)')." >&2; \
+		echo "E: Install the matching linux-headers-* package, or pass KVER=<ver>." >&2; \
+		exit 1; \
 	fi
 
-	# ============================================================
-	# 1. libboundscheck — Debian installs to multiarch path,
-	#    but cmake hardcodes /usr/lib64/. Create symlink.
-	# ============================================================
-	mkdir -p /usr/lib64
-	ln -sf /usr/lib/aarch64-linux-gnu/libboundscheck.so /usr/lib64/libboundscheck.so
+	# 1. smap driver kernel modules
+	cd $(CURDIR)/plugins/smap/src/drivers && \
+		make -j$(NUMJOBS) KERNEL_VERSION=velinux -C $(KDIR) M=$(CURDIR)/plugins/smap/src/drivers modules
+	# smap tiering depends on drivers' Module.symvers
+	install -d $(CURDIR)/plugins/smap/src/tiering/depends
+	cp $(CURDIR)/plugins/smap/src/drivers/Module.symvers \
+		$(CURDIR)/plugins/smap/src/tiering/depends/
+	cd $(CURDIR)/plugins/smap/src/tiering && \
+		make -j$(NUMJOBS) KERNEL_VERSION=velinux -C $(KDIR) M=$(CURDIR)/plugins/smap/src/tiering modules
+	# smap ucache kernel module
+	cd $(CURDIR)/plugins/smap/src/ucache && \
+		make -j$(NUMJOBS) -C $(KDIR) M=$(CURDIR)/plugins/smap/src/ucache modules
 
-	# ============================================================
-	# 2. rmrs — main ubturbo framework (build.sh wraps cmake)
-	# ============================================================
+	# 2. smap userspace (libsmap.so) via cmake. "make install" must run so
+	#    that libsmap.so is placed under output/smap/lib/ (the path referenced
+	#    by the install step below). Mirrors ubturbo.spec %build for smap.
+	cd $(CURDIR)/plugins/smap && \
+		cmake -DCMAKE_BUILD_TYPE=Release . && \
+		make -j$(NUMJOBS) install
+
+	# 3. rmrs main framework
 	cd $(CURDIR) && bash -x build.sh -c
 
+	# 4. ucache userspace plugin
+	cd $(CURDIR)/plugins/ucache && bash -x build.sh -c
+
+# ---------------------------------------------------------------------------
+# Install everything into per-package DESTDIRs, mirroring the spec %install.
+# Do NOT touch the build host's /usr/lib64; the libboundscheck symlink is
+# only needed inside the package install tree at runtime, not at build time.
+# ---------------------------------------------------------------------------
 override_dh_auto_install:
-	# ---- rmrs ----
-	install -D -m 0755 $(CURDIR)/dist/release/bin/ub_turbo_exec \
+	dh_auto_install
+
+	# ---- ubturbo-smap ----
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-smap/lib/modules/smap
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-smap/lib/modules/ucache
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-smap/usr/lib/aarch64-linux-gnu
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-smap/etc/udev/rules.d
+	install -m 0500 $(CURDIR)/plugins/smap/src/drivers/smap_tracking_core.ko \
+		$(CURDIR)/debian/ubturbo-smap/lib/modules/smap/
+	install -m 0500 $(CURDIR)/plugins/smap/src/drivers/smap_access_tracking.ko \
+		$(CURDIR)/debian/ubturbo-smap/lib/modules/smap/
+	install -m 0500 $(CURDIR)/plugins/smap/src/drivers/smap_histogram_tracking.ko \
+		$(CURDIR)/debian/ubturbo-smap/lib/modules/smap/
+	install -m 0500 $(CURDIR)/plugins/smap/src/tiering/smap_tiering.ko \
+		$(CURDIR)/debian/ubturbo-smap/lib/modules/smap/
+	install -m 0500 $(CURDIR)/plugins/smap/src/ucache/ucache.ko \
+		$(CURDIR)/debian/ubturbo-smap/lib/modules/ucache/
+	install -m 0644 $(CURDIR)/plugins/smap/output/smap/lib/libsmap.so \
+		$(CURDIR)/debian/ubturbo-smap/usr/lib/aarch64-linux-gnu/libsmap.so
+	install -m 0640 $(CURDIR)/plugins/smap/99-smap.rules \
+		$(CURDIR)/debian/ubturbo-smap/etc/udev/rules.d/99-smap.rules
+
+	# ---- ubturbo-rmrs ----
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/bin
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/lib
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/conf
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/scripts
+	install -m 0755 $(CURDIR)/dist/release/bin/ub_turbo_exec \
 		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/bin/ub_turbo_exec
-	install -D -m 0755 $(CURDIR)/build/rpm/cat.sh \
+	install -m 0755 $(CURDIR)/build/rpm/cat.sh \
 		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/bin/cat.sh
-	install -D -m 0644 $(CURDIR)/dist/release/lib/libubturbo_client.so \
+	install -m 0644 $(CURDIR)/dist/release/lib/libubturbo_client.so \
 		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/lib/libubturbo_client.so
-	install -D -m 0644 $(CURDIR)/dist/release/lib/librmrs_ubturbo_plugin.so \
+	install -m 0644 $(CURDIR)/dist/release/lib/librmrs_ubturbo_plugin.so \
 		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/lib/librmrs_ubturbo_plugin.so
-	install -D -m 0644 $(CURDIR)/dist/release/conf/ubturbo_plugin_admission.conf \
+	install -m 0644 $(CURDIR)/dist/release/conf/ubturbo_plugin_admission.conf \
 		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/conf/ubturbo_plugin_admission.conf
-	install -D -m 0644 $(CURDIR)/dist/release/conf/ubturbo.conf \
+	install -m 0644 $(CURDIR)/dist/release/conf/ubturbo.conf \
 		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/conf/ubturbo.conf
-	install -D -m 0644 $(CURDIR)/dist/release/conf/plugin_rmrs.conf \
+	install -m 0644 $(CURDIR)/dist/release/conf/plugin_rmrs.conf \
 		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/conf/plugin_rmrs.conf
-	install -D -m 0644 $(CURDIR)/build/rpm/ubturbo.service \
+	install -m 0644 $(CURDIR)/build/rpm/ubturbo.service \
 		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/scripts/ubturbo.service
 
-	# ---- devel ----
+	# ---- ubturbo-ucache ----
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-ucache/opt/ubturbo/lib
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-ucache/opt/ubturbo/conf
+	install -m 0644 $(CURDIR)/plugins/ucache/cmake-build-release/lib/libucache_os_turbo_plugin.so \
+		$(CURDIR)/debian/ubturbo-ucache/opt/ubturbo/lib/libucache_os_turbo_plugin.so
+	install -m 0644 $(CURDIR)/plugins/ucache/cmake-build-release/conf/plugin_turbo_ucache.conf \
+		$(CURDIR)/debian/ubturbo-ucache/opt/ubturbo/conf/plugin_turbo_ucache.conf
+
+	# ---- patchelf: set rpath for rmrs binaries/libs (matches spec) ----
+	find $(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/lib -name '*.so' \
+		-exec patchelf --set-rpath '$$ORIGIN/../lib' {} \;
+	patchelf --set-rpath '$$ORIGIN/../lib' \
+		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/bin/ub_turbo_exec || true
+
+	# ---- ubturbo-devel ----
 	install -d -m 0755 $(CURDIR)/debian/ubturbo-devel/usr/include/ubturbo
 	for h in turbo_conf.h turbo_def.h turbo_ipc_client.h turbo_ipc_server.h turbo_logger.h; do \
 		install -m 0644 $(CURDIR)/include/$$h \
@@ -59,15 +146,9 @@ override_dh_auto_install:
 	install -m 0644 $(CURDIR)/src/smap/smap_interface.h \
 		$(CURDIR)/debian/ubturbo-devel/usr/include/ubturbo/
 
-	# ---- patchelf: set rpath for rmrs binaries/libs ----
-	find $(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/lib -name '*.so' \
-		-exec patchelf --set-rpath '$$ORIGIN/../lib' {} \;
-	patchelf --set-rpath '$$ORIGIN/../lib' \
-		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/bin/ub_turbo_exec
-
+# No upstream test suite.
 override_dh_auto_test:
-	# No test suite configured for package build
 
+# Match RPM spec: %global __strip /bin/true (no stripping)
 override_dh_strip:
-	# Match RPM spec: %global __strip /bin/true (no stripping)
-	# Do nothing — skip binary stripping entirely
+	@echo "Skipping strip per upstream RPM spec"
