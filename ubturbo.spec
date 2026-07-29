@@ -1,5 +1,5 @@
 %global version    1.0.0
-%global release_version 5
+%global release_version 9
 %global __strip /bin/true
 
 Name:          ubturbo
@@ -97,13 +97,6 @@ This package contains the ubturbo framework developmemt kit
 cd %{_builddir}/ubturbo/plugins/ubdma/src && make -j`nproc` -C /lib/modules/6.6.0*/build M=%{_builddir}/ubturbo/plugins/ubdma/src modules
 
 #build smap
-cd %{_builddir}
-git clone https://gitee.com/src-openeuler/spdlog.git
-mv spdlog/v1.11.0.tar.gz .
-rm -rf %{_builddir}/spdlog
-ls
-pwd
-tar -zxvf v1.11.0.tar.gz
 
 cd %{_builddir}
 cd %{_builddir}/ubturbo/plugins/smap/src/drivers && make -j`nproc` -C /lib/modules/6.6.0*/build M=%{_builddir}/ubturbo/plugins/smap/src/drivers modules
@@ -111,10 +104,6 @@ cp %{_builddir}/ubturbo/plugins/smap/src/drivers/Module.symvers %{_builddir}/ubt
 cd %{_builddir}/ubturbo/plugins/smap/src/tiering && make -j`nproc` -C /lib/modules/6.6.0*/build M=%{_builddir}/ubturbo/plugins/smap/src/tiering modules
 cd %{_builddir}/ubturbo/plugins/smap/src/ucache && make -j`nproc` -C /lib/modules/6.6.0*/build M=%{_builddir}/ubturbo/plugins/smap/src/ucache modules
 
-rm -rf %{_builddir}/ubturbo/plugins/smap/3rdparty/spdlog
-mv %{_builddir}/spdlog-1.11.0 %{_builddir}/spdlog
-cp -rf %{_builddir}/spdlog %{_builddir}/ubturbo/plugins/smap/3rdparty
-ls %{_builddir}/ubturbo/plugins/smap/3rdparty/spdlog
 cd %{_builddir}/ubturbo/plugins/smap && cmake -DCMAKE_BUILD_TYPE=Release .
 make -j`nproc` install
 
@@ -894,12 +883,20 @@ fi
 main "$@"
 
 %changelog
-* Thu May 21 2026 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-5
+* Mon Jul 13 2026 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-9
+- fix：update .spec
+* Mon Jul 13 2026 Yu yuanxun <yuyuanxun@h-partners.com> - 1.0.0-8
+- fix：update sp3
+* Tue Jul 7 2026 Yu yuanxun <yuyuanxun@h-partners.com> - 1.0.0-7
+- fix：update sp3
+* Fri Jun 26 2026 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-6
+- fix：update sp3 
+* Fri May 29 2026 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-5
+- fix：Add pre-migration remote available numa detection 
+* Thu May 21 2026 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-4
 - update: add ubturbo.rpm
-* Sun May 17 2026 Liu Jiangqi <liujiangqi1@huawei.com> - 1.0.0-4
-- update: update version for sp4
-* Wed Apr 29 2026 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-3
-- update: update version for sp4
+* Sun May 17 2026 Liu Jiangqi <liujiangqi1@huawei.com> - 1.0.0-3
+- update: update version for sp3
 * Wed Dec 24 2025 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-2
 - fix: 4k scene statistic feature
 * Wed Dec 3 2025 Wang Sheng <wangsheng138@h-partners.com> - 1.0.0-1
