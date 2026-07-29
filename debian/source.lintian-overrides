@@ -1,0 +1,21 @@
+# Source-level lintian overrides for ubturbo.
+#
+# The following lintian tags are emitted by design because the Debian
+# packaging mirrors the upstream RPM spec (ubturbo.spec). They are reviewed
+# and considered acceptable.
+
+# Kernel modules are installed under /lib/modules/{smap,ucache}
+# (not /lib/modules/$(uname -r)/) because the spec uses depmod's external
+# module directory feature, configured in /etc/depmod.d/*.conf by
+# ubturbo-smap.postinst.
+ubturbo source: dir-or-file-in-non-standard-dir
+
+# The spec sets %global __strip /bin/true to preserve debug symbols and
+# uses patchelf to set RUNPATH=$ORIGIN/../lib so the daemon can locate its
+# bundled libraries under /opt/ubturbo. Stripping is disabled in
+# debian/rules (override_dh_strip).
+ubturbo source: binary-or-shlib-defs-rpath
+
+# Kernel modules ship with mode 0500 to match the RPM spec's
+# %{__install} -b -m 0500 directives.
+ubturbo source: non-standard-file-perm

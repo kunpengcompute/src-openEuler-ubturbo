@@ -1,1 +1,2 @@
 remove-openEuler-release-dependency.patch
+adapt-to-different-kernels.patch

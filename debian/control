@@ -2,6 +2,7 @@ Source: ubturbo
 Section: admin
 Priority: optional
 Maintainer: openEuler Maintainers <maintainers@openeuler.org>
+Standards-Version: 4.6.0
 Build-Depends: debhelper-compat (= 13),
                make (>= 4.3),
                gcc (>= 10.3.1),
@@ -11,22 +12,56 @@ Build-Depends: debhelper-compat (= 13),
                ninja-build,
                patchelf,
                chrpath,
-               pkg-config
-Standards-Version: 4.6.0
+               pkg-config,
+               libboundscheck-dev,
+               flex,
+               bison,
+               libelf-dev,
+               libssl-dev,
+               libncurses-dev,
+               linux-headers-generic [arm64] | linux-headers [arm64],
+               kmod
+Rules-Requires-Root: binary-targets
 Homepage: https://gitee.com/openeuler/ubturbo
 
 Package: ubturbo-rmrs
 Architecture: arm64
-Depends: ${misc:Depends}, ${shlibs:Depends}
+Depends: ${misc:Depends}, ${shlibs:Depends},
+         coreutils, ubturbo-smap (= ${binary:Version}), ubturbo-ucache (= ${binary:Version})
 Description: UB Turbo resource management framework
  This package contains the ubturbo daemon (ub_turbo_exec),
  client library (libubturbo_client.so), RMRS plugin,
- configuration files, and systemd service.
+ configuration files, and the systemd service unit.
+ .
+ It is the core of the ubturbo framework and depends on the smap
+ and ucache companion packages shipped from the same source.
+
+Package: ubturbo-smap
+Architecture: arm64
+Depends: ${misc:Depends}, ${shlibs:Depends}, kmod
+Description: SMAP driver and tiering kernel modules for ubturbo
+ This package contains the SMAP driver kernel modules
+ (smap_tracking_core, smap_access_tracking, smap_histogram_tracking,
+ smap_tiering) and the ucache kernel module, along with the
+ userspace libsmap.so library and the udev rule that governs
+ device permissions.
+
+Package: ubturbo-ucache
+Architecture: arm64
+Depends: ${misc:Depends}, ${shlibs:Depends}, ubturbo-rmrs (= ${binary:Version})
+Description: UCache userspace plugin for ubturbo
+ This package contains the Huawei UCache userspace plugin
+ (libucache_os_turbo_plugin.so) and its configuration file
+ loaded by the ubturbo daemon.
 
 Package: ubturbo-devel
 Section: libdevel
 Architecture: arm64
-Depends: ${misc:Depends}
-Description: Development headers for UB Turbo framework
- This package contains C headers for integrating with the
- UB Turbo SDK (turbo_conf.h, turbo_def.h, turbo_ipc_*.h, etc.).
+Multi-Arch: same
+Depends: ${misc:Depends}, ubturbo-rmrs (= ${binary:Version})
+Description: Development headers for the UB Turbo framework
+ This package contains the C headers required to integrate with
+ the UB Turbo SDK, including turbo_conf.h, turbo_def.h,
+ turbo_ipc_client.h, turbo_ipc_server.h, turbo_logger.h,
+ turbo_serialize.h, turbo_rmrs_interface.h,
+ turbo_ucache_interface.h and smap_interface.h.
