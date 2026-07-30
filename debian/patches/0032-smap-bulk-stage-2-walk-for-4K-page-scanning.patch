@@ -1,0 +1,441 @@
+From 7ff275fa043caead368770d4ef4b917ec58be736 Mon Sep 17 00:00:00 2001
+From: Jiming Pang <discrete_brain@163.com>
+Date: Sat, 11 Jul 2026 17:56:48 +0800
+Subject: [PATCH 32/43] smap: bulk stage-2 walk for 4K page scanning
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replace per-4K-page kvm_pgtable_walk(addr, 1) calls with PMD-granularity
+bulk walks that descend the upper page table levels (PGD/PUD/PMD) once
+per 2MB range instead of 512 times.
+
+Add smap_kvm_pgtable_stage2_mkold_range() in kvm_pgtable.c which walks
+[addr, addr+size) via KVM_PGTABLE_WALK_LEAF | SHARED, invoking the
+caller per-PTE callback for each leaf entry. The callback-based design
+keeps generic PTE-level AF test/clear in kvm_pgtable.c while HVA→HPA
+recording stays in accessed_bit.c.
+
+The 4K scan loop in process_memslot_pages_4k() iterates at PMD
+granularity aligned to HVA PMD boundaries via hva_to_gfn_memslot(),
+ensuring each walk range falls within a single HVA PMD for correct
+bloom filter keying. Non-4K (huge page) scanning continues via the
+existing per-page process_memslot_pages() path unchanged.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ plugins/smap/src/drivers/Makefile       |   4 +
+ plugins/smap/src/drivers/accessed_bit.c | 206 ++++++++++++++++++------
+ plugins/smap/src/drivers/kvm_pgtable.c  |  74 +++++++++
+ plugins/smap/src/drivers/kvm_pgtable.h  |  27 ++++
+ 4 files changed, 263 insertions(+), 48 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/Makefile b/plugins/smap/src/drivers/Makefile
+index 1bae0b9..684cd17 100644
+--- a/plugins/smap/src/drivers/Makefile
++++ b/plugins/smap/src/drivers/Makefile
+@@ -12,6 +12,10 @@ smap_histogram_tracking-objs := ub_hist.o
+ 
+ ccflags-y += -DACPI_NOT_READY
+ 
++ifdef DEBUG_SCAN_DETAIL
++	ccflags-y += -DDEBUG_SCAN_DETAIL
++endif
++
+ ifeq ($(KERNEL_VERSION), ocos)
+     ccflags-y += -DKERNEL_OCOS
+ else ifeq ($(KERNEL_VERSION), velinux)
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index 4d25932..a47fd5e 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -516,6 +516,47 @@ static void actc_data_update(int nid, phys_addr_t paddr, u64 pa_index)
+ 	}
+ }
+ 
++static void actc_data_add_fast(phys_addr_t paddr, u32 page_size,
++			       struct access_pid *ap)
++{
++	struct access_tracking_dev *adev;
++	int ret, nid;
++	u64 pa_index;
++
++	nid = get_numa_id_by_paddr(paddr);
++	if (unlikely(nid == NUMA_NO_NODE))
++		return;
++
++	if (nid < nr_local_numa) {
++		ret = calc_paddr_acidx_acpi_known_nid(paddr, nid, &pa_index,
++						      page_size);
++	} else {
++		ret = calc_paddr_acidx_iomem_known_nid(paddr, nid, &pa_index,
++						       page_size);
++	}
++
++	if (unlikely(ret))
++		return;
++
++	adev = get_access_tracking_dev(nid);
++	if (unlikely(!adev || pa_index >= adev->page_count || adev->is_hist))
++		return;
++
++	struct page *page = pfn_to_online_page(PHYS_PFN(paddr));
++	if (!page)
++		return;
++	if (smap_page_init(page)) {
++		smap_page_mark(page);
++		/* New pages: use per-PID cached mean value */
++		adev->access_bit_actc_data[pa_index] = ap->actc_mean_value;
++	} else {
++		adev->access_bit_actc_data[pa_index]++;
++		if (adev->access_bit_actc_data[pa_index] >= ACTC_MAX) {
++			ap->decay_flag = true;
++		}
++	}
++}
++
+ static int hva_to_hpa_hugetlb(struct kvm *kvm, u64 host_va,
+ 			      struct access_pid *ap, bool is_young)
+ {
+@@ -947,6 +988,120 @@ static bool memslot_is_mem(struct kvm_memory_slot *memslot)
+ 	return true;
+ }
+ 
++/* Context passed to the bulk stage-2 walker callback for each young PTE */
++struct smap_bulk_memslot_ctx {
++	struct kvm *kvm;
++	struct kvm_memory_slot *memslot;
++	struct access_pid *ap;
++};
++
++/*
++ * smap_bulk_pte_cb — per-PTE callback for bulk stage-2 mkold range walk.
++ *
++ * Called by smap_stage2_range_walker for each valid leaf PTE in the walk
++ * range. Converts GPA to HVA via the memslot and records the physical page
++ * frame (and updates actc_data for young pages) via hva_to_hpa.
++ */
++static int smap_bulk_pte_cb(u64 gpa, u64 hpa, bool young, bool pte_valid,
++			    void *arg)
++{
++	struct smap_bulk_memslot_ctx *ctx = arg;
++	struct access_pid *ap = ctx->ap;
++	unsigned long hva;
++	struct page *page;
++	int ret = 0;
++
++	/* Skip cold PTEs unless this is the last scan (need page counting) */
++	if (!young && !access_pid_cur_last_scanning(ap))
++		return 0;
++
++	if (pte_valid) {
++		if (young)
++			actc_data_add_fast(hpa, PAGE_SIZE, ap);
++		if (access_pid_cur_last_scanning(ap)) {
++			page = pfn_to_online_page(PHYS_PFN(hpa));
++			if (!page || !try_get_page(page))
++				return 0;
++			if (young) {
++				smap_page_cold_periods_reset(page);
++				add_to_bm_page(hpa, ap);
++			} else {
++				int cold_nid = pfn_to_nid(PHYS_PFN(hpa));
++
++				if (smap_page_cold_periods_inc(page) >=
++					    g_cold_period_threshold &&
++				    !smap_cold_queue_enqueue(cold_nid,
++							     PHYS_PFN(hpa))) {
++					/* enqueued into cold_queue; skip bitmap */
++				} else {
++					add_to_bm_page(hpa, ap);
++				}
++			}
++			put_page(page);
++		}
++	} else {
++		hva = gfn_to_hva_memslot(ctx->memslot, gpa >> PAGE_SHIFT);
++		ret = hva_to_hpa(ctx->kvm, hva, ap, young);
++	}
++
++	return ret;
++}
++
++static void smap_bulk_hole_cb(u64 gpa_start, u64 gpa_end, void *arg)
++{
++	struct smap_bulk_memslot_ctx *ctx = arg;
++	struct access_pid *ap = ctx->ap;
++	unsigned long hva;
++	gfn_t start = gpa_start >> PAGE_SHIFT;
++	gfn_t end = gpa_end >> PAGE_SHIFT;
++	gfn_t gfn;
++
++	if (!access_pid_cur_last_scanning(ap))
++		return;
++
++	for (gfn = start; gfn < end; gfn++) {
++		hva = gfn_to_hva_memslot(ctx->memslot, gfn);
++		(void)hva_to_hpa(ctx->kvm, hva, ap, false);
++	}
++}
++
++static inline void update_bloom_if_pmd_hot(struct access_pid *ap,
++					   unsigned long pmd, int total_ptes,
++					   int young_ptes)
++{
++	if (suitable_to_scan(total_ptes, young_ptes))
++		update_bloom_filter(ap, ap->scan_seq, pmd);
++}
++
++static inline bool should_skip_pmd(struct access_pid *ap, unsigned long pmd)
++{
++	return !ap->force_scan && !access_pid_cur_last_scanning(ap) &&
++	       !test_bloom_filter(ap, ap->scan_seq - 1, pmd);
++}
++
++static int process_memslot_pages_4k(struct kvm *kvm,
++				    struct kvm_memory_slot *memslot,
++				    struct access_pid *ap)
++{
++	u64 memslot_start = memslot->base_gfn << PAGE_SHIFT;
++	u64 memslot_end = (memslot->base_gfn + memslot->npages) << PAGE_SHIFT;
++	struct smap_bulk_memslot_ctx bulk_ctx = {
++		.kvm = kvm,
++		.memslot = memslot,
++		.ap = ap,
++	};
++	struct smap_stage2_range_data range_data = {
++		.on_pte = smap_bulk_pte_cb,
++		.on_hole = smap_bulk_hole_cb,
++		.cb_arg = &bulk_ctx,
++	};
++
++	(void)smap_kvm_pgtable_stage2_mkold_range(kvm->arch.mmu.pgt,
++		memslot_start, memslot_end - memslot_start, &range_data);
++
++	return 0;
++}
++
+ static int collect_statistic_vaddr(struct kvm *kvm,
+ 				   struct kvm_memory_slot *memslot,
+ 				   struct access_pid *ap, int page_size,
+@@ -986,11 +1141,6 @@ static int process_memslot_pages(struct kvm *kvm,
+ 	int ret;
+ 	u64 paddr;
+ 	struct page *page;
+-	unsigned long last_pmd = 0;
+-	int pmd_total = 0;
+-	int pmd_young = 0;
+-	bool use_bloom = (page_size == PAGE_SIZE && ap->type == NORMAL_SCAN &&
+-			  ap->bloom_filter[0]);
+ 
+ 	for (gpa = memslot->base_gfn << PAGE_SHIFT;
+ 	     gpa < (memslot->base_gfn + memslot->npages) << PAGE_SHIFT;
+@@ -1002,33 +1152,6 @@ static int process_memslot_pages(struct kvm *kvm,
+ 
+ 		hva = gfn_to_hva_memslot(memslot, gpa_to_gfn(gpa));
+ 
+-		if (use_bloom) {
+-			unsigned long pmd = hva & PMD_MASK;
+-			bool skip;
+-
+-			if (pmd != last_pmd && last_pmd != 0) {
+-				if (pmd_total > 0 &&
+-				    suitable_to_scan(pmd_total, pmd_young))
+-					update_bloom_filter(ap, ap->scan_seq,
+-							    last_pmd);
+-				pmd_total = 0;
+-				pmd_young = 0;
+-			}
+-
+-			if (pmd != last_pmd) {
+-				ap->total_pmds++;
+-				last_pmd = pmd;
+-				skip = !ap->force_scan &&
+-				       !access_pid_cur_last_scanning(ap) &&
+-				       !test_bloom_filter(ap, ap->scan_seq - 1, pmd);
+-				if (skip)
+-					ap->skipped_pmds++;
+-			}
+-
+-			if (skip)
+-				continue;
+-		}
+-
+ #ifdef DEBUG_SCAN_DETAIL
+ 		start_time = ktime_get();
+ #endif
+@@ -1040,12 +1163,6 @@ static int process_memslot_pages(struct kvm *kvm,
+ 		ap->total_walk_time_ns += walk_time;
+ #endif
+ 
+-		if (use_bloom) {
+-			pmd_total++;
+-			if (is_young)
+-				pmd_young++;
+-		}
+-
+ 		if (!is_young && !access_pid_cur_last_scanning(ap))
+ 			continue;
+ 		if (paddr) {
+@@ -1098,12 +1215,6 @@ static int process_memslot_pages(struct kvm *kvm,
+ 			continue;
+ 	}
+ 
+-	if (use_bloom && last_pmd != 0) {
+-		if (pmd_total > 0 &&
+-		    suitable_to_scan(pmd_total, pmd_young))
+-			update_bloom_filter(ap, ap->scan_seq, last_pmd);
+-	}
+-
+ 	return 0;
+ }
+ 
+@@ -1198,7 +1309,7 @@ static int scan_kvm_memslots_4k(struct kvm *kvm, struct access_pid *ap,
+ 	kvm_for_each_memslot(memslot, bkt, slots) {
+ 		if (!memslot_is_mem(memslot))
+ 			continue;
+-		process_memslot_pages(kvm, memslot, ap, page_size);
++		process_memslot_pages_4k(kvm, memslot, ap);
+ 	}
+ #ifdef DEBUG_SCAN_DETAIL
+ 	start_time = ktime_get();
+@@ -1798,7 +1909,6 @@ static void update_bloom_filter(struct access_pid *ap, unsigned long seq,
+ static bool suitable_to_scan(int total, int young)
+ {
+ 	int n = clamp_t(int, cache_line_size() / sizeof(pte_t), 2, 8);
+-	pr_debug("suitable_to_scan: total=%d young=%d\n", total, young);
+ 	return young * n >= total;
+ }
+ 
+@@ -1812,8 +1922,8 @@ static int smap_pmd_entry(pmd_t *pmd, unsigned long addr, unsigned long next,
+ 
+ 	/* Flush previous PMD's suitable_to_scan result into bloom filter */
+ 	if (pte_walk->current_pmd_valid &&
+-	    pte_walk->current_pmd != current_pmd_addr &&
+-	    ap->bloom_filters[0] && pte_walk->pmd_total > 0) {
++	    pte_walk->current_pmd != current_pmd_addr && ap->bloom_filters[0] &&
++	    pte_walk->pmd_total > 0) {
+ 		if (suitable_to_scan(pte_walk->pmd_total, pte_walk->pmd_young))
+ 			update_bloom_filter(ap, ap->scan_seq,
+ 					    pte_walk->current_pmd);
+diff --git a/plugins/smap/src/drivers/kvm_pgtable.c b/plugins/smap/src/drivers/kvm_pgtable.c
+index 4eb112d..7734394 100644
+--- a/plugins/smap/src/drivers/kvm_pgtable.c
++++ b/plugins/smap/src/drivers/kvm_pgtable.c
+@@ -378,3 +378,77 @@ bool smap_kvm_pgtable_stage2_is_young(struct kvm_pgtable *pgt, u64 addr)
+ {
+ 	return smap_kvm_pgtable_stage2_test_clear_young(pgt, addr, false, NULL);
+ }
++
++/*
++ * smap_stage2_range_walker — bulk leaf callback for stage-2 mkold range walk.
++ *
++ * Called for each leaf PTE in the range. Reads the access flag, invokes the
++ * caller's per-PTE callback (which typically records the HVA and updates
++ * actc_data), then clears AF via cmpxchg. On cmpxchg race returns -EAGAIN;
++ * the walk continues because HANDLE_FAULT is not set.
++ *
++ * Counters in struct smap_stage2_range_data are updated for each valid PTE
++ * so the caller can decide (e.g. via suitable_to_scan) whether to mark the
++ * enclosing PMD as hot in the bloom filter.
++ */
++static int smap_stage2_range_walker(const struct kvm_pgtable_visit_ctx *ctx,
++				    enum kvm_pgtable_walk_flags visit)
++{
++	struct smap_stage2_range_data *data = ctx->arg;
++	kvm_pte_t new;
++	bool pte_valid;
++	bool young;
++	u64 hpa;
++
++#ifdef KERNEL_VELINUX
++	if (ctx->level < KVM_PGTABLE_LAST_LEVEL) {
++#else
++	if (ctx->level < KVM_PGTABLE_MAX_LEVELS - 1) {
++#endif
++		u64 hole_end = ctx->addr + kvm_granule_size(ctx->level);
++		data->on_hole(ctx->addr, hole_end, data->cb_arg);
++		return 0;
++	}
++
++	pte_valid = kvm_pte_valid(ctx->old);
++	new = ctx->old & ~KVM_PTE_LEAF_ATTR_LO_S2_AF;
++	young = (new != ctx->old);
++	hpa = kvm_pte_to_phys(ctx->old);
++
++	data->total_ptes++;
++	(void)data->on_pte(ctx->addr, hpa, young, pte_valid, data->cb_arg);
++
++	if (pte_valid && young) {
++		data->young_ptes++;
++		stage2_try_set_pte(ctx, new);
++	}
++
++	return 0;
++}
++
++/*
++ * smap_kvm_pgtable_stage2_mkold_range — bulk test-and-clear AF over a GPA range.
++ *
++ * Walks the stage-2 page table for [addr, addr+size), calling @on_pte for
++ * each valid leaf PTE whose access flag is set. The upper page table levels
++ * (PGD, PUD, PMD) are descended only once per invocation, eliminating the
++ * redundant descents incurred by per-4K-page calls.
++ *
++ * @data->total_ptes and @data->young_ptes are set on return so the caller
++ * can update the bloom filter at PMD granularity.
++ */
++int smap_kvm_pgtable_stage2_mkold_range(struct kvm_pgtable *pgt, u64 addr,
++					u64 size,
++					struct smap_stage2_range_data *data)
++{
++	struct kvm_pgtable_walker walker = {
++		.cb = smap_stage2_range_walker,
++		.arg = data,
++		.flags = KVM_PGTABLE_WALK_LEAF | KVM_PGTABLE_WALK_SHARED,
++	};
++
++	data->total_ptes = 0;
++	data->young_ptes = 0;
++
++	return kvm_pgtable_walk(pgt, addr, size, &walker);
++}
+diff --git a/plugins/smap/src/drivers/kvm_pgtable.h b/plugins/smap/src/drivers/kvm_pgtable.h
+index e7f889c..b21b7ad 100644
+--- a/plugins/smap/src/drivers/kvm_pgtable.h
++++ b/plugins/smap/src/drivers/kvm_pgtable.h
+@@ -15,4 +15,31 @@ bool smap_kvm_pgtable_stage2_mkold(struct kvm_pgtable *pgt, u64 addr, u64 *paddr
+ 
+ bool smap_kvm_pgtable_stage2_is_young(struct kvm_pgtable *pgt, u64 addr);
+ 
++/*
++ * Callback for bulk stage-2 walk: called for each valid leaf PTE.
++ * @gpa: guest physical address of the PTE
++ * @young: true if the access flag was set
++ * @pte_valid: true if the PTE is valid
++ * @arg: caller-provided context
++ * Returns: 0 on success, negative on error (stops the walk)
++ */
++typedef int (*smap_pte_cb)(u64 gpa, u64 hpa, bool young, bool pte_valid,
++			   void *arg);
++
++typedef void (*smap_hole_cb)(u64 gpa_start, u64 gpa_end, void *arg);
++
++/* Per-range data for bulk stage-2 mkold walk */
++struct smap_stage2_range_data {
++	smap_pte_cb on_pte;
++	smap_hole_cb on_hole;
++	void *cb_arg;
++	/* Output: counters set by the walk */
++	int total_ptes;
++	int young_ptes;
++};
++
++int smap_kvm_pgtable_stage2_mkold_range(struct kvm_pgtable *pgt, u64 addr,
++					u64 size,
++					struct smap_stage2_range_data *data);
++
+ #endif /* _KVM_PGTABLE_H */
+-- 
+2.54.0.windows.1
+

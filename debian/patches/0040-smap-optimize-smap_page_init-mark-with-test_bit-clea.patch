@@ -1,0 +1,58 @@
+From 8253a3b3dafee91401705ab499abd347e75bdf99 Mon Sep 17 00:00:00 2001
+From: lucas <1358497393@qq.com>
+Date: Mon, 27 Jul 2026 11:24:41 +0800
+Subject: [PATCH 40/43] smap: optimize smap_page_init/mark with
+ test_bit/clear_bit
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replace cmpxchg loop in smap_page_mark with clear_bit, which is a
+single atomic instruction on aarch64 (STLR or LL/SC). The cmpxchg
+loop was overkill for clearing a single bit — it retried whenever
+any other bit in page->flags changed concurrently, but we only care
+about bit 4 being cleared.
+
+Replace READ_ONCE + mask in smap_page_init with test_bit, which
+provides equivalent volatile-read semantics more concisely.
+
+Add <linux/bitops.h> for the bit operation primitives.
+---
+ plugins/smap/src/drivers/smap_page_flags.h | 9 +++------
+ 1 file changed, 3 insertions(+), 6 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/smap_page_flags.h b/plugins/smap/src/drivers/smap_page_flags.h
+index ff13eb9..9d0471e 100644
+--- a/plugins/smap/src/drivers/smap_page_flags.h
++++ b/plugins/smap/src/drivers/smap_page_flags.h
+@@ -17,6 +17,7 @@
+ #define _SRC_SMAP_PAGE_FLAGS_H
+ 
+ #include <linux/compiler.h>
++#include <linux/bitops.h>
+ #include <linux/mm.h>
+ #include <linux/mmzone.h>
+ #include <asm/cmpxchg.h>
+@@ -73,17 +74,13 @@ static inline u8 smap_page_cold_periods_inc(struct page *page)
+ /* Init flag: true if page never seen by SMAP (bit 4 = 1). */
+ static inline bool smap_page_init(struct page *page)
+ {
+-	return (READ_ONCE(page->flags) & SMAP_INIT_FLAG_MASK) != 0;
++	return test_bit(SMAP_INIT_FLAG_SHIFT, &page->flags);
+ }
+ 
+ /* Clear init flag (bit 4 → 0); no other bits touched. */
+ static inline void smap_page_mark(struct page *page)
+ {
+-	unsigned long old, new;
+-	do {
+-		old = READ_ONCE(page->flags);
+-		new = old & ~SMAP_INIT_FLAG_MASK;
+-	} while (unlikely(cmpxchg(&page->flags, old, new) != old));
++	clear_bit(SMAP_INIT_FLAG_SHIFT, &page->flags);
+ }
+ 
+ #endif /* _SRC_SMAP_PAGE_FLAGS_H */
+-- 
+2.54.0.windows.1
+

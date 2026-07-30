@@ -1,0 +1,88 @@
+From 5e1eb662ada82a37561210958a7bc1f5f16a4795 Mon Sep 17 00:00:00 2001
+From: yuyuanxun <2972982755@qq.com>
+Date: Fri, 26 Jun 2026 17:15:24 +0800
+Subject: [PATCH 05/43] fix(smap): Accurately calculate the amount of migration
+
+---
+ plugins/smap/src/tiering/iomem.c           |  4 ++--
+ plugins/smap/src/tiering/tracking_manage.c |  4 ++--
+ plugins/smap/src/user/manage/manage.c      |  2 +-
+ plugins/smap/src/user/strategy/migration.c | 11 ++++++-----
+ 4 files changed, 11 insertions(+), 10 deletions(-)
+
+diff --git a/plugins/smap/src/tiering/iomem.c b/plugins/smap/src/tiering/iomem.c
+index b3ace89..a737b23 100644
+--- a/plugins/smap/src/tiering/iomem.c
++++ b/plugins/smap/src/tiering/iomem.c
+@@ -412,7 +412,7 @@ int iterate_obmm_dev_dir(void)
+ 
+ 	dir_file = filp_open(OBMM_SYS_DIR, O_RDONLY | O_DIRECTORY, 0);
+ 	if (IS_ERR(dir_file)) {
+-		pr_err("failed to open obmm directory: %s\n", OBMM_SYS_DIR);
++		// pr_err("failed to open obmm directory: %s\n", OBMM_SYS_DIR);
+ 		return PTR_ERR(dir_file);
+ 	}
+ 
+@@ -444,7 +444,7 @@ int iterate_obmm_dev(void)
+ 
+ 	ret = iterate_obmm_dev_dir();
+ 	if (ret) {
+-		pr_err("failed to iterate obmm_dev directory, ret: %d\n", ret);
++		// pr_err("failed to iterate obmm_dev directory, ret: %d\n", ret);
+ 		goto out;
+ 	}
+ 
+diff --git a/plugins/smap/src/tiering/tracking_manage.c b/plugins/smap/src/tiering/tracking_manage.c
+index d4f8b5b..ac6e957 100644
+--- a/plugins/smap/src/tiering/tracking_manage.c
++++ b/plugins/smap/src/tiering/tracking_manage.c
+@@ -130,8 +130,8 @@ static void migrate_back_work_func(struct work_struct *work)
+ 
+ 	ret = iterate_obmm_dev();
+ 	if (ret) {
+-		pr_err("failed to iterate obmm_dev in migrate back schedule, ret: %d\n",
+-		       ret);
++		// pr_err("failed to iterate obmm_dev in migrate back schedule, ret: %d\n",
++		//        ret);
+ 	}
+ 
+ next:
+diff --git a/plugins/smap/src/user/manage/manage.c b/plugins/smap/src/user/manage/manage.c
+index 389c7cb..0f81544 100644
+--- a/plugins/smap/src/user/manage/manage.c
++++ b/plugins/smap/src/user/manage/manage.c
+@@ -1279,7 +1279,7 @@ static void CalcActcStats(ProcessAttr *attr)
+         for (uint64_t i = 0; i < actcLen; i++) {
+             actc_t freq = actc[i].freq;
+             uint16_t bucketIdx = MIN(freq, FREQ_BUCKETS_SIZE - 1);
+-            if (!actc[i].isWhiteListPage) {
++            if (nid >= nrLocalNuma || !actc[i].isWhiteListPage) {
+                 count->freqBuckets[bucketIdx]++;
+             }
+             if (freq != 0) {
+diff --git a/plugins/smap/src/user/strategy/migration.c b/plugins/smap/src/user/strategy/migration.c
+index 1dab02c..4d38d99 100644
+--- a/plugins/smap/src/user/strategy/migration.c
++++ b/plugins/smap/src/user/strategy/migration.c
+@@ -44,12 +44,13 @@ int AddMigList(struct MigrateMsg *mMsg, struct MigList *mList)
+     if (mList->nr == 0 || mList->addr == NULL) {
+         return 0;
+     }
+-    freePageNum = IsHugeMode() ? GetNrFreeHugePagesByNode(mList->to) : GetNrFreePagesByNode(mList->to);
+-    if (freePageNum == 0) {
+-        return 0;
+-    }
++    // freePageNum = IsHugeMode() ? GetNrFreeHugePagesByNode(mList->to) : GetNrFreePagesByNode(mList->to);
++    // if (freePageNum == 0) {
++    //     return 0;
++    // }
+ 
+-    migrateNum = MIN(mList->nr, freePageNum);
++    // migrateNum = MIN(mList->nr, freePageNum);
++    migrateNum = mList->nr;
+     SMAP_LOGGER_DEBUG("mList->nr: %lu, migrateNum: %lu.", mList->nr, migrateNum);
+     if (migrateNum < mList->nr) {
+         SMAP_LOGGER_INFO("Change migrate num from %llu to %llu.", mList->nr, migrateNum);
+-- 
+2.54.0.windows.1
+

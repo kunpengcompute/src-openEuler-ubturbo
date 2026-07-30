@@ -1,0 +1,43 @@
+From 88f4f70cc16b02185ef2c5ee8132ed9bb031932d Mon Sep 17 00:00:00 2001
+From: lucas <1358497393@qq.com>
+Date: Wed, 3 Jun 2026 12:30:40 +0800
+Subject: [PATCH 12/43] chore: increase MAX_PROCESSES_CNT to 500
+
+---
+ plugins/smap/src/tiering/common.h     | 4 ++--
+ plugins/smap/src/user/manage/manage.h | 4 ++--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/plugins/smap/src/tiering/common.h b/plugins/smap/src/tiering/common.h
+index 065a743..35627bf 100644
+--- a/plugins/smap/src/tiering/common.h
++++ b/plugins/smap/src/tiering/common.h
+@@ -23,8 +23,8 @@
+ #define TWO_MEGA_SHIFT 21
+ #define TWO_MEGA_SIZE (1UL << TWO_MEGA_SHIFT)
+ #define TWO_MEGA_MASK (~(TWO_MEGA_SIZE - 1))
+-#define MAX_4K_PROCESSES_CNT 300
+-#define MAX_2M_PROCESSES_CNT 100
++#define MAX_4K_PROCESSES_CNT 500
++#define MAX_2M_PROCESSES_CNT 500
+ #define MAX_PER_PID_MIG_LIST_COUNT 8
+ #define MAX_2M_MIGMSG_CNT (MAX_2M_PROCESSES_CNT * MAX_PER_PID_MIG_LIST_COUNT)
+ #define MAX_4K_MIGMSG_CNT (MAX_4K_PROCESSES_CNT * MAX_PER_PID_MIG_LIST_COUNT)
+diff --git a/plugins/smap/src/user/manage/manage.h b/plugins/smap/src/user/manage/manage.h
+index a9520e4..bda5171 100644
+--- a/plugins/smap/src/user/manage/manage.h
++++ b/plugins/smap/src/user/manage/manage.h
+@@ -33,8 +33,8 @@
+ #endif
+ #define RESERVED_RATIO 0.05
+ #define RESERVED_MEMORY 200
+-#define MAX_4K_PROCESSES_CNT 300
+-#define MAX_2M_PROCESSES_CNT 100
++#define MAX_4K_PROCESSES_CNT 500
++#define MAX_2M_PROCESSES_CNT 500
+ #define MAX_THREADS 10
+ #define MAX_RES_LEN 4
+ #define PAGE_SHIFT 12
+-- 
+2.54.0.windows.1
+

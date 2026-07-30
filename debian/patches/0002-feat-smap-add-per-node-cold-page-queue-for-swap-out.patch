@@ -1,0 +1,333 @@
+From fef27047bc68ac530f513b2bcc2675dc56e71800 Mon Sep 17 00:00:00 2001
+From: Pang Jiming <discrete_brain@163.com>
+Date: Tue, 16 Jun 2026 14:31:09 +0800
+Subject: [PATCH 02/43] feat(smap): add per-node cold page queue for swap-out
+
+Add lockless per-node circular buffer to collect remote cold pages
+whose consecutive-cold-period counter reaches SMAP_COLD_PERIOD_THRESHOLD.
+Pages are enqueued during the scan path and drained during the migrate
+path.
+
+Since scan and drain are guaranteed separated in the business model,
+no locking is needed on the queue.
+---
+ plugins/smap/src/drivers/Makefile          |  2 +-
+ plugins/smap/src/drivers/access_tracking.c |  7 ++
+ plugins/smap/src/drivers/accessed_bit.c    | 34 +++++++---
+ plugins/smap/src/drivers/smap_cold_queue.c | 78 ++++++++++++++++++++++
+ plugins/smap/src/drivers/smap_cold_queue.h | 38 +++++++++++
+ plugins/smap/src/drivers/smap_page_flags.h | 28 ++++++--
+ plugins/smap/src/tiering/Makefile          |  2 +-
+ 7 files changed, 172 insertions(+), 17 deletions(-)
+ create mode 100644 plugins/smap/src/drivers/smap_cold_queue.c
+ create mode 100644 plugins/smap/src/drivers/smap_cold_queue.h
+
+diff --git a/plugins/smap/src/drivers/Makefile b/plugins/smap/src/drivers/Makefile
+index 2701e14..254d12b 100644
+--- a/plugins/smap/src/drivers/Makefile
++++ b/plugins/smap/src/drivers/Makefile
+@@ -7,7 +7,7 @@ obj-m += smap_histogram_tracking.o
+ 
+ smap_tracking_core-objs := core.o
+ smap_tracking_core-objs += bus.o
+-smap_access_tracking-objs := access_iomem.o access_acpi_helper.o access_acpi_mem.o hist_ops.o hist_tracking.o accessed_bit.o access_ioctl.o access_pid.o access_mmu.o access_tracking.o kvm_pgtable.o access_tracking_wrapper.o memory_notifier.o
++smap_access_tracking-objs := access_iomem.o access_acpi_helper.o access_acpi_mem.o hist_ops.o hist_tracking.o accessed_bit.o access_ioctl.o access_pid.o access_mmu.o access_tracking.o kvm_pgtable.o access_tracking_wrapper.o memory_notifier.o smap_cold_queue.o
+ smap_histogram_tracking-objs := ub_hist.o
+ 
+ ccflags-y += -DACPI_NOT_READY
+diff --git a/plugins/smap/src/drivers/access_tracking.c b/plugins/smap/src/drivers/access_tracking.c
+index b44ca67..1738c56 100644
+--- a/plugins/smap/src/drivers/access_tracking.c
++++ b/plugins/smap/src/drivers/access_tracking.c
+@@ -32,6 +32,7 @@
+ #include "access_pid.h"
+ #include "hist_ops.h"
+ #include "access_tracking.h"
++#include "smap_cold_queue.h"
+ 
+ #define MAX_SCAN_TIME 100000 /* 100s */
+ #define MS_TO_US 1000
+@@ -540,6 +541,9 @@ static int __init access_tracking_init(void)
+ 	}
+ 	spin_lock_init(&ham_lock);
+ 	init_rwsem(&statistic_lock);
++	ret = smap_cold_queue_init();
++	if (ret)
++		goto err_cold_queue;
+ 	ret = remote_ram_init();
+ 	if (ret) {
+ 		goto err_remote_ram;
+@@ -582,6 +586,8 @@ err_ioctl:
+ 	release_remote_ram();
+ err_remote_ram:
+ 	reset_acpi_mem();
++err_cold_queue:
++	smap_cold_queue_free();
+ 	return ret;
+ }
+ 
+@@ -594,6 +600,7 @@ static void __exit access_tracking_exit(void)
+ 	release_adev();
+ 	release_remote_ram();
+ 	reset_acpi_mem();
++	smap_cold_queue_free();
+ 	memory_notifier_exit();
+ 	pr_info("access tracking exit successfully\n");
+ }
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index 3d68fa8..3a382cf 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -35,6 +35,7 @@
+ #include "access_mmu.h"
+ #include "access_tracking.h"
+ #include "smap_page_flags.h"
++#include "smap_cold_queue.h"
+ #include "accessed_bit.h"
+ 
+ #define DECIMAL 10
+@@ -457,15 +458,23 @@ static int hva_to_hpa_hugetlb(struct kvm *kvm, u64 host_va,
+ 		 * End of period: update cold-period counter from
+ 		 * accumulated actc_data.
+ 		 */
+-		if (entry) {
+-			page = pfn_to_online_page(PHYS_PFN(paddr));
+-			if (page) {
+-				if (*entry > 0)
+-					smap_page_cold_periods_reset(page);
+-				else
+-					smap_page_cold_periods_inc(page);
+-			}
++		if (!entry)
++			return 0;
++		page = pfn_to_online_page(PHYS_PFN(paddr));
++		if (!page || !try_get_page(page))
++			return 0;
++		if (*entry > 0)
++			smap_page_cold_periods_reset(page);
++		else {
++			int cold_nid = pfn_to_nid(PHYS_PFN(paddr));
++
++			if (smap_page_cold_periods_inc(page) >=
++				    SMAP_COLD_PERIOD_THRESHOLD &&
++			    cold_nid >= nr_local_numa)
++				smap_cold_queue_enqueue(cold_nid,
++							PHYS_PFN(paddr));
+ 		}
++		put_page(page);
+ 	}
+ 
+ 	return 0;
+@@ -1419,12 +1428,15 @@ static void process_scan_results(struct pte_walk *pte_walk)
+ 			continue;
+ 
+ 		page = pfn_to_online_page(PHYS_PFN(entry->paddr));
+-		if (!page)
++		if (!page || !try_get_page(page))
+ 			continue;
+ 		if (adev->access_bit_actc_data[pa_idx] > 0)
+ 			smap_page_cold_periods_reset(page);
+-		else
+-			smap_page_cold_periods_inc(page);
++		else if (entry->nid >= nr_local_numa &&
++			 smap_page_cold_periods_inc(page) >=
++				 SMAP_COLD_PERIOD_THRESHOLD)
++			smap_cold_queue_enqueue(entry->nid, PHYS_PFN(entry->paddr));
++		put_page(page);
+ 	}
+ }
+ 
+diff --git a/plugins/smap/src/drivers/smap_cold_queue.c b/plugins/smap/src/drivers/smap_cold_queue.c
+new file mode 100644
+index 0000000..5035b89
+--- /dev/null
++++ b/plugins/smap/src/drivers/smap_cold_queue.c
+@@ -0,0 +1,78 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) Huawei Technologies Co., Ltd. 2024-2024. All rights reserved.
++ * Description: Per-node PFN queue for cold page swap-out
++ *
++ * Provides the per-node circular buffer and enqueue function used by the
++ * scan path (accessed_bit.c).  Only remote (slow-tier) cold pages are
++ * enqueued.  The drain function lives in the tiering module (mig_init.c)
++ * which has access to reclaim_pages.
++ */
++
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/mm.h>
++#include <linux/string.h>
++#include <linux/vmalloc.h>
++
++#include "smap_cold_queue.h"
++
++/* Per-node queues (local + remote) */
++struct smap_cold_queue smap_cold_numa_queue[SMAP_MAX_NUMNODES];
++EXPORT_SYMBOL(smap_cold_numa_queue);
++
++void smap_cold_queue_free(void)
++{
++	int i;
++
++	for (i = 0; i < SMAP_MAX_NUMNODES; i++) {
++		struct smap_cold_queue *q = &smap_cold_numa_queue[i];
++		vfree(q->pfn);
++		q->pfn = NULL;
++	}
++}
++
++int smap_cold_queue_init(void)
++{
++	int ret = 0;
++	int i;
++
++	for (i = 0; i < SMAP_MAX_NUMNODES; i++) {
++		struct smap_cold_queue *q = &smap_cold_queues[i];
++
++		q->pfn = vmalloc(SMAP_COLD_QUEUE_MAX_SIZE * sizeof(u64),
++				 GFP_KERNEL);
++		if (!q->pfn) {
++			smap_cold_queue_free();
++			ret = -ENOMEM;
++			break;
++		}
++		q->head = 0;
++		q->tail = 0;
++		q->count = 0;
++	}
++	return ret;
++}
++
++int smap_cold_queue_enqueue(int nid, u64 pfn)
++{
++	struct smap_cold_queue *q;
++	unsigned long flags;
++
++	if (nid < 0 || nid >= SMAP_MAX_NUMNODES)
++		return -1;
++
++	q = &smap_cold_numa_queue[nid];
++	spin_lock_irqsave(&smap_cold_pid_lock, flags);
++	if (q->count >= SMAP_COLD_QUEUE_MAX_SIZE) {
++		spin_unlock_irqrestore(&smap_cold_pid_lock, flags);
++		return -1;
++	}
++
++	q->pfn[q->tail] = pfn;
++	q->tail = (q->tail + 1) & SMAP_COLD_QUEUE_MAX_MASK;
++	q->count++;
++	spin_unlock_irqrestore(&smap_cold_pid_lock, flags);
++	return 0;
++}
++EXPORT_SYMBOL(smap_cold_queue_enqueue);
+diff --git a/plugins/smap/src/drivers/smap_cold_queue.h b/plugins/smap/src/drivers/smap_cold_queue.h
+new file mode 100644
+index 0000000..71e8dbb
+--- /dev/null
++++ b/plugins/smap/src/drivers/smap_cold_queue.h
+@@ -0,0 +1,38 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (c) Huawei Technologies Co., Ltd. 2024-2024. All rights reserved.
++ * Description: Per-node PFN queue for cold page swap-out
++ *
++ * During the scan phase, pages whose consecutive-cold-period counter crosses
++ * SMAP_COLD_PERIOD_THRESHOLD are enqueued here.
++ */
++
++#ifndef _SRC_SMAP_COLD_QUEUE_H
++#define _SRC_SMAP_COLD_QUEUE_H
++
++#define SMAP_COLD_QUEUE_MAX_SIZE (262144 * 16) /* 2^18 */
++#define SMAP_COLD_QUEUE_MAX_MASK (SMAP_COLD_QUEUE_MAX_SIZE - 1)
++
++#ifndef SMAP_MAX_NUMNODES
++#define SMAP_MAX_NUMNODES 22
++#endif
++
++struct smap_cold_queue {
++	u64 *pfn;
++	unsigned int head; /* next dequeue index */
++	unsigned int tail; /* next enqueue index */
++	unsigned int count; /* current number of entries */
++};
++
++/*
++ * One queue per NUMA node (local + remote).
++ * Defined in smap_cold_queue.c (drivers module).
++ */
++extern struct smap_cold_queue smap_cold_numa_queue[SMAP_MAX_NUMNODES];
++
++void smap_cold_queue_free(void);
++int smap_cold_queue_init(void);
++
++int smap_cold_queue_enqueue(int nid, u64 pfn);
++
++#endif /* _SRC_SMAP_COLD_QUEUE_H */
+diff --git a/plugins/smap/src/drivers/smap_page_flags.h b/plugins/smap/src/drivers/smap_page_flags.h
+index fb90c7f..1b6b7e3 100644
+--- a/plugins/smap/src/drivers/smap_page_flags.h
++++ b/plugins/smap/src/drivers/smap_page_flags.h
+@@ -65,8 +65,21 @@ static inline void smap_page_cold_periods_reset(struct page *page)
+  * @page: target page
+  *
+  * Call at period end when the page was NOT accessed the entire period.
++ * Returns the new counter value (0..14).  Only touches the low 4 bits.
++ *
++ * The all-1s pattern SMAP_COLD_PERIOD_MASK (0xF = 15) is reserved as a
++ * sentinel for "page never touched by SMAP".  The kernel sets the
++ * LAST_CPUPID field to all-1s when a page is freed/released, so without
++ * this sentinel every freshly-allocated page would appear to have cold
++ * count 15 and be immediately enqueued for swap-out on first scan.
++ *
++ * Effective counter range is therefore 0..14.  Saturates at 14: once a
++ * page has been cold for 14+ periods it stays at the cap so it is retried
++ * for swap-out every period.  Since g_cold_period_threshold is clamped to
++ * [1, 15], a cap of 14 still triggers swap-out at any valid threshold
++ * (14 >= threshold for threshold <= 14).
+  */
+-static inline void smap_page_cold_periods_inc(struct page *page)
++static inline u8 smap_page_cold_periods_inc(struct page *page)
+ {
+ 	unsigned long old, new;
+ 	u8 cnt;
+@@ -75,9 +88,10 @@ static inline void smap_page_cold_periods_inc(struct page *page)
+ 		old = READ_ONCE(page->flags);
+ 		cnt = (old >> LAST_CPUPID_PGSHIFT) & SMAP_COLD_PERIOD_MASK;
+ 		if (cnt == SMAP_COLD_PERIOD_MASK)
+-			cnt = 1;
+-		else if (cnt < SMAP_COLD_PERIOD_MAX)
+-			cnt++;
++			cnt = 1;  /* sentinel: kernel all-1s / uninitialised */
++		else if (cnt < SMAP_COLD_PERIOD_MASK - 1)
++			cnt++;    /* saturate at 14, keep 0xF as sentinel */
++		/* else: cnt == 14, stay at cap. */
+ 		new = old;
+ 		new &= ~(LAST_CPUPID_MASK << LAST_CPUPID_PGSHIFT);
+ 		new |= ((unsigned long)cnt<< LAST_CPUPID_PGSHIFT);
+@@ -86,4 +100,10 @@ static inline void smap_page_cold_periods_inc(struct page *page)
+ 	return cnt;
+ }
+ 
++/*
++ * Threshold for triggering cold-page swap-out.  When a page's consecutive
++ * cold-period counter reaches this value, it is enqueued for reclaim.
++ */
++#define SMAP_COLD_PERIOD_THRESHOLD 10
++
+ #endif /* _SRC_SMAP_PAGE_FLAGS_H */
+diff --git a/plugins/smap/src/tiering/Makefile b/plugins/smap/src/tiering/Makefile
+index 6451164..b0ac108 100644
+--- a/plugins/smap/src/tiering/Makefile
++++ b/plugins/smap/src/tiering/Makefile
+@@ -14,4 +14,4 @@ modules:
+ 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
+ 
+ clean:
+-	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
+\ No newline at end of file
++	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
+-- 
+2.54.0.windows.1
+

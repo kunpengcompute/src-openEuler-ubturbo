@@ -1,0 +1,676 @@
+From c6eff9bec6da9e7a782675195e199370b18ec5a6 Mon Sep 17 00:00:00 2001
+From: lucas <1358497393@qq.com>
+Date: Thu, 30 Jul 2026 14:22:21 +0800
+Subject: [PATCH 43/43] add smap tool
+
+---
+ plugins/smap/tool/smap_interface.h | 388 +++++++++++++++++++++++++++++
+ plugins/smap/tool/smap_tool.cpp    | 260 +++++++++++++++++++
+ 2 files changed, 648 insertions(+)
+ create mode 100644 plugins/smap/tool/smap_interface.h
+ create mode 100644 plugins/smap/tool/smap_tool.cpp
+
+diff --git a/plugins/smap/tool/smap_interface.h b/plugins/smap/tool/smap_interface.h
+new file mode 100644
+index 0000000..e18905c
+--- /dev/null
++++ b/plugins/smap/tool/smap_interface.h
+@@ -0,0 +1,388 @@
++/*
++ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
++ *
++ * smap is licensed under the Mulan PSL v2.
++ * You can use this software according to the terms and conditions of the Mulan PSL v2.
++ * You may obtain a copy of Mulan PSL v2 at:
++ *      http://license.coscl.org.cn/MulanPSL2
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
++ * See the Mulan PSL v2 for more details.
++ */
++#ifndef __SMAP_INTERFACE_H__
++#define __SMAP_INTERFACE_H__
++
++#include <unistd.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define MAX_NR_MIGRATE_ESCAPE 300
++#define MAX_NR_MIGBACK 50
++#define MAX_NR_MIGNUMA 50
++#define MAX_NR_REMOVE MAX_NR_MIGOUT
++#ifndef MAX_NR_GROUPED_MIGOUT
++#define MAX_NR_GROUPED_MIGOUT MAX_NR_MIGOUT
++#endif
++#ifndef MAX_MIGRATION_GROUP_NUM
++#define MAX_MIGRATION_GROUP_NUM 8
++#endif
++#ifndef MAX_GROUP_LOCAL_NUMA
++#define MAX_GROUP_LOCAL_NUMA 4
++#endif
++#ifndef MAX_GROUP_REMOTE_NUMA
++#define MAX_GROUP_REMOTE_NUMA REMOTE_NUMA_NUM
++#endif
++#define ADAPT_ALLOC_PERIOD 1000
++#define SCAN_MIGRATE_PERIOD LIGHT_STABLE_MIGRATE_CYCLE
++#define USER_DEFAULT_MIGRATE_OUT_RATIO 25
++#define WAIT_TIME (100)
++#define MAX_WAIT_TIME (180 * 1000)
++#define MIN_WAIT_TIME (10 * 1000)
++#define MAX_SCAN_TIME 2000
++#define MIN_SCAN_TIME 50
++#define DEFAULT_L2_NODE (-1)
++#define KB_PER_2MB 2048
++#define KB_PER_4KB 4
++#define MAX_SCAN_DURATION_SEC 300
++#define NON_EXIST_PID (-1)
++#define REMOTE_NUMA_NUM 18
++#define MAX_NR_MIGOUT 40
++
++// 迁移模式
++typedef enum
++{
++    MIG_RATIO_MODE = 0, // 按照比例迁移
++    MIG_MEMSIZE_MODE,   // 按照内存大小迁移
++} MigrateMode;
++
++enum {
++    SLEEP = 0,
++    RUNNING = 1,
++};
++
++enum {
++    FREE_ADAPT_MEM,
++    QUERY_ADAPT_MEM,
++};
++
++enum {
++    VM_DEVICE_IDX,
++    PID_DEVICE_IDX,
++    ACCESS_DEVICE_IDX,
++    NR_DEVICES,
++};
++
++enum {
++    DISABLE_NUMA_MIG,
++    ENABLE_NUMA_MIG,
++};
++
++typedef enum { INPUT_PROCESS = 0, INPUT_VM, INPUT_MAX } InputPidType;
++
++struct MigrateOutPayloadInner {
++    int destNid;
++    int ratio;
++    uint64_t memSize; // 内存迁移大小(KB)
++    MigrateMode migrateMode; // 内存迁移模式，按照比例或是大小
++};
++
++struct MigrateOutPayload {
++    int srcNid; // 是否指定迁出源节点（-1表示不指定）
++    pid_t pid;
++    int count;
++    struct MigrateOutPayloadInner inner[REMOTE_NUMA_NUM];
++};
++
++struct MigrateOutMsg {
++    int count;
++    struct MigrateOutPayload payload[MAX_NR_MIGOUT];
++};
++
++struct MigrationNode {
++    int nid;
++    uint64_t size; // locals: 本地最低保留水线; targets: 远端最大驻留容量, 单位KB
++};
++
++struct MigrationGroup {
++    int localCount;
++    struct MigrationNode locals[MAX_GROUP_LOCAL_NUMA];
++    int targetCount;
++    struct MigrationNode targets[MAX_GROUP_REMOTE_NUMA];
++};
++
++struct GroupedMigrateOutPayload {
++    pid_t pid;
++    int groupCount;
++    struct MigrationGroup groups[MAX_MIGRATION_GROUP_NUM];
++};
++
++struct GroupedMigrateOutMsg {
++    int count;
++    struct GroupedMigrateOutPayload payload[MAX_NR_GROUPED_MIGOUT];
++};
++
++struct MigrateBackPayload {
++    int srcNid;
++    int destNid;
++    uint64_t memid;
++};
++
++struct MigrateBackMsg {
++    unsigned long long taskID;
++    int count;
++    struct MigrateBackPayload payload[MAX_NR_MIGBACK];
++};
++
++struct RemovePayload {
++    pid_t pid;
++    int count; // count为0时按PID整体删除；大于0时按nid[]局部删除普通PID的远端NUMA
++    int nid[REMOTE_NUMA_NUM]; // count大于0时表示需要删除的远端NUMA集合
++};
++
++struct RemoveMsg {
++    int count;
++    struct RemovePayload payload[MAX_NR_REMOVE];
++};
++
++struct EnableNodeMsg {
++    int enable;
++    int nid;
++};
++
++struct SetRemoteNumaInfoMsg {
++    int srcNid; // 设置-1时表示每个本地numa都可用此远端numa
++    int destNid;
++    uint64_t size;
++};
++
++struct MigrateEscapePayload {
++    pid_t pid;
++    int srcNid;
++    int destNid;
++    int ratio;
++    uint64_t memSize;
++    MigrateMode migrateMode;
++};
++
++struct MigrateEscapeMsg {
++    int count;
++    struct MigrateEscapePayload payload[MAX_NR_MIGRATE_ESCAPE];
++};
++
++enum {
++    NORMAL_DATA_SOURCE,
++    STATISTIC_DATA_SOURCE,
++    MAX_SOURCE,
++};
++
++typedef void (*Logfunc)(int level, const char *str, const char *moduleName);
++
++/* *
++ * @brief   设置进程迁移到远端NUMA
++ *
++ * @param msg      [IN] 迁移进程信息，包含迁移进程、远端NUMA和迁移比例
++ * @param pidType  [IN] 进程类型，目前支持4KB和2MB进程类型
++ * @return int  0：操作成功；非0：操作失败
++ */
++int ubturbo_smap_migrate_out(struct MigrateOutMsg *msg, int pidType);
++
++/* *
++ * @brief   设置大规格弹性虚机的组级迁移策略
++ *
++ * @param msg      [IN] 迁移组信息，包含PID、本地NUMA集合、远端NUMA集合、远端quota和本地保留水线
++ * @param pidType  [IN] 进程类型，仅支持虚机2M页类型
++ * @return int  0：操作成功；非0：操作失败
++ */
++int ubturbo_smap_migrate_out_grouped(struct GroupedMigrateOutMsg *msg, int pidType);
++
++/* *
++ * @brief   迁移指定地址段的远端NUMA内存
++ *
++ * @param msg   [IN] 迁移地址段信息，包含源NUMA、目标NUMA、地址段
++ * @return int  0：操作成功；非0：操作失败
++ */
++int ubturbo_smap_migrate_back(struct MigrateBackMsg *msg);
++
++/* *
++ * @brief   移除进程的冷热页迁移
++ *
++ * @param msg   [IN] 移除的进程信息，包含进程的PID
++ * @param pidType  [IN] 进程类型，目前支持4KB和2MB进程类型
++ * @return int  0：操作成功；非0：操作失败
++ */
++int ubturbo_smap_remove(struct RemoveMsg *msg, int pidType);
++
++/* *
++ * @brief   使能NUMA的冷热页迁移
++ *
++ * @param msg   [IN] NUMA信息，包含NUMA ID、使能开关
++ * @return int  0：操作成功；非0：操作失败
++ */
++int ubturbo_smap_node_enable(struct EnableNodeMsg *msg);
++
++/* *
++ * @brief   初始化SMAP模块
++ *
++ * @param pageType [IN] 页面类型，当前只支持4KB和2MB页
++ * @param extlog   [IN] 日志打印函数
++ * @return int  0：操作成功；非0：操作失败
++ */
++int ubturbo_smap_start(uint32_t pageType, Logfunc extlog);
++
++/* *
++ * @brief  卸载SMAP模块
++ *
++ * @return int  0：操作成功；非0：操作失败
++ */
++int ubturbo_smap_stop(void);
++
++/* *
++ * @brief 紧急迁移本地内存到远端，在发生本地内存无资源场景
++ *
++ * @param size [IN] 需要紧急迁移的大小
++ */
++void ubturbo_smap_urgent_migrate_out(uint64_t size);
++
++/* *
++ * @brief   设置本地NUMA对远端NUMA迁移内存大小
++ *
++ * @param msg [IN] 设置信息，包含本地NUMA、远端NUMA和大小
++ * @return int  0：操作成功；非0：操作失败
++ */
++int ubturbo_smap_remote_numa_info_set(struct SetRemoteNumaInfoMsg *msg);
++
++/* *
++ * @brief   查询进程的页面冷热信息
++ *
++ * @param pid        [IN] 查询的进程
++ * @param data       [IN/OUT] 查询页面冷热数据
++ * @param lengthIn   [IN] 传入的数据长度
++ * @param lengthOut  [OUT] 查询的返回长度
++ * @param dataSource [IN] 标识数据来源
++ * @return int  0：操作成功；非0：操作失败
++ */
++int ubturbo_smap_freq_query(int pid, uint16_t *data, uint32_t lengthIn, uint32_t *lengthOut, int dataSource);
++
++/* *
++ * @brief   设置SMAP运行模式
++ *
++ * @param runMode [IN] 运行模式，动态和固定比例迁移
++ * @return int  0：操作成功；非0：操作失败
++ */
++int ubturbo_smap_run_mode_set(int runMode);
++
++/* *
++ * @brief   查询SMAP是否运行
++ *
++ * @return bool  true：运行；false：未运行
++ */
++bool ubturbo_smap_is_running(void);
++
++/* *
++ * @brief   SMAP同步迁出
++ *
++ * @param msg         [IN] 迁移进程信息，包含迁移进程、远端NUMA、迁移比例、迁移页面大小和迁移模式
++ * @param pidType     [IN] 进程类型，目前支持4KB和2MB进程类型
++ * @param maxWaitTime [IN] 一次调用最大等待时间，单位ms
++ * @return int  0：操作成功；非0：操作失败
++ */
++int ubturbo_smap_migrate_out_sync(struct MigrateOutMsg *msg, int pidType, uint64_t maxWaitTime);
++
++/* 迁移远端内存相关接口 */
++
++struct MigrateNumaMsg {
++    int srcNid;
++    int destNid;
++    int count;
++    uint64_t memids[MAX_NR_MIGNUMA];
++};
++
++/* *
++ * @brief   添加进程到冷热扫描
++ *
++ * @param pidArr   [IN] 进程数组
++ * @param scanTime [IN] 扫描间隔
++ * @param duration [IN] 扫描持续时长
++ * @param len      [IN] 进程数组大小
++ * @param scanType [IN] 扫描类型
++ * @return int  0：操作成功；非0：操作失败
++ */
++int ubturbo_smap_process_tracking_add(pid_t *pidArr, uint32_t *scanTime, uint32_t *duration, int len, int scanType);
++
++/* *
++ * @brief   移除进程冷热扫描
++ *
++ * @param pidArr [IN] 进程数组起始地址
++ * @param len    [IN] 进程数组大小
++ * @param flag   [IN] 标志位
++ * @return int  0：操作成功；非0：操作失败
++ */
++int ubturbo_smap_process_tracking_remove(pid_t *pidArr, int len, int flag);
++
++/* *
++ * @brief   使能进程的页面迁移
++ *
++ * @param pidArr [IN] 进程数组起始地址
++ * @param len    [IN] 进程数组大小
++ * @param enable [IN] 使能开关
++ * @param flags  [IN] 标志位
++ * @return int  0：操作成功；非0：操作失败
++ */
++int ubturbo_smap_process_migrate_enable(pid_t *pidArr, int len, int enable, int flags);
++
++/* *
++ * @brief   迁移远端内存到远端内存
++ *
++ * @param msg [IN] 远端内存信息，包含源NUMA、目标NUMA、物理地址段
++ * @return int  0：操作成功；非0：操作失败
++ */
++int ubturbo_smap_remote_numa_migrate(struct MigrateNumaMsg *msg);
++
++/* *
++ * @brief   迁移远端内存到同远端内存
++ *
++ * @param msg [IN] 远端内存信息，包含源NUMA、目标NUMA、物理地址段
++ * @return int  0：操作成功；非0：操作失败
++ */
++int ubturbo_smap_same_remote_numa_migrate(struct MigrateNumaMsg *msg);
++
++/* *
++ * @brief   迁移指定进程远端内存到远端内存
++ *
++ * @param pidArr   [IN] 进程数组起始地址
++ * @param len      [IN] 进程数组大小
++ * @param srcNid   [IN] 源远端NUMA
++ * @param destNid  [IN] 目标远端NUMA
++ * @return int  0：操作成功；非0：操作失败
++ */
++int ubturbo_smap_pid_remote_numa_migrate(struct MigrateEscapeMsg *msg);
++
++/* *
++ * @brief   查询远端设置为nid的进程
++ *
++ * @param nid      [IN] 远端NUMA ID
++ * @param result   [OUT] 结果数组指针
++ * @param inLen    [IN] 结果数组大小
++ * @param outLen   [OUT] 返回数组大小
++ * @return int  0：操作成功；非0：操作失败
++ */
++int ubturbo_smap_process_config_query(int nid, struct OldProcessPayload *result, int inLen, int *outLen);
++
++/* *
++ * @brief   查询NUMA的频次统计信息
++ *
++ * @param numa      [IN] 远端NUMA数组起始地址
++ * @param freq      [OUT] 结果数组指针
++ * @param length    [IN] 数组大小
++ * @return int  0：操作成功；非0：操作失败
++ */
++int ubturbo_smap_remote_numa_freq_query(uint16_t *numa, uint64_t *freq, uint16_t length);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* __SMAP_INTERFACE_H__ */
+diff --git a/plugins/smap/tool/smap_tool.cpp b/plugins/smap/tool/smap_tool.cpp
+new file mode 100644
+index 0000000..f513c50
+--- /dev/null
++++ b/plugins/smap/tool/smap_tool.cpp
+@@ -0,0 +1,260 @@
++#include <cstring>
++#include <iostream>
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <sys/types.h>
++#include <signal.h>
++#include <vector>
++#include <string>
++#include <stdexcept>
++#include <ctime>
++#include <iomanip>
++#include <sstream>
++
++#include "smap_interface.h"
++
++using namespace std;
++
++typedef enum SmapLogLevel {
++    SMAP_LOG_DEBUG = 0,
++        SMAP_LOG_INFO,
++        SMAP_LOG_WARNING,
++        SMAP_LOG_ERROR,
++        SMAP_LOG_BUTT
++}
++SmapLogLevel;
++
++#define MAX_MIGRATE_NUM 40
++
++// 日志回调函数
++void logfunc(int level,
++    const char * str,
++        const char * moduleName) {
++    time_t now = time(NULL);
++    struct tm * timeinfo = localtime( & now);
++    char time_buf[9];
++    strftime(time_buf, sizeof(time_buf), "%H:%M:%S", timeinfo);
++
++    const char * color_err = "\033[31m";
++    const char * color_info = "\033[32m";
++    const char * reset = "\033[0m";
++
++    const char * color = (level == SMAP_LOG_ERROR) ? color_err : color_info;
++    const char * tag = (level == SMAP_LOG_ERROR) ? "[ERR]" : (level == SMAP_LOG_WARNING) ? "[WARN]" : "[INFO]";
++
++    std::ostringstream oss;
++    oss << "[" << time_buf << "] " << color << tag << reset << " " << moduleName << ": " << str << std::endl;
++
++    std::cout << oss.str();
++}
++
++volatile sig_atomic_t g_running = 1;
++
++void signal_handler(int signum) {
++    (void) signum;
++    cout << "\n[!] 收到中断信号，正在关闭服务..." << endl;
++    g_running = 0;
++}
++
++int parse_int(const char * str,
++    const string & arg_name) {
++    try {
++        size_t pos;
++        int val = stoi(str, & pos);
++        if (pos != strlen(str)) {
++            throw invalid_argument("包含非数字字符");
++        }
++        return val;
++    } catch (const exception & e) {
++        cerr << "Error: " << arg_name << " 参数值无效： '" << str << "' (" << e.what() << ")" << endl;
++        exit(1);
++    }
++}
++
++int main(int argc, char * argv[]) {
++    // --------------------------------------------------
++    // 1. 默认配置初始化
++    // --------------------------------------------------
++    int default_swap_size = 94208; // 默认 Swap 大小 (字节)
++    int default_ratio = 25; // 默认迁移比例 (%)
++    int default_src_nid = 1; // 默认源节点
++    int default_dest_nid = 5; // 默认目标节点
++
++    // --------------------------------------------------
++    // 2. 命令行参数解析
++    // --------------------------------------------------
++
++    // 如果参数不足，打印帮助信息并退出
++    if (argc < 2) {
++        cerr << "用法: " << argv[0] << " <进程数量> <pid1> [pid2] ... [选项]" << endl;
++        cerr << "可选参数:" << endl;
++        cerr << " --swap-size <size> : Swap 区域大小 (字节), 默认: " << default_swap_size << endl;
++        cerr << " --ratio <0-100> : 迁移比例 (%), 默认: " << default_ratio << "%" << endl;
++        cerr << " --src-nid <id> : 源 NUMA 节点 ID, 默认: " << default_src_nid << endl;
++        cerr << " --dest-nid <id> : 目标 NUMA 节点 ID, 默认: " << default_dest_nid << endl;
++        cerr << endl;
++        cerr << "示例: " << argv[0] << " 1 325387 --swap-size 102400 --ratio 50 --src-nid 0 --dest-nid 4" << endl;
++        return 1;
++    }
++
++    // 解析第一个参数：需要迁移的进程数量
++    int pid_count = atoi(argv[1]);
++    vector < int > pids;
++
++    // 基础校验：确保后续参数数量足够（至少包含 pid_count 个 PID）
++    if (argc < pid_count + 2) {
++        cerr << "错误: 提供的 PID 数量不足。期望 " << pid_count << " 个，实际获取 " << (argc - 2) << " 个。" << endl;
++        return 1;
++    }
++
++    // 遍历剩余参数，解析 PID 和配置选项
++    for (int i = 2; i < argc; i++) {
++        string arg = argv[i];
++
++        // 检查是否是配置选项 (--swap-size, --ratio, --src-nid, --dest-nid)
++        if (arg == "--swap-size" || arg == "--ratio" || arg == "--src-nid" || arg == "--dest-nid") {
++            // 校验选项后是否有对应的值
++            if (i + 1 >= argc) {
++                cerr << "错误: 选项 " << arg << " 缺少对应的值。" << endl;
++                return 1;
++            }
++
++            string value = argv[++i]; // 移动到下一个参数
++
++            // 根据不同选项更新默认配置
++            if (arg == "--swap-size") {
++                default_swap_size = parse_int(value.c_str(), "swap-size");
++                if (default_swap_size <= 0) {
++                    cerr << "错误: swap-size 必须为正整数。" << endl;
++                    return 1;
++                }
++                cout << ">> 已配置 Swap 大小: " << default_swap_size << " 字节" << endl;
++            } else if (arg == "--ratio") {
++                default_ratio = parse_int(value.c_str(), "ratio");
++                if (default_ratio < 0 || default_ratio > 100) {
++                    cerr << "错误: ratio 必须在 0 到 100 之间。" << endl;
++                    return 1;
++                }
++                cout << ">> 已配置迁移比例: " << default_ratio << "%" << endl;
++            } else if (arg == "--src-nid") {
++                default_src_nid = parse_int(value.c_str(), "src-nid");
++                if (default_src_nid < 0) {
++                    cerr << "错误: src-nid 必须为非负整数。" << endl;
++                    return 1;
++                }
++                cout << ">> 已配置源 NUMA ID: " << default_src_nid << endl;
++            } else if (arg == "--dest-nid") {
++                default_dest_nid = parse_int(value.c_str(), "dest-nid");
++                if (default_dest_nid < 0) {
++                    cerr << "错误: dest-nid 必须为非负整数。" << endl;
++                    return 1;
++                }
++                cout << ">> 已配置目标 NUMA ID: " << default_dest_nid << endl;
++            }
++        } else {
++            // 非选项参数视为 PID
++            pids.push_back(atoi(arg.c_str()));
++        }
++    }
++
++    if (pids.size() != (size_t) pid_count) {
++        cerr << "错误: 期望 " << pid_count << " 个 PID，实际解析到 " << pids.size() << " 个。" << endl;
++        return 1;
++    }
++
++    // --------------------------------------------------
++    // 3. 初始化 SMAP 服务
++    // --------------------------------------------------
++    cout << ">>> [步骤 1] 正在初始化 SMAP 服务..." << endl;
++    int result = ubturbo_smap_start(1, logfunc);
++    if (result != 0) {
++        cerr << "❌ SMAP 初始化失败，错误码: " << result << endl;
++        return result;
++    }
++    cout << "✅ SMAP 服务初始化成功。" << endl;
++
++    // --------------------------------------------------
++    // 4. 配置 NUMA 远端信息
++    // --------------------------------------------------
++    cout << ">>> [步骤 2] 正在设置 NUMA 远端映射信息..." << endl;
++    struct SetRemoteNumaInfoMsg numa_msg;
++    // 使用解析后的参数填充配置
++    numa_msg.srcNid = default_src_nid;
++    numa_msg.destNid = default_dest_nid;
++    numa_msg.size = default_swap_size;
++
++    result = ubturbo_smap_remote_numa_info_set( & numa_msg);
++    if (result != 0) {
++        cerr << "❌ 设置 NUMA 远端信息失败，错误码: " << result << endl;
++        return result;
++    } else {
++        cout << "✅ NUMA 远端信息已设置 (源: " << numa_msg.srcNid <<
++            " -> 目标: " << numa_msg.destNid <<
++            ", 大小: " << numa_msg.size << ")." << endl;
++    }
++
++    // --------------------------------------------------
++    // 5. 执行进程内存迁移
++    // --------------------------------------------------
++    cout << ">>> [步骤 3] 开始迁移 " << pids.size() << " 个进程..." << endl;
++
++    struct MigrateOutMsg msg;
++    struct MigrateOutPayload * payload;
++    struct MigrateOutPayloadInner * inner;
++
++    // 遍历所有目标进程
++    memset( & msg, 0, sizeof(msg));
++    for (size_t i = 0; i < pids.size(); i++) {
++        msg.count++;
++        payload = & msg.payload[i % MAX_MIGRATE_NUM];
++
++        payload -> srcNid = default_src_nid;
++        payload -> count = 1;
++        payload -> pid = pids[i];
++        inner = & payload -> inner[0];
++
++        inner -> destNid = default_dest_nid;
++        inner -> ratio = default_ratio;
++        inner -> memSize = 0;
++        inner -> migrateMode = MIG_RATIO_MODE;
++        if ((i + 1) % MAX_MIGRATE_NUM != 0)
++            continue;
++
++        // 调用 SMAP 接口执行迁移
++        result = ubturbo_smap_migrate_out( & msg, 1);
++        if (result != 0) {
++            cerr << "❌ 进程 " << pids[i] << " 迁移失败，错误码: " << result << endl;
++            return result;
++        }
++        memset( & msg, 0, sizeof(msg));
++    }
++    if (msg.count != 0) {
++        result = ubturbo_smap_migrate_out( & msg, 1);
++        if (result != 0) {
++            cerr << "进程 迁移失败，错误码: " << result << endl;
++            return result;
++        }
++    }
++
++    cout << "✅ 所有进程迁移任务执行完毕。" << endl;
++
++    // --------------------------------------------------
++    // 6. 等待退出信号
++    // --------------------------------------------------
++    struct sigaction sa;
++    sa.sa_handler = signal_handler;
++    sigemptyset( & sa.sa_mask);
++    sa.sa_flags = 0;
++    if (sigaction(SIGINT, & sa, NULL) == -1) {
++        perror("sigaction");
++        return 1;
++    }
++
++    cout << ">>> 系统运行中... 按 Ctrl+C 停止。" << endl;
++    while (g_running) {
++        sleep(1);
++    }
++    ubturbo_smap_stop();
++    return 0;
++}
+\ No newline at end of file
+-- 
+2.54.0.windows.1
+

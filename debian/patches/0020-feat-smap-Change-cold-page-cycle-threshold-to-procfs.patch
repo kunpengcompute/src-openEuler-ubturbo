@@ -1,0 +1,228 @@
+From 1bc8a56e934d5b83fe9c98b28cb9d5424ea171d3 Mon Sep 17 00:00:00 2001
+From: yuyuanxun <2972982755@qq.com>
+Date: Tue, 14 Jul 2026 10:04:30 +0800
+Subject: [PATCH 20/43] feat(smap): Change cold page cycle threshold to procfs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+将 SMAP_COLD_PERIOD_THRESHOLD 从编译期宏改为全局变量
+g_cold_period_threshold(默认 10),新增 /proc/smap/cold_period_threshold
+可写节点,支持运行时 echo 调阈值、cat 读当前值。
+
+- smap_page_flags.h: 宏 -> extern 变量声明
+- accessed_bit.c: 变量定义 + proc show/write 回调(kstrtouint_from_user,
+  范围校验 [1,1000]) + fops + smap_cold_threshold_proc_init 注册 +
+  4 个使用点改读变量
+- accessed_bit.h: 注册函数声明
+- access_tracking.c: access_ioctl_init 后注册(失败非 fatal,阈值保持默认)
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ plugins/smap/src/drivers/access_ioctl.c    |  6 ++
+ plugins/smap/src/drivers/access_tracking.c |  3 +
+ plugins/smap/src/drivers/accessed_bit.c    | 88 +++++++++++++++++++++-
+ plugins/smap/src/drivers/accessed_bit.h    |  1 +
+ plugins/smap/src/drivers/smap_page_flags.h |  3 +-
+ 5 files changed, 96 insertions(+), 5 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/access_ioctl.c b/plugins/smap/src/drivers/access_ioctl.c
+index 4feebbc..68ccd83 100644
+--- a/plugins/smap/src/drivers/access_ioctl.c
++++ b/plugins/smap/src/drivers/access_ioctl.c
+@@ -17,6 +17,7 @@
+ #include "check.h"
+ #include "access_tracking.h"
+ #include "access_pid.h"
++#include "accessed_bit.h"
+ #include "access_ioctl.h"
+ 
+ #undef pr_fmt
+@@ -221,6 +222,11 @@ static long ioctl_create_smap_procfs(void __user *argp)
+ 		return ret;
+ 	}
+ 
++	/* /proc/smap is up now; attach the runtime-tunable threshold node.
++	 * Non-fatal: on failure the threshold keeps its default value. */
++	if (smap_cold_threshold_proc_init())
++		pr_warn("cold_period_threshold proc node not created\n");
++
+ 	pr_info("procfs root directory create\n");
+ 	return 0;
+ }
+diff --git a/plugins/smap/src/drivers/access_tracking.c b/plugins/smap/src/drivers/access_tracking.c
+index 3ce3b4f..2b35ac4 100644
+--- a/plugins/smap/src/drivers/access_tracking.c
++++ b/plugins/smap/src/drivers/access_tracking.c
+@@ -604,6 +604,9 @@ static int __init access_tracking_init(void)
+ 		goto err_ioctl;
+ 	}
+ 
++	/* The cold_period_threshold proc node is created lazily inside
++	 * ioctl_create_smap_procfs(), after /proc/smap is set up by user space. */
++
+ 	ret = access_tracking_add();
+ 	if (ret) {
+ 		pr_err("unable to add access tracking device to tracking bus\n");
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index 68d490d..3cd00a7 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -21,6 +21,8 @@
+ #include <linux/pid_namespace.h>
+ #include <linux/pid.h>
+ #include <linux/proc_fs.h>
++#include <linux/seq_file.h>
++#include <linux/uaccess.h>
+ #include <linux/slab.h>
+ #include <linux/sched/mm.h>
+ #include <linux/sched/signal.h>
+@@ -240,6 +242,84 @@ static const struct proc_ops proc_file_ops = {
+ 	.proc_read = proc_file_read,
+ };
+ 
++/*
++ * Runtime-tunable cold-period threshold, exposed at
++ * /proc/smap/cold_period_threshold. Default 10 (matches the old compile-time
++ * SMAP_COLD_PERIOD_THRESHOLD). Write a positive integer to adjust at runtime;
++ * read with cat. No lock: the 32-bit aligned read/write is atomic, and a
++ * torn read of a soft threshold is harmless.
++ */
++unsigned int g_cold_period_threshold = 10;
++EXPORT_SYMBOL(g_cold_period_threshold);
++
++#define SMAP_COLD_PERIOD_THRESHOLD_MIN 1
++#define SMAP_COLD_PERIOD_THRESHOLD_MAX 15
++
++static ssize_t cold_threshold_proc_read(struct file *file, char __user *buf,
++					 size_t count, loff_t *ppos)
++{
++	char kbuf[16];
++	int len;
++
++	/* Single unsigned int; EOF once served. */
++	if (*ppos > 0)
++		return 0;
++	len = snprintf(kbuf, sizeof(kbuf), "%u\n", g_cold_period_threshold);
++	if (len < 0 || count < (size_t)len)
++		return -EINVAL;
++	if (copy_to_user(buf, kbuf, len))
++		return -EFAULT;
++	*ppos += len;
++	return len;
++}
++
++static ssize_t cold_threshold_proc_write(struct file *file,
++					 const char __user *buf, size_t count,
++					 loff_t *pos)
++{
++	unsigned int val;
++	int ret;
++
++	ret = kstrtouint_from_user(buf, count, DECIMAL, &val);
++	if (ret)
++		return ret;
++	if (val < SMAP_COLD_PERIOD_THRESHOLD_MIN ||
++	    val > SMAP_COLD_PERIOD_THRESHOLD_MAX) {
++		pr_err("cold_period_threshold %u out of range [%d, %d]\n", val,
++		       SMAP_COLD_PERIOD_THRESHOLD_MIN,
++		       SMAP_COLD_PERIOD_THRESHOLD_MAX);
++		return -EINVAL;
++	}
++	WRITE_ONCE(g_cold_period_threshold, val);
++	return count;
++}
++
++static const struct proc_ops cold_threshold_fops = {
++	.proc_read = cold_threshold_proc_read,
++	.proc_write = cold_threshold_proc_write,
++};
++
++/* Register /proc/smap/cold_period_threshold. Must run after access_ioctl_init
++ * has created smap_procfs_root. Failure is non-fatal: the threshold keeps its
++ * default and the scan path still works, only runtime tuning is unavailable. */
++int smap_cold_threshold_proc_init(void)
++{
++	struct proc_dir_entry *pde;
++
++	if (!smap_procfs_root) {
++		pr_err("smap procfs root not ready, skip cold_period_threshold\n");
++		return -ENXIO;
++	}
++	pde = proc_create("cold_period_threshold", 0644, smap_procfs_root,
++			  &cold_threshold_fops);
++	if (!pde) {
++		pr_err("failed to create /proc/smap/cold_period_threshold\n");
++		return -ENOMEM;
++	}
++	proc_set_user(pde, procfs_kuid, procfs_kgid);
++	return 0;
++}
++
+ int smap_create_tracking_info_file(struct ham_tracking_info *info)
+ {
+ 	int ret;
+@@ -487,7 +567,7 @@ static int hva_to_hpa_hugetlb(struct kvm *kvm, u64 host_va,
+ 			int cold_nid = pfn_to_nid(PHYS_PFN(paddr));
+ 
+ 			if (smap_page_cold_periods_inc(page) >=
+-				    SMAP_COLD_PERIOD_THRESHOLD &&
++				    g_cold_period_threshold &&
+ 			    cold_nid >= nr_local_numa)
+ 				smap_cold_queue_enqueue(cold_nid,
+ 							PHYS_PFN(paddr));
+@@ -631,7 +711,7 @@ static int hva_to_hpa_4k(struct kvm *kvm, u64 host_va, struct access_pid *ap,
+ 			int cold_nid = pfn_to_nid(PHYS_PFN(paddr));
+ 
+ 			if (smap_page_cold_periods_inc(page) >=
+-				    SMAP_COLD_PERIOD_THRESHOLD &&
++				    g_cold_period_threshold &&
+ 			    !smap_cold_queue_enqueue(cold_nid, PHYS_PFN(paddr))) {
+ 				/* enqueued into cold_queue; skip bitmap */
+ 			} else {
+@@ -927,7 +1007,7 @@ static int process_memslot_pages(struct kvm *kvm,
+ 					int cold_nid = pfn_to_nid(PHYS_PFN(paddr));
+ 
+ 					if (smap_page_cold_periods_inc(page) >=
+-						    SMAP_COLD_PERIOD_THRESHOLD &&
++						    g_cold_period_threshold &&
+ 					    !smap_cold_queue_enqueue(cold_nid,
+ 								     PHYS_PFN(paddr))) {
+ 					/* enqueued into cold_queue; skip bitmap */
+@@ -1683,7 +1763,7 @@ static void process_scan_results(struct pte_walk *pte_walk)
+ 			smap_page_cold_periods_reset(page);
+ 		else if (entry->nid >= nr_local_numa &&
+ 			 smap_page_cold_periods_inc(page) >=
+-				 SMAP_COLD_PERIOD_THRESHOLD)
++				 g_cold_period_threshold)
+ 			smap_cold_queue_enqueue(entry->nid, PHYS_PFN(entry->paddr));
+ 		put_page(page);
+ 	}
+diff --git a/plugins/smap/src/drivers/accessed_bit.h b/plugins/smap/src/drivers/accessed_bit.h
+index 6c0fc56..8cacf38 100644
+--- a/plugins/smap/src/drivers/accessed_bit.h
++++ b/plugins/smap/src/drivers/accessed_bit.h
+@@ -95,4 +95,5 @@ int scan_hva_info(pid_t pid_nr, u64 *l1_page_num, u64 *l2_page_num,
+ 		  u64 **l1_vaddr, u64 **l2_vaddr);
+ int scan_hva_info_4k(pid_t pid, u64 *l1_page_num, u64 *l2_page_num,
+ 		     u64 **l1_vaddr, u64 **l2_vaddr);
++int smap_cold_threshold_proc_init(void);
+ #endif /* _SRC_ACCESSED_BIT_H */
+diff --git a/plugins/smap/src/drivers/smap_page_flags.h b/plugins/smap/src/drivers/smap_page_flags.h
+index fe100af..8e24a31 100644
+--- a/plugins/smap/src/drivers/smap_page_flags.h
++++ b/plugins/smap/src/drivers/smap_page_flags.h
+@@ -124,8 +124,9 @@ static inline u8 smap_page_cold_periods_inc(struct page *page)
+ /*
+  * Threshold for triggering cold-page swap-out.  When a page's consecutive
+  * cold-period counter reaches this value, it is enqueued for reclaim.
++ * Runtime-tunable via /proc/smap/cold_period_threshold (default 10).
+  */
+-#define SMAP_COLD_PERIOD_THRESHOLD 10
++extern unsigned int g_cold_period_threshold;
+ 
+ /**
+  * smap_acc_cnt_get - Read the accumulated access-frequency counter
+-- 
+2.54.0.windows.1
+

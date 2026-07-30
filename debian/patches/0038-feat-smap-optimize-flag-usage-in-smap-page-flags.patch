@@ -1,0 +1,191 @@
+From c544b015f672b4d4770bc79d17708a20bfcc2e0a Mon Sep 17 00:00:00 2001
+From: lucas <1358497393@qq.com>
+Date: Fri, 24 Jul 2026 10:26:18 +0800
+Subject: [PATCH 38/43] feat(smap): optimize flag usage in smap page->flags
+
+---
+ plugins/smap/src/drivers/smap_page_flags.h | 93 ++++++++++++++--------
+ 1 file changed, 58 insertions(+), 35 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/smap_page_flags.h b/plugins/smap/src/drivers/smap_page_flags.h
+index 0c63c77..ff6a727 100644
+--- a/plugins/smap/src/drivers/smap_page_flags.h
++++ b/plugins/smap/src/drivers/smap_page_flags.h
+@@ -4,15 +4,21 @@
+  * Description: SMAP page->flags helpers for cold-period and access-frequency
+  *
+  * On aarch64 the LAST_CPUPID field (16 bits) in page->flags is unused when
+- * NUMA balancing is disabled.  We split it into two sub-counters that
++ * NUMA balancing is disabled.  We split it into three sub-fields that
+  * coexist without interfering:
+  *
+- *   bits [0..3]   (4 bits)  consecutive-cold-period counter  (0..14, 0xF = uninitialised sentinel)
+- *   bits [4..15]  (12 bits) accumulated access-frequency count (0..4095)
++ *   bits [0..3]   (4 bits)  consecutive-cold-period counter  (0..14, 0xF = sentinel)
++ *   bit  [4]      (1 bit)   init flag  (1 = kernel-uninitialised, 0 = SMAP-seen)
++ *   bits [5..15]  (11 bits) access-frequency count (0..2046, 0x7FF = sentinel)
+  *
+- * The cold-period counter drives the cold_queue swap-out path; the access
+- * frequency counter is a side statistic incremented on each young access
+- * observation and does not participate in swap-out decisions.
++ * The cold-period counter drives the cold_queue swap-out path; the init flag
++ * replaces the old 12-bit-wide smap_page_init check with a single bit; the
++ * access frequency counter is a side statistic incremented on each young
++ * access observation and does not participate in swap-out decisions.
++ *
++ * When the kernel frees a page it sets LAST_CPUPID to all-1s (0xFFFF).
++ * Bit 4 = 1 and the frequency field = 0x7FF act as sentinels for "never
++ * touched by SMAP", analogous to the 0xF sentinel in the cold-period field.
+  */
+ 
+ #ifndef _SRC_SMAP_PAGE_FLAGS_H
+@@ -25,16 +31,24 @@
+ #include <asm/cmpxchg.h>
+ 
+ /* ---- bit layout inside the LAST_CPUPID field ---- */
++
++/* Cold-period counter: bits [0..3] */
+ #define SMAP_COLD_PERIOD_WIDTH 4
+ #define SMAP_COLD_PERIOD_MASK  ((1UL << SMAP_COLD_PERIOD_WIDTH) - 1)
+ /* SMAP_COLD_PERIOD_MASK (0xF) is reserved as an "uninitialised" sentinel;
+  * the effective counter range is 0..14.  See smap_page_cold_periods_inc. */
+ 
+-/* Access-frequency counter occupies the high 12 bits of the 16-bit field. */
+-#define SMAP_ACC_CNT_SHIFT  (LAST_CPUPID_PGSHIFT + SMAP_COLD_PERIOD_WIDTH)
+-#define SMAP_ACC_CNT_WIDTH  12
+-#define SMAP_ACC_CNT_MASK   ((1UL << SMAP_ACC_CNT_WIDTH) - 1)
+-#define SMAP_ACC_CNT_MAX    SMAP_ACC_CNT_MASK /* 4095 */
++/* Init flag: bit [4] — 1 means kernel-uninitialised (all-1s from page
++ * release), 0 means SMAP has seen this page at least once.  Replaces the
++ * old 12-bit smap_page_init / smap_page_mark mechanism with a single bit. */
++#define SMAP_INIT_FLAG_SHIFT  (LAST_CPUPID_PGSHIFT + SMAP_COLD_PERIOD_WIDTH)
++#define SMAP_INIT_FLAG_MASK   (1UL << SMAP_INIT_FLAG_SHIFT)
++
++/* Access-frequency counter: bits [5..15] (11 bits) */
++#define SMAP_ACC_CNT_SHIFT    (SMAP_INIT_FLAG_SHIFT + 1)
++#define SMAP_ACC_CNT_WIDTH    11
++#define SMAP_ACC_CNT_MASK     ((1UL << SMAP_ACC_CNT_WIDTH) - 1)
++#define SMAP_ACC_CNT_MAX      SMAP_ACC_CNT_MASK /* 0x7FF = 2047, sentinel */
+ 
+ /* Field-local masks (already shifted to LAST_CPUPID_PGSHIFT origin). */
+ #define SMAP_COLD_FIELD_MASK \
+@@ -69,7 +83,7 @@ static inline u8 smap_page_cold_periods_get(struct page *page)
+  * @page: target page
+  *
+  * Call when the page was accessed during the current period.  Only clears
+- * the low 4 bits; the access-frequency bits are preserved.
++ * the low 4 bits; the init flag and frequency bits are preserved.
+  */
+ static inline void smap_page_cold_periods_reset(struct page *page)
+ {
+@@ -121,7 +135,7 @@ static inline u8 smap_page_cold_periods_inc(struct page *page)
+ 	return cnt;
+ }
+ 
+-/*
++/**
+  * Threshold for triggering cold-page swap-out.  When a page's consecutive
+  * cold-period counter reaches this value, it is enqueued for reclaim.
+  * Runtime-tunable via /proc/smap/cold_period_threshold (default 10).
+@@ -133,8 +147,9 @@ extern unsigned int cold_period_thresh;
+  *
+  * @page: target page
+  *
+- * Returns a value 0..4095.  Returns 0 when the counter has saturated/wrapped
+- * (matches the original feat_accumulate_freq semantics).
++ * Returns a value 0..2046.  Returns 0 when the counter has the sentinel
++ * value 0x7FF (kernel-initialised all-1s or genuine saturation), matching
++ * the original feat_accumulate_freq semantics.
+  */
+ static inline u16 smap_acc_cnt_get(struct page *page)
+ {
+@@ -151,8 +166,9 @@ static inline u16 smap_acc_cnt_get(struct page *page)
+  *
+  * @page: target page
+  *
+- * Called on each young access observation.  Only touches the high 12 bits;
+- * the cold-period bits are preserved.
++ * Called on each young access observation.  Only touches bits 5..15
++ * (frequency); the init flag (bit 4) and cold-period bits (0..3) are
++ * preserved.
+  */
+ static inline void smap_acc_cnt_inc(struct page *page)
+ {
+@@ -177,8 +193,9 @@ static inline void smap_acc_cnt_inc(struct page *page)
+  *
+  * @page: target page
+  *
+- * Only clears the high 12 bits (frequency); the low 4-bit cold-period
+- * counter is preserved so cold_queue tracking is not disturbed.
++ * Only clears bits 5..15 (frequency); the init flag (bit 4) and the low
++ * 4-bit cold-period counter are preserved so cold_queue tracking and the
++ * "page seen" marker are not disturbed.
+  */
+ static inline void smap_acc_cnt_reset(struct page *page)
+ {
+@@ -192,40 +209,46 @@ static inline void smap_acc_cnt_reset(struct page *page)
+ }
+ 
+ /**
+- * smap_page_init - Check whether the access-frequency flag bits are all 1s
++ * smap_page_init - Check the init flag
+  *
+  * @page: target page
+  *
+- * Returns true if every bit in the SMAP_ACC_CNT field is set (i.e. the
+- * counter has reached SMAP_ACC_CNT_MAX = 0xFFF), false otherwise.
+- * Only inspects the 12-bit frequency field; the low 4-bit cold-period
+- * counter is not considered.
++ * Returns true if the page has never been seen by SMAP (init flag = 1).
++ * The kernel sets LAST_CPUPID to all-1s when a page is freed, so bit 4
++ * is 1 on freshly-allocated pages.  After smap_page_mark clears it to 0,
++ * subsequent calls return false.
++ *
++ * This replaces the old 12-bit-wide ACC_CNT == 0xFFF check with a single
++ * bit, freeing 11 bits for the frequency counter while keeping the same
++ * "is this page new to SMAP?" semantics.
+  */
+ static inline bool smap_page_init(struct page *page)
+ {
+-	unsigned long flags = READ_ONCE(page->flags);
+-	u16 cnt = (flags >> SMAP_ACC_CNT_SHIFT) & SMAP_ACC_CNT_MASK;
+-	return cnt == SMAP_ACC_CNT_MAX;
++	return (READ_ONCE(page->flags) & SMAP_INIT_FLAG_MASK);
+ }
+ 
+ /**
+- * smap_page_mark - Clear the access-frequency flag bits, keeping only the lowest bit set
++ * smap_page_mark - Clear the init flag (mark page as seen by SMAP)
+  *
+  * @page: target page
+  *
+- * Atomically sets the SMAP_ACC_CNT field to 1 (binary 000000000001),
+- * i.e. all 12 frequency bits are cleared except the lowest-order one.
+- * The low 4-bit cold-period counter (SMAP_COLD_FIELD) is preserved.
++ * Atomically clears bit 4 (init flag) from 1 → 0.  No other bits are
++ * touched: the frequency counter and cold-period counter are preserved.
++ *
++ * The init flag is 1 on freshly-allocated pages (kernel sets LAST_CPUPID
++ * to all-1s).  Clearing it to 0 is the sole "mark" action; the frequency
++ * counter is left untouched and will be handled by smap_acc_cnt_inc/reset
++ * on their own schedule.
+  */
+ static inline void smap_page_mark(struct page *page)
+ {
+ 	unsigned long flags, new_flags;
++	unsigned long old, new;
+ 
+ 	do {
+-		flags = READ_ONCE(page->flags);
+-		new_flags = flags & ~SMAP_ACC_FIELD_MASK;
+-		new_flags |= (unsigned long)1 << SMAP_ACC_CNT_SHIFT;
+-	} while (unlikely(cmpxchg(&page->flags, flags, new_flags) != flags));
++		old = READ_ONCE(page->flags);
++		new = old & ~SMAP_INIT_FLAG_MASK;
++	} while (unlikely(cmpxchg(&page->flags, old, new) != old));
+ }
+ 
+ #endif /* _SRC_SMAP_PAGE_FLAGS_H */
+-- 
+2.54.0.windows.1
+

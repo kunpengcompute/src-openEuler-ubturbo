@@ -1,0 +1,171 @@
+From c18df9bbafa6b0644ad503d20a36325e5f281aea Mon Sep 17 00:00:00 2001
+From: Pang Jiming <discrete_brain@163.com>
+Date: Thu, 11 Jun 2026 22:10:44 +0800
+Subject: [PATCH 25/43] refactor: remove node_is_critical_err checks
+
+---
+ plugins/smap/.gitignore                       |  3 ++
+ plugins/smap/src/tiering/mig_init.c           | 17 -----------
+ plugins/smap/src/tiering/smap_migrate_pages.c | 28 -------------------
+ plugins/smap/src/tiering/tracking_manage.c    | 28 ++++++++-----------
+ 4 files changed, 14 insertions(+), 62 deletions(-)
+
+diff --git a/plugins/smap/.gitignore b/plugins/smap/.gitignore
+index 73ff41c..9e482e5 100644
+--- a/plugins/smap/.gitignore
++++ b/plugins/smap/.gitignore
+@@ -2,6 +2,9 @@ output
+ build
+ .idea
+ .vscode
++.clangd
++.editorconfig
++CLAUDE.md
+ cmake-build-debug
+ 
+ # cscope files
+diff --git a/plugins/smap/src/tiering/mig_init.c b/plugins/smap/src/tiering/mig_init.c
+index 13b5ed4..a0625a4 100644
+--- a/plugins/smap/src/tiering/mig_init.c
++++ b/plugins/smap/src/tiering/mig_init.c
+@@ -534,14 +534,6 @@ static void walkpage_and_migrate(struct mig_payload *payloads, int len,
+ 		for (i = 0; i < len; i++) {
+ 			struct pagemapread pm = { 0 };
+ 
+-			if (node_is_critical_err(payloads[i].src_nid) ||
+-			    node_is_critical_err(payloads[i].dest_nid)) {
+-				pr_err_ratelimited(
+-					"critical error on node %d or %d\n",
+-					payloads[i].src_nid,
+-					payloads[i].dest_nid);
+-				continue;
+-			}
+ 			if (mig_res[i] == 1) {
+ 				continue;
+ 			}
+@@ -585,15 +577,6 @@ static void walkpage_and_migrate(struct mig_payload *payloads, int len,
+ 			mig_cnt_backup = mig_cnt;
+ 			cnt = 0;
+ 			do {
+-				if (node_is_critical_err(payloads[i].src_nid) ||
+-				    node_is_critical_err(
+-					    payloads[i].dest_nid)) {
+-					pr_err_ratelimited(
+-						"critical error on node %d or %d",
+-						payloads[i].src_nid,
+-						payloads[i].dest_nid);
+-					break;
+-				}
+ 				mig_cnt_min = MIN(mig_cnt_backup,
+ 						  NR_BATCHED_MIGRATION);
+ 				failed_cnt += smap_migrate(
+diff --git a/plugins/smap/src/tiering/smap_migrate_pages.c b/plugins/smap/src/tiering/smap_migrate_pages.c
+index f675fa7..3089850 100644
+--- a/plugins/smap/src/tiering/smap_migrate_pages.c
++++ b/plugins/smap/src/tiering/smap_migrate_pages.c
+@@ -584,11 +584,6 @@ void smap_handle_migrate_back_subtask(struct migrate_back_subtask *task)
+ 	nr_folios_backup = nr_folios;
+ #endif
+ 	do {
+-		if (node_is_critical_err(task->src_nid)) {
+-			pr_err_ratelimited("critical error on node %d\n",
+-					   task->src_nid);
+-			break;
+-		}
+ 		nr_folios_min = MIN(nr_folios, NR_BATCHED_MIGRATION);
+ 		nr_migrate_fail += smap_migrate(
+ 			&migrate_folios[cnt * NR_BATCHED_MIGRATION],
+@@ -698,11 +693,6 @@ void smap_handle_migrate_back_subtask_4k(struct migrate_back_subtask *task)
+ 		cnt = 0;
+ 		nr_fail = 0;
+ 		do {
+-			if (node_is_critical_err(i)) {
+-				pr_err_ratelimited(
+-					"critical error on node %d\n", i);
+-				break;
+-			}
+ 			nr_folios_min =
+ 				MIN(mig_pages_cnt[i], NR_BATCHED_MIGRATION);
+ 			nr_fail += smap_migrate(
+@@ -854,11 +844,6 @@ int do_migrate(struct migrate_msg *msg, struct mig_list *mig_list)
+ 
+ again:
+ 		tmp_pre_migrate_nr = 0;
+-		if (node_is_critical_err(mig_list[i].from) ||
+-		    node_is_critical_err(mig_list[i].to)) {
+-			continue;
+-		}
+-
+ 		nr_this_migrate = MIN(nr_remain_folios, NR_BATCHED_MIGRATION);
+ 		folio_index = mig_list[i].nr - nr_remain_folios;
+ 
+@@ -1053,12 +1038,6 @@ unsigned int smap_migrate_numa(struct migrate_numa_inner_msg *msg)
+ 	int i;
+ 	int nid = msg->dest_nid;
+ 
+-	if (node_is_critical_err(msg->src_nid) ||
+-	    node_is_critical_err(msg->dest_nid)) {
+-		pr_err_ratelimited("critical error on node %d or %d\n",
+-				   msg->src_nid, msg->dest_nid);
+-		return -EINVAL;
+-	}
+ 	for (i = 0; i < msg->count; i++) {
+ 		int retry = MAX_MIGRATE_NUMA_RETRY_TIME;
+ 		u64 start_pa = msg->range[i].pa_start;
+@@ -1069,13 +1048,6 @@ unsigned int smap_migrate_numa(struct migrate_numa_inner_msg *msg)
+ 				break;
+ 			pr_info("migrate range to %d failed %d pages\n", nid,
+ 				ret);
+-			if (node_is_critical_err(msg->src_nid) ||
+-			    node_is_critical_err(msg->dest_nid)) {
+-				pr_err_ratelimited(
+-					"critical error on node %d or %d\n",
+-					msg->src_nid, msg->dest_nid);
+-				return -EINVAL;
+-			}
+ 		} while (retry--);
+ 		if (retry == 0)
+ 			return ret;
+diff --git a/plugins/smap/src/tiering/tracking_manage.c b/plugins/smap/src/tiering/tracking_manage.c
+index 1ba7ad9..17b722f 100644
+--- a/plugins/smap/src/tiering/tracking_manage.c
++++ b/plugins/smap/src/tiering/tracking_manage.c
+@@ -158,24 +158,18 @@ next:
+ 
+ 	task = prev_task;
+ 	list_for_each_entry(subtask, &task->subtask, task_list) {
+-		if (node_is_critical_err(subtask->src_nid)) {
+-			pr_err_ratelimited("critical error on node %d\n",
+-					   subtask->src_nid);
+-			subtask->status = MB_SUBTASK_ERR;
+-		} else {
+-			for (i = 0; i < SUBTASK_RETRY_TIME; i++) {
+-				if (is_smap_pg_huge())
+-					smap_handle_migrate_back_subtask(
+-						subtask);
+-				else
+-					smap_handle_migrate_back_subtask_4k(
+-						subtask);
+-				if (subtask->status != MB_SUBTASK_ERR) {
+-					break;
+-				}
+-				msleep(SUBTASK_SLEEP_TIME);
+-				pr_debug("migrate back retry time %d\n", i);
++		for (i = 0; i < SUBTASK_RETRY_TIME; i++) {
++			if (is_smap_pg_huge())
++				smap_handle_migrate_back_subtask(
++					subtask);
++			else
++				smap_handle_migrate_back_subtask_4k(
++					subtask);
++			if (subtask->status != MB_SUBTASK_ERR) {
++				break;
+ 			}
++			msleep(SUBTASK_SLEEP_TIME);
++			pr_debug("migrate back retry time %d\n", i);
+ 		}
+ 		if (subtask->status == MB_SUBTASK_ERR) {
+ 			task->status = MB_TASK_ERR;
+-- 
+2.54.0.windows.1
+

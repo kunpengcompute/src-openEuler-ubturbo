@@ -1,0 +1,33 @@
+From 59b67c17b27bdaf985d7ccfc9bf77848c07cc490 Mon Sep 17 00:00:00 2001
+From: Jiming Pang <discrete_brain@163.com>
+Date: Wed, 1 Jul 2026 16:53:51 +0800
+Subject: [PATCH 22/43] feat(smap): support 4K page scanning for KVM virtual
+ machines
+
+Add kernel-level 4K-VM support by introducing a process_type module
+parameter to distinguish processes from VMs at scan time. Implement 4K
+page table walk and KVM memslot scanning for VMs using 4K pages,
+alongside the existing 2M hugepage path.
+
+Remove the userspace QEMU task type check to allow 4K-VM processes to
+be managed without requiring hugepage VMA detection.
+---
+ plugins/smap/src/drivers/accessed_bit.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index 3cd00a7..ff7d37d 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -1087,8 +1087,6 @@ static int scan_kvm_memslots_4k(struct kvm *kvm, struct access_pid *ap,
+ 	struct kvm_memslots *slots;
+ 	struct kvm_memory_slot *memslot;
+ 	int bkt;
+-	u64 nr_pages, cur_index;
+-	u64 *vaddr;
+ 
+ 	if (!kvm || !kvm->arch.mmu.pgt) {
+ 		pr_err("invalid kvm passed to scan kvm memslots\n");
+-- 
+2.54.0.windows.1
+

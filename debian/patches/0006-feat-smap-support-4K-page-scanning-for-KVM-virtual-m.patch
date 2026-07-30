@@ -1,0 +1,372 @@
+From e21e7e40f6aed177713df375f28c18a64fd81e30 Mon Sep 17 00:00:00 2001
+From: Pang Jiming <discrete_brain@163.com>
+Date: Tue, 16 Jun 2026 20:49:46 +0800
+Subject: [PATCH 06/43] feat(smap): support 4K page scanning for KVM virtual
+ machines
+
+Add kernel-level 4K-VM support by introducing a process_type module
+parameter to distinguish processes from VMs at scan time. Implement 4K
+page table walk and KVM memslot scanning for VMs using 4K pages,
+alongside the existing 2M hugepage path.
+
+Remove the userspace QEMU task type check to allow 4K-VM processes to
+be managed without requiring hugepage VMA detection.
+---
+ plugins/smap/src/drivers/access_mmu.c      |   3 +-
+ plugins/smap/src/drivers/access_tracking.c |   4 +
+ plugins/smap/src/drivers/access_tracking.h |   7 +-
+ plugins/smap/src/drivers/accessed_bit.c    | 207 ++++++++++++++++++++-
+ plugins/smap/src/user/manage/manage.c      |   5 -
+ 5 files changed, 213 insertions(+), 13 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/access_mmu.c b/plugins/smap/src/drivers/access_mmu.c
+index 7ac5c7e..92a520c 100644
+--- a/plugins/smap/src/drivers/access_mmu.c
++++ b/plugins/smap/src/drivers/access_mmu.c
+@@ -85,11 +85,12 @@ int add_to_bm_page(u64 paddr, struct access_pid *ap)
+ {
+ 	int nid, nid_pos, ret;
+ 	u64 acidx;
++	unsigned long numa_nodes = ap->numa_nodes;
++
+ 	ret = calc_paddr_acidx(paddr, &nid, &acidx);
+ 	if (ret)
+ 		return ret;
+ 	nid_pos = convert_nid_to_pos(nid);
+-	unsigned long numa_nodes = ap->numa_nodes;
+ 	if (unlikely(!test_bit(nid_pos, &numa_nodes))) {
+ 		return -EINVAL;
+ 	}
+diff --git a/plugins/smap/src/drivers/access_tracking.c b/plugins/smap/src/drivers/access_tracking.c
+index 475bc5e..052a4fd 100644
+--- a/plugins/smap/src/drivers/access_tracking.c
++++ b/plugins/smap/src/drivers/access_tracking.c
+@@ -55,6 +55,10 @@ unsigned int enable_hist = DISABLE_HIST;
+ module_param(enable_hist, uint, S_IRUGO);
+ MODULE_PARM_DESC(enable_hist, "smap hist disable: 0, smap hist enable: 1");
+ 
++unsigned int process_type = TYPE_PROC;
++module_param(process_type, uint, S_IRUGO);
++MODULE_PARM_DESC(process_type, "smap process type: 0 for process, 1 for vm");
++
+ LIST_HEAD(access_dev);
+ u8 access_page_size = PAGE_MODE_2M;
+ 
+diff --git a/plugins/smap/src/drivers/access_tracking.h b/plugins/smap/src/drivers/access_tracking.h
+index 0e20c82..986cef6 100644
+--- a/plugins/smap/src/drivers/access_tracking.h
++++ b/plugins/smap/src/drivers/access_tracking.h
+@@ -20,6 +20,7 @@
+ extern unsigned int smap_scene;
+ extern u32 g_pagesize_huge;
+ extern unsigned int enable_hist;
++extern unsigned int process_type;
+ 
+ enum access_page_mode {
+ 	PAGE_MODE_4K = 0,
+@@ -39,6 +40,11 @@ enum hist_status {
+ 	NR_STATUS_ARGS,
+ };
+ 
++enum smap_process_type {
++	TYPE_PROC,
++	TYPE_VM,
++};
++
+ #define AB_ACTC_ELEM_SIZE 16
+ #define WORKQ_NAME_SIZE 32
+ #define WORKQ_NAME_MAX_LEN (WORKQ_NAME_SIZE - 1)
+@@ -75,7 +81,6 @@ static inline int get_page_size(struct access_tracking_dev *adev)
+ }
+ 
+ void cancel_ap_scan_work(struct access_pid *ap);
+-bool is_access_hugepage(void);
+ void submit_one_work(struct access_pid *ap);
+ ktime_t calc_time_us(ktime_t start_time);
+ #endif /* _SRC_ACCESS_TRACKING_H */
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index 1746c33..e048cc8 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -487,6 +487,157 @@ static int hva_to_hpa_hugetlb(struct kvm *kvm, u64 host_va,
+ 	return 0;
+ }
+ 
++#if defined(CONFIG_GUP_GET_PXX_LOW_HIGH) && \
++	(defined(CONFIG_SMP) || defined(CONFIG_PREEMPT_RCU))
++/*
++ * See the comment above ptep_get_lockless() in include/linux/pgtable.h:
++ * the barriers in pmdp_get_lockless() cannot guarantee that the value in
++ * pmd_high actually belongs with the value in pmd_low; but holding interrupts
++ * off blocks the TLB flush between present updates, which guarantees that a
++ * successful __pte_offset_map() points to a page from matched halves.
++ */
++static unsigned long pmdp_get_lockless_start(void)
++{
++	unsigned long irqflags;
++
++	local_irq_save(irqflags);
++	return irqflags;
++}
++static void pmdp_get_lockless_end(unsigned long irqflags)
++{
++	local_irq_restore(irqflags);
++}
++#else
++static unsigned long pmdp_get_lockless_start(void) { return 0; }
++static void pmdp_get_lockless_end(unsigned long irqflags) { }
++#endif
++
++pte_t *__pte_offset_map(pmd_t *pmd, unsigned long addr, pmd_t *pmdvalp)
++{
++	unsigned long irqflags;
++	pmd_t pmdval;
++
++	rcu_read_lock();
++	irqflags = pmdp_get_lockless_start();
++	pmdval = pmdp_get_lockless(pmd);
++	pmdp_get_lockless_end(irqflags);
++
++	if (pmdvalp)
++		*pmdvalp = pmdval;
++	if (unlikely(pmd_none(pmdval) || is_pmd_migration_entry(pmdval)))
++		goto nomap;
++	if (unlikely(pmd_trans_huge(pmdval) || pmd_devmap(pmdval)))
++		goto nomap;
++	if (unlikely(pmd_bad(pmdval))) {
++		pmd_clear_bad(pmd);
++		goto nomap;
++	}
++	return __pte_map(&pmdval, addr);
++nomap:
++	rcu_read_unlock();
++	return NULL;
++}
++
++pte_t *stub_pte_offset(struct mm_struct *mm, unsigned long addr)
++{
++	pgd_t *pgd;
++	p4d_t *p4d;
++	pud_t *pud;
++	pmd_t *pmd;
++	pte_t *pte;
++
++	pgd = pgd_offset(mm, addr);
++	if (!pgd_present(READ_ONCE(*pgd)))
++		return NULL;
++
++	p4d = p4d_offset(pgd, addr);
++	if (!p4d_present(READ_ONCE(*p4d)))
++		return NULL;
++
++	pud = pud_offset(p4d, addr);
++	if (!pud_present(READ_ONCE(*pud)))
++		return NULL;
++
++	pmd = pmd_offset(pud, addr);
++	if (!pmd_present(READ_ONCE(*pmd)))
++		return NULL;
++
++	pte = pte_offset_map(pmd, addr);
++	return pte;
++}
++
++static int hva_to_hpa_4k(struct kvm *kvm, u64 host_va, struct access_pid *ap,
++			 bool is_young)
++{
++	pte_t *ptep;
++	pte_t pte;
++	phys_addr_t paddr;
++	actc_t *entry = NULL;
++	struct page *page;
++
++	if (!kvm)
++		return -EINVAL;
++
++	ptep = stub_pte_offset(kvm->mm, host_va);
++	if (!ptep) {
++		return -EFAULT;
++	}
++
++	pte = __ptep_get(ptep);
++	if (!pte_present(pte)) {
++		pr_debug("unable to get PTE\n");
++		pte_unmap(ptep);
++		return -EINVAL;
++	}
++
++	paddr = PFN_PHYS(pte_pfn(pte));
++	if (!pfn_valid(PHYS_PFN(paddr))) {
++		pte_unmap(ptep);
++		return -EFAULT;
++	}
++	pte_unmap(ptep);
++
++	if (ap->first_scan) {
++		page = pfn_to_online_page(PHYS_PFN(paddr));
++		if (page && try_get_page(page)) {
++			smap_page_cold_periods_reset(page);
++			put_page(page);
++		}
++	}
++
++	if (is_young || access_pid_cur_last_scanning(ap))
++		entry = actc_data_lookup_entry(paddr, PAGE_SIZE);
++
++	if (is_young && entry)
++		(*entry)++;
++
++	if (access_pid_cur_last_scanning(ap))
++		add_to_bm_page(paddr, ap);
++		/*
++		 * End of period: update cold-period counter from
++		 * accumulated actc_data.
++		 */
++		if (!entry)
++			return 0;
++		page = pfn_to_online_page(PHYS_PFN(paddr));
++		if (!page || !try_get_page(page))
++			return 0;
++		if (*entry > 0)
++			smap_page_cold_periods_reset(page);
++		else {
++			int cold_nid = pfn_to_nid(PHYS_PFN(paddr));
++
++			if (smap_page_cold_periods_inc(page) >=
++				    SMAP_COLD_PERIOD_THRESHOLD &&
++			    cold_nid >= nr_local_numa)
++				smap_cold_queue_enqueue(cold_nid,
++							PHYS_PFN(paddr));
++		}
++		put_page(page);
++
++	return 0;
++}
++
+ static void ham_actc_data_add(int pid, phys_addr_t paddr, u32 page_size)
+ {
+ 	struct access_tracking_dev *adev;
+@@ -598,6 +749,8 @@ static int hva_to_hpa(struct kvm *kvm, u64 host_va, struct access_pid *ap,
+ 		} else {
+ 			ret = hva_to_hpa_hugetlb(kvm, host_va, ap, is_young);
+ 		}
++	} else {
++		ret = hva_to_hpa_4k(kvm, host_va, ap, is_young);
+ 	}
+ 	return ret;
+ }
+@@ -743,7 +896,7 @@ static int process_memslot_pages(struct kvm *kvm,
+ 		if (!is_young && !access_pid_cur_last_scanning(ap))
+ 			continue;
+ 		hva = gfn_to_hva_memslot(memslot, gpa_to_gfn(gpa));
+-		if (!get_vma_if_huge_page(kvm, hva))
++		if (page_size == HPAGE_SIZE && !get_vma_if_huge_page(kvm, hva))
+ 			continue;
+ 		ret = hva_to_hpa(kvm, hva, ap, is_young);
+ 		if (ret)
+@@ -804,6 +957,37 @@ static int scan_kvm_memslots(struct kvm *kvm, struct access_pid *ap,
+ 	return 0;
+ }
+ 
++static int scan_kvm_memslots_4k(struct kvm *kvm, struct access_pid *ap,
++				int page_size)
++{
++	struct kvm_memslots *slots;
++	struct kvm_memory_slot *memslot;
++	int bkt;
++	u64 nr_pages, cur_index;
++	u64 *vaddr;
++
++	if (!kvm || !kvm->arch.mmu.pgt) {
++		pr_err("invalid kvm passed to scan kvm memslots\n");
++		return -EINVAL;
++	}
++
++	slots = kvm_memslots(kvm);
++	if (!slots)
++		return -EINVAL;
++
++	if (ap->type != NORMAL_SCAN)
++		return -EINVAL;
++
++	clear_statistic_tracking_info(ap->pid);
++	kvm_for_each_memslot(memslot, bkt, slots) {
++		if (!memslot_is_mem(memslot))
++			continue;
++		process_memslot_pages(kvm, memslot, ap, page_size);
++	}
++	kvm_flush_remote_tlbs(kvm);
++	return 0;
++}
++
+ static inline int pre_scan_kvm_memslots(struct kvm *kvm)
+ {
+ 	int idx = srcu_read_lock(&kvm->srcu);
+@@ -1283,7 +1467,7 @@ static void release_resources(struct file *filp, struct task_struct *task,
+ 		put_pid(pid);
+ }
+ 
+-static int scan_forward_2M(struct access_pid *ap, int page_size)
++static int scan_forward_vm(struct access_pid *ap, int page_size)
+ {
+ 	int srcu_idx;
+ 	struct file *filp;
+@@ -1311,8 +1495,15 @@ static int scan_forward_2M(struct access_pid *ap, int page_size)
+ 		return -EINVAL;
+ 	}
+ 	srcu_idx = pre_scan_kvm_memslots(kvm);
+-	if (scan_kvm_memslots(kvm, ap, page_size))
+-		pr_err("failed to scan kvm mem slots for pid: %d\n", ap->pid);
++	if (page_size == g_pagesize_huge) {
++		if (scan_kvm_memslots(kvm, ap, page_size))
++			pr_err("failed to scan kvm mem slots for pid: %d\n",
++			       ap->pid);
++	} else if (page_size == PAGE_SIZE) {
++		if (scan_kvm_memslots_4k(kvm, ap, page_size))
++			pr_err("failed to scan kvm mem slots for pid: %d\n",
++			       ap->pid);
++	}
+ 
+ 	post_scan_kvm_memslots(kvm, srcu_idx);
+ 	release_resources(filp, task, pid_s);
+@@ -1715,7 +1906,7 @@ int pid_pte_mkold(struct access_pid *ap)
+ int scan_accessed_bit_forward_vm(struct access_pid *ap, int page_size)
+ {
+ 	if (page_size == g_pagesize_huge) {
+-		return scan_forward_2M(ap, page_size);
++		return scan_forward_vm(ap, page_size);
+ 	} else {
+ 		return -EINVAL;
+ 	}
+@@ -1724,7 +1915,11 @@ int scan_accessed_bit_forward_vm(struct access_pid *ap, int page_size)
+ int scan_accessed_bit_forward_mm(struct access_pid *ap, int page_size)
+ {
+ 	if (page_size == PAGE_SIZE) {
+-		return scan_forward_4k_mm(ap, page_size);
++		if (process_type == TYPE_PROC) {
++			return scan_forward_4k_mm(ap, page_size);
++		} else if (process_type == TYPE_VM) {
++			return scan_forward_vm(ap, page_size);
++		}
+ 	}
+ 	return -EINVAL;
+ }
+diff --git a/plugins/smap/src/user/manage/manage.c b/plugins/smap/src/user/manage/manage.c
+index 0f81544..a5b4307 100644
+--- a/plugins/smap/src/user/manage/manage.c
++++ b/plugins/smap/src/user/manage/manage.c
+@@ -382,11 +382,6 @@ static int CheckPid(pid_t pid)
+         SMAP_LOGGER_ERROR("Input pid %d is invalid.", pid);
+         return -ESRCH;
+     }
+-    ret = IsQemuTask(pid);
+-    if (ret != type) {
+-        SMAP_LOGGER_ERROR("Pid %d type(%d) conflict with current pid type(%d).", pid, ret, type);
+-        return -EINVAL;
+-    }
+     return 0;
+ }
+ 
+-- 
+2.54.0.windows.1
+

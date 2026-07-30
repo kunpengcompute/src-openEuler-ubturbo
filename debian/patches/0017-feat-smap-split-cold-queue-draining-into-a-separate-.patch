@@ -1,0 +1,131 @@
+From a4837652643d97262e47c57138100761e8991d28 Mon Sep 17 00:00:00 2001
+From: yuyuanxun <2972982755@qq.com>
+Date: Fri, 10 Jul 2026 15:40:22 +0800
+Subject: [PATCH 17/43] feat(smap): split cold queue draining into a separate
+ periodic ioctl
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+将 smap_cold_queue_drain 从 __ioctl_migrate 中拆出,新增
+SMAP_MIG_DRAIN_COLD_QUEUE ioctl(magic 0xB9, nr 5, 无参 _IO),
+在策略库每个迁移周期下发迁移前无条件调用一次,使冷页换出与
+迁移下发解耦。
+
+- mig_init.h/mig_init.c: 新增 ioctl 号与 __ioctl_drain_cold_queue
+  handler,删除 __ioctl_migrate 内联 drain,switch 新增 case
+- smap_ioctl.h: 用户态侧同名 ioctl 号
+- migration.c: PerformMigration 中迁移前周期 drain
+- separate_strategy.c: CalcSwapNum4K 的 freqBuckets 越界保护
+  (f < FREQ_BUCKETS_SIZE)
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ plugins/smap/src/tiering/mig_init.c              | 16 +++++++++++++---
+ plugins/smap/src/tiering/mig_init.h              |  4 ++++
+ plugins/smap/src/user/manage/smap_ioctl.h        |  1 +
+ plugins/smap/src/user/strategy/migration.c       |  6 ++++++
+ .../smap/src/user/strategy/separate_strategy.c   |  2 +-
+ 5 files changed, 25 insertions(+), 4 deletions(-)
+
+diff --git a/plugins/smap/src/tiering/mig_init.c b/plugins/smap/src/tiering/mig_init.c
+index e0e6ec9..e63ed8e 100644
+--- a/plugins/smap/src/tiering/mig_init.c
++++ b/plugins/smap/src/tiering/mig_init.c
+@@ -406,9 +406,8 @@ static int __ioctl_migrate(void __user *argp)
+ 		return ret;
+ 	}
+ 
+-	ret = smap_cold_queue_drain();
+-	if (ret)
+-		pr_warn("failed to drain cold queue: %d\n", ret);
++	/* Cold-queue drain is now driven by SMAP_MIG_DRAIN_COLD_QUEUE each
++	 * migration cycle, instead of inline here. See __ioctl_drain_cold_queue. */
+ 
+ 	ret = do_migrate(&msg, mig_list);
+ 	filter_4k_migrate_info();
+@@ -423,6 +422,14 @@ static int __ioctl_migrate(void __user *argp)
+ 	return ret;
+ }
+ 
++static int __ioctl_drain_cold_queue(void)
++{
++	int ret = smap_cold_queue_drain();
++	if (ret)
++		pr_warn("failed to drain cold queue: %d\n", ret);
++	return ret;
++}
++
+ static int __ioctl_migrate_numa(void __user *argp)
+ {
+ 	int i, ret;
+@@ -743,6 +750,9 @@ static long smu_mig_ioctl(struct file *file, unsigned int cmd,
+ 	case SMAP_SET_UB_DMA_AVAIL:
+ 		rc = __ioctl_set_ub_dma_avail(argp);
+ 		break;
++	case SMAP_MIG_DRAIN_COLD_QUEUE:
++		rc = __ioctl_drain_cold_queue();
++		break;
+ 	default:
+ 		rc = -ENOTTY;
+ 	}
+diff --git a/plugins/smap/src/tiering/mig_init.h b/plugins/smap/src/tiering/mig_init.h
+index b896bab..9e56f64 100644
+--- a/plugins/smap/src/tiering/mig_init.h
++++ b/plugins/smap/src/tiering/mig_init.h
+@@ -27,6 +27,10 @@
+ #define SMAP_MIG_PID_REMOTE_NUMA \
+ 	_IOW(SMAP_MIG_MAGIC, 3, struct migrate_pid_remote_numa_msg)
+ #define SMAP_SET_UB_DMA_AVAIL _IOW(SMAP_MIG_MAGIC, 4, unsigned int)
++/* Drain all per-PID cold page queues and reclaim via swap. No payload.
++ * Decoupled from SMAP_MIG_MIGRATE so the swap-out path can be driven each
++ * migration cycle instead of only inside the migrate ioctl. */
++#define SMAP_MIG_DRAIN_COLD_QUEUE _IO(SMAP_MIG_MAGIC, 5)
+ 
+ typedef struct {
+ 	u64 pme;
+diff --git a/plugins/smap/src/user/manage/smap_ioctl.h b/plugins/smap/src/user/manage/smap_ioctl.h
+index ff3168f..c86248e 100644
+--- a/plugins/smap/src/user/manage/smap_ioctl.h
++++ b/plugins/smap/src/user/manage/smap_ioctl.h
+@@ -37,6 +37,7 @@
+ #define SMAP_MIG_MIGRATE_NUMA _IOW(SMAP_MIG_MAGIC, 2, struct MigrateNumaIoctlMsg)
+ #define SMAP_MIG_PID_REMOTE_NUMA _IOW(SMAP_MIG_MAGIC, 3, struct MigPidRemoteNumaIoctlMsg)
+ #define SMAP_SET_UB_DMA_AVAIL _IOW(SMAP_MIG_MAGIC, 4, unsigned int)
++#define SMAP_MIG_DRAIN_COLD_QUEUE _IO(SMAP_MIG_MAGIC, 5)
+ 
+ #define SMAP_MAGIC 0xBA
+ #define SMAP_MIGRATE_BACK _IOW(SMAP_MAGIC, 0, struct MigrateBackMsg)
+diff --git a/plugins/smap/src/user/strategy/migration.c b/plugins/smap/src/user/strategy/migration.c
+index ebd3f51..407bb46 100644
+--- a/plugins/smap/src/user/strategy/migration.c
++++ b/plugins/smap/src/user/strategy/migration.c
+@@ -521,6 +521,12 @@ static int PerformMigration(struct ProcessManager *manager)
+     struct MigrateMsg mMsg;
+     struct timeval start, end;
+ 
++    // 迁移周期前先换出冷页:与迁移下发解耦,每个周期无条件 drain 一次
++    int dr = ioctl(manager->fds.migrate, SMAP_MIG_DRAIN_COLD_QUEUE);
++    if (dr) {
++        SMAP_LOGGER_WARNING("drain cold queue failed: %d.", dr);
++    }
++
+     ret = PreMigration(manager, &mMsg, &migratePages);
+     if (ret) {
+         SMAP_LOGGER_ERROR("PreMigration failed! ret: %d.", ret);
+diff --git a/plugins/smap/src/user/strategy/separate_strategy.c b/plugins/smap/src/user/strategy/separate_strategy.c
+index e1c16aa..132dd76 100644
+--- a/plugins/smap/src/user/strategy/separate_strategy.c
++++ b/plugins/smap/src/user/strategy/separate_strategy.c
+@@ -357,7 +357,7 @@ static uint64_t CalcSwapNum4K(ProcessAttr *process, int localNid, int remoteNid,
+         swapByFreq = 0;
+     }
+     uint64_t l1ColdNum = 0;
+-    for (uint64_t f = 0; f <= freqThreshold; f++) {
++    for (uint64_t f = 0; f <= freqThreshold && f < FREQ_BUCKETS_SIZE; f++) {
+         l1ColdNum += localActCount->freqBuckets[f];
+     }
+     if (remoteActCount->freqNum > numaOffset[remoteNid]) {
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,61 @@
+From a877e23a1b7fc25719bbf884b5529b6bd5cbaf74 Mon Sep 17 00:00:00 2001
+From: discrete_brain <discrete_brain@163.com>
+Date: Mon, 27 Jul 2026 15:02:22 +0800
+Subject: [PATCH 42/43] perf(smap): remove redundant code
+
+---
+ plugins/smap/src/drivers/accessed_bit.c       | 10 +++-------
+ plugins/smap/src/tiering/smap_migrate_pages.c |  2 --
+ 2 files changed, 3 insertions(+), 9 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index ac43e73..32aa01f 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -750,11 +750,7 @@ static int hva_to_hpa_4k(struct mm_struct *mm, u64 host_va,
+ 		return -EINVAL;
+ 	}
+ 
+-	paddr = PFN_PHYS(pte_pfn(pte));
+-	if (!pfn_valid(PHYS_PFN(paddr))) {
+-		pte_unmap(ptep);
+-		return -EFAULT;
+-	}
++	paddr = __pte_to_phys(pte);
+ 	pte_unmap(ptep);
+ 
+ 	page = pfn_to_online_page(PHYS_PFN(paddr));
+@@ -1012,7 +1008,7 @@ static int smap_bulk_pte_cb(u64 gpa, u64 hpa, bool young, bool pte_valid,
+ 			smap_handle_last_scan_4k(hpa, page, young, ap);
+ 	} else {
+ 		hva = gfn_to_hva_memslot(ctx->memslot, gpa >> PAGE_SHIFT);
+-		ret = hva_to_hpa(ctx->kvm->mm, hva, ap, young, false);
++		ret = hva_to_hpa_4k(ctx->kvm->mm, hva, ap, young);
+ 	}
+ 
+ 	return ret;
+@@ -1032,7 +1028,7 @@ static void smap_bulk_hole_cb(u64 gpa_start, u64 gpa_end, void *arg)
+ 
+ 	for (gfn = start; gfn < end; gfn++) {
+ 		hva = gfn_to_hva_memslot(ctx->memslot, gfn);
+-		(void)hva_to_hpa(ctx->kvm->mm, hva, ap, false, false);
++		(void)hva_to_hpa_4k(ctx->kvm->mm, hva, ap, false);
+ 	}
+ }
+ 
+diff --git a/plugins/smap/src/tiering/smap_migrate_pages.c b/plugins/smap/src/tiering/smap_migrate_pages.c
+index bdea307..810bfb7 100644
+--- a/plugins/smap/src/tiering/smap_migrate_pages.c
++++ b/plugins/smap/src/tiering/smap_migrate_pages.c
+@@ -829,8 +829,6 @@ again:
+ 	pre_migrate_failed = 0;
+ 	pre_migrate_num = 0;
+ 	tmp_pre_migrate_nr = 0;
+-	if (node_is_critical_err(item->from) || node_is_critical_err(item->to))
+-		return item->failed_mig_nr;
+ 
+ 	{
+ 		struct folio **migrate_folios;
+-- 
+2.54.0.windows.1
+

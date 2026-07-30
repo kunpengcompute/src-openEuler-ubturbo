@@ -1,0 +1,199 @@
+From a2766887aab5adbcb2fe68c9304645b3ae5e7766 Mon Sep 17 00:00:00 2001
+From: Jiming Pang <discrete_brain@163.com>
+Date: Thu, 9 Jul 2026 19:37:40 +0800
+Subject: [PATCH 31/43] perf(smap): add segment cache and pre-computed offsets
+ for acpi address lookup
+
+Add addr_offset field to acpi_mem_segment for O(1) offset calculation.
+Cache last accessed segment to exploit spatial locality in scanning workloads.
+---
+ plugins/smap/src/drivers/access_acpi_mem.c | 70 ++++++++++++++++++----
+ plugins/smap/src/drivers/access_acpi_mem.h |  4 ++
+ plugins/smap/src/drivers/access_tracking.c | 11 ++++
+ 3 files changed, 73 insertions(+), 12 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/access_acpi_mem.c b/plugins/smap/src/drivers/access_acpi_mem.c
+index 2dd12a0..387aceb 100644
+--- a/plugins/smap/src/drivers/access_acpi_mem.c
++++ b/plugins/smap/src/drivers/access_acpi_mem.c
+@@ -19,6 +19,10 @@ struct mem_info acpi_mem = {
+ 	.len = 0,
+ 	.mem = LIST_HEAD_INIT(acpi_mem.mem),
+ };
++static struct acpi_mem_segment *acpi_mem_cache[SMAP_MAX_LOCAL_NUMNODES];
++static u32 acpi_mem_seg_count[SMAP_MAX_LOCAL_NUMNODES];
++static u64 acpi_cache_hit_count;
++static u64 acpi_cache_miss_count;
+ 
+ bool is_paddr_local(u64 pa)
+ {
+@@ -147,6 +151,21 @@ static void merge_acpi_mem_segments(void)
+ 	}
+ }
+ 
++static void calc_acpi_mem_addr_offset(void)
++{
++	struct acpi_mem_segment *seg;
++	u64 addr_offset[SMAP_MAX_NUMNODES] = { 0 };
++
++	memset(acpi_mem_seg_count, 0, sizeof(acpi_mem_seg_count));
++	list_for_each_entry(seg, &acpi_mem.mem, segment) {
++		seg->size = seg->end - seg->start + 1;
++		seg->addr_offset = addr_offset[seg->node];
++		addr_offset[seg->node] += seg->size;
++		if (seg->node < SMAP_MAX_LOCAL_NUMNODES)
++			acpi_mem_seg_count[seg->node]++;
++	}
++}
++
+ int init_acpi_mem(void)
+ {
+ 	int count;
+@@ -188,6 +207,7 @@ int init_acpi_mem(void)
+ 
+ 	pr_info("init_acpi_mem: nr_local_numa = %d\n", nr_local_numa);
+ 	merge_acpi_mem_segments();
++	calc_acpi_mem_addr_offset();
+ 
+ 	return 0;
+ }
+@@ -201,6 +221,20 @@ void reset_acpi_mem(void)
+ 	}
+ 	acpi_mem.len = 0;
+ 	nr_local_numa = 0;
++	memset(acpi_mem_cache, 0, sizeof(acpi_mem_cache));
++	memset(acpi_mem_seg_count, 0, sizeof(acpi_mem_seg_count));
++}
++
++void reset_acpi_cache_counters(void)
++{
++	acpi_cache_hit_count = 0;
++	acpi_cache_miss_count = 0;
++}
++
++void get_acpi_cache_counters(u64 *hit, u64 *miss)
++{
++	*hit = acpi_cache_hit_count;
++	*miss = acpi_cache_miss_count;
+ }
+ 
+ u64 get_node_actc_len(int node_id, int page_size)
+@@ -255,20 +289,26 @@ int calc_paddr_acidx_acpi_known_nid(u64 paddr, int nid, u64 *index,
+ 				    int page_size)
+ {
+ 	struct acpi_mem_segment *mem;
+-	u64 offset = 0;
+ 	int shift = __builtin_ctz(page_size);
+ 
++	mem = acpi_mem_cache[nid];
++	if (likely(mem)) {
++		acpi_cache_hit_count++;
++		*index = (mem->addr_offset + paddr - mem->start) >> shift;
++		return 0;
++	}
++
++	acpi_cache_miss_count++;
+ 	list_for_each_entry(mem, &acpi_mem.mem, segment) {
+-		if (mem->node != nid) {
++		if (mem->node != nid)
+ 			continue;
+-		}
+-		if (paddr > mem->end) {
+-			offset += mem->end - mem->start + 1;
++		if (paddr > mem->end)
+ 			continue;
+-		} else if (unlikely(paddr < mem->start))
++		if (unlikely(paddr < mem->start))
+ 			break;
+-		offset += paddr - mem->start;
+-		*index = offset >> shift;
++		*index = (mem->addr_offset + paddr - mem->start) >> shift;
++		if (acpi_mem_seg_count[nid] == 1)
++			acpi_mem_cache[nid] = mem;
+ 		return 0;
+ 	}
+ 	return -ERANGE;
+@@ -277,19 +317,25 @@ int calc_paddr_acidx_acpi_known_nid(u64 paddr, int nid, u64 *index,
+ int calc_acidx_paddr_acpi(int nid, u64 acidx, u64 *paddr, int page_size)
+ {
+ 	struct acpi_mem_segment *mem;
+-	u64 range;
+ 	int shift = __builtin_ctz(page_size);
+ 	u64 offset = acidx << shift;
+ 
++	mem = acpi_mem_cache[nid];
++	if (likely(mem)) {
++		*paddr = mem->start + offset - mem->addr_offset;
++		return 0;
++	}
++
+ 	list_for_each_entry(mem, &acpi_mem.mem, segment) {
+ 		if (mem->node != nid)
+ 			continue;
+-		range = mem->end - mem->start + 1;
+-		if (offset >= range) {
+-			offset -= range;
++		if (offset >= mem->size) {
++			offset -= mem->size;
+ 			continue;
+ 		}
+ 		*paddr = mem->start + offset;
++		if (acpi_mem_seg_count[nid] == 1)
++			acpi_mem_cache[nid] = mem;
+ 		return 0;
+ 	}
+ 	return -ERANGE;
+diff --git a/plugins/smap/src/drivers/access_acpi_mem.h b/plugins/smap/src/drivers/access_acpi_mem.h
+index b4190f2..17c4b59 100644
+--- a/plugins/smap/src/drivers/access_acpi_mem.h
++++ b/plugins/smap/src/drivers/access_acpi_mem.h
+@@ -15,6 +15,8 @@ struct acpi_mem_segment {
+ 	struct list_head segment;
+ 	u64 start;
+ 	u64 end;
++	u64 addr_offset;
++	u64 size;
+ };
+ 
+ struct mem_info {
+@@ -27,6 +29,8 @@ extern int nr_local_numa;
+ bool is_paddr_local(u64 pa);
+ int init_acpi_mem(void);
+ void reset_acpi_mem(void);
++void reset_acpi_cache_counters(void);
++void get_acpi_cache_counters(u64 *hit, u64 *miss);
+ u64 get_node_actc_len(int node_id, int page_size);
+ int calc_paddr_acidx_acpi(u64 paddr, int *nid, u64 *index, int page_size);
+ int calc_paddr_acidx_acpi_known_nid(u64 paddr, int nid, u64 *index,
+diff --git a/plugins/smap/src/drivers/access_tracking.c b/plugins/smap/src/drivers/access_tracking.c
+index 01d82c4..e0a9c50 100644
+--- a/plugins/smap/src/drivers/access_tracking.c
++++ b/plugins/smap/src/drivers/access_tracking.c
+@@ -506,6 +506,8 @@ static void work_func(struct work_struct *work)
+ 	scan_work = to_delay_work(work);
+ 	ap = delay_work_to_ap(scan_work);
+ 
++	reset_acpi_cache_counters();
++
+ 	/* Bloom filter: double-buffering flip & round-level decisions */
+ 	if (ap->type == NORMAL_SCAN && enable_bloom_filter) {
+ 		ap->force_scan =
+@@ -562,6 +564,15 @@ static void work_func(struct work_struct *work)
+ 			filtered, ap->scan_seq,
+ 			ap->force_scan ? "true" : "false");
+ 	}
++
++	/* Print acpi cache stats */
++	if (ap->type == NORMAL_SCAN) {
++		u64 hit, miss;
++		get_acpi_cache_counters(&hit, &miss);
++		pr_info("[acpi_cache] pid=%d hit=%llu miss=%llu\n",
++			ap->pid, hit, miss);
++	}
++
+ 	if (ap->type == NORMAL_SCAN && ap->cur_times >= ap->ntimes) {
+ 		ap->total_scanned_pages +=
+ 			calc_process_page_number(ap) * ap->ntimes;
+-- 
+2.54.0.windows.1
+

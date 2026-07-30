@@ -1,0 +1,131 @@
+From 4dfd097ea9f617c996c4b75ded3192b0f2fb2f1f Mon Sep 17 00:00:00 2001
+From: Jiming Pang <discrete_brain@163.com>
+Date: Wed, 15 Jul 2026 14:40:17 +0800
+Subject: [PATCH 34/43] refactor(smap): simplify stage-2 page table walker
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Remove dead code from __kvm_pgtable_visit() that is unused by SMAP:
+
+- Remove kvm_pgtable_walk_continue() and all its call sites — the
+  -EAGAIN/HANDLE_FAULT machinery was vestigial from upstream fault
+  handlers; SMAP callbacks have no fault-handling path and the
+  per-page caller already handles errors uniformly
+- Remove KVM_PGTABLE_WALK_TABLE_PRE and TABLE_POST branches —
+  never set by any SMAP caller
+- Remove the reload-after-callback pattern — SMAP callbacks never
+  install new page tables, so re-reading the PTE is a no-op
+- Remove the !table fallback callback — was firing a second
+  kvm_pgtable_visitor_cb() after addr had been advanced, causing
+  a double callback for non-table entries
+- Remove the out: label and goto — control flow is now a simple
+  two-way branch (table → descend, !table → callback + advance)
+- Drop KVM_PGTABLE_WALK_HANDLE_FAULT from the per-page path
+
+The walker now treats any non-table entry as a leaf: fire the
+callback, advance addr, return. Table entries descend into the
+child page table. No flags, no reload, no continue/stop logic.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ plugins/smap/src/drivers/kvm_pgtable.c | 60 ++------------------------
+ 1 file changed, 4 insertions(+), 56 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/kvm_pgtable.c b/plugins/smap/src/drivers/kvm_pgtable.c
+index 7734394..0fa3530 100644
+--- a/plugins/smap/src/drivers/kvm_pgtable.c
++++ b/plugins/smap/src/drivers/kvm_pgtable.c
+@@ -70,24 +70,6 @@ static int kvm_pgtable_visitor_cb(struct kvm_pgtable_walk_data *data,
+ 		     !kvm_pgtable_walk_lock_held());
+ 	return walker->cb(ctx, visit);
+ }
+-static bool kvm_pgtable_walk_continue(const struct kvm_pgtable_walker *walker,
+-				      int r)
+-{
+-	/*
+-	 * Visitor callbacks return EAGAIN when the conditions that led to a
+-	 * fault are no longer reflected in the page tables due to a race to
+-	 * update a PTE. In the context of a fault handler this is interpreted
+-	 * as a signal to retry guest execution.
+-	 *
+-	 * Ignore the return code altogether for walkers outside a fault handler
+-	 * (e.g. write protecting a range of memory) and chug along with the
+-	 * page table walk.
+-	 */
+-	if (r == -EAGAIN)
+-		return !(walker->flags & KVM_PGTABLE_WALK_HANDLE_FAULT);
+-
+-	return !r;
+-}
+ 
+ static kvm_pte_t *kvm_pte_follow(kvm_pte_t pte,
+ 				 struct kvm_pgtable_mm_ops *mm_ops)
+@@ -116,51 +98,18 @@ static inline int __kvm_pgtable_visit(struct kvm_pgtable_walk_data *data,
+ 		.level = level,
+ 		.flags = flags,
+ 	};
+-	int ret = 0;
+-	bool reload = false;
++	int ret;
+ 	kvm_pteref_t childp;
+ 	bool table = kvm_pte_table(ctx.old, level);
+-	if (table && (ctx.flags & KVM_PGTABLE_WALK_TABLE_PRE)) {
+-		ret = kvm_pgtable_visitor_cb(data, &ctx,
+-					     KVM_PGTABLE_WALK_TABLE_PRE);
+-		reload = true;
+-	}
+-
+-	if (!table && (ctx.flags & KVM_PGTABLE_WALK_LEAF)) {
+-		ret = kvm_pgtable_visitor_cb(data, &ctx, KVM_PGTABLE_WALK_LEAF);
+-		reload = true;
+-	}
+-	/*
+-	 * Reload the page table after invoking the walker callback for leaf
+-	 * entries or after pre-order traversal, to allow the walker to descend
+-	 * into a newly installed or replaced table.
+-	 */
+-	if (reload) {
+-		ctx.old = READ_ONCE(*ptep);
+-		table = kvm_pte_table(ctx.old, level);
+-	}
+-	if (!kvm_pgtable_walk_continue(data->walker, ret)) {
+-		goto out;
+-	}
+ 	if (!table) {
++		ret = kvm_pgtable_visitor_cb(data, &ctx, KVM_PGTABLE_WALK_LEAF);
+ 		data->addr = ALIGN_DOWN(data->addr, kvm_granule_size(level));
+ 		data->addr += kvm_granule_size(level);
+-		goto out;
++		return ret;
+ 	}
+ 
+ 	childp = (kvm_pteref_t)kvm_pte_follow(ctx.old, mm_ops);
+ 	ret = __kvm_pgtable_walk(data, mm_ops, childp, level + 1);
+-	if (!kvm_pgtable_walk_continue(data->walker, ret)) {
+-		goto out;
+-	}
+-	if (ctx.flags & KVM_PGTABLE_WALK_TABLE_POST)
+-		ret = kvm_pgtable_visitor_cb(data, &ctx,
+-					     KVM_PGTABLE_WALK_TABLE_POST);
+-
+-out:
+-	if (kvm_pgtable_walk_continue(data->walker, ret))
+-		return 0;
+-
+ 	return ret;
+ }
+ 
+@@ -362,8 +311,7 @@ bool smap_kvm_pgtable_stage2_test_clear_young(struct kvm_pgtable *pgt, u64 addr,
+ 
+ 	ret = smap_stage2_test_clear_young(
+ 		pgt, addr, 1, 0, KVM_PTE_LEAF_ATTR_LO_S2_AF, mkold, &pte, NULL,
+-		&young,
+-		KVM_PGTABLE_WALK_HANDLE_FAULT | KVM_PGTABLE_WALK_SHARED, paddr);
++		&young, KVM_PGTABLE_WALK_SHARED, paddr);
+ 	if (!ret)
+ 		dsb(ishst);
+ 	return young;
+-- 
+2.54.0.windows.1
+

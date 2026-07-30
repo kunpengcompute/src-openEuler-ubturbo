@@ -1,0 +1,79 @@
+From efe78f1ccff5086e4397328e83465eee39fc7f9a Mon Sep 17 00:00:00 2001
+From: lucas <1358497393@qq.com>
+Date: Mon, 29 Jun 2026 15:05:17 +0800
+Subject: [PATCH 10/43] fix(smap): swap 4K pages by L1/L2 freq gap instead of
+ L1 zero pages
+
+  CalcSwapNum4K only allowed L1 zero pages to be swapped out, which rarely
+  happens under accumulated frequency. Swap when an L2 page's frequency
+  exceeds the L1 minimum by more than FREQ_SWAP_DELTA_4K (10) instead.
+---
+ .../src/user/strategy/separate_strategy.c     | 26 ++++++++++++++-----
+ 1 file changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/plugins/smap/src/user/strategy/separate_strategy.c b/plugins/smap/src/user/strategy/separate_strategy.c
+index 95d8ec6..e1c16aa 100644
+--- a/plugins/smap/src/user/strategy/separate_strategy.c
++++ b/plugins/smap/src/user/strategy/separate_strategy.c
+@@ -25,6 +25,8 @@
+ #define DEFAULT_SLOW_THRED_2M (2 * DEFAULT_FREQ_WT_2M)
+ #define MAX_MIGRATE_DIVISOR_2M 1
+ #define MULTI_NUMA_VM_OOM 66
++/* 4K 交换：仅当 L2 页面频次比 L1 最小频次高出该差值时才值得交换 */
++#define FREQ_SWAP_DELTA_4K 2
+ 
+ typedef struct NumaInfo {
+     int localNid;
+@@ -335,19 +337,28 @@ static uint64_t CalcSwapNum4K(ProcessAttr *process, int localNid, int remoteNid,
+ {
+     uint64_t migrateNum;
+     uint64_t lastFreqNum;
+-    uint64_t lastZeroNum;
++    uint64_t swapByFreq;
+     ActCount *localActCount = &process->scanAttr.actCount[localNid];
+     ActCount *remoteActCount = &process->scanAttr.actCount[remoteNid];
+     uint64_t localLen = process->scanAttr.actcLen[localNid] - numaOffset[localNid];
+     uint64_t localFree = localActCount->pageNum - localActCount->whiteNum;
+     uint64_t remoteFree = remoteActCount->pageNum - remoteActCount->whiteNum;
+-    uint64_t freqBucketZero = localActCount->freqBuckets[0];
++    /* 累计频次下不应只换出 L1 零页：统计 L2 中频次比 L1 最小频次大 FREQ_SWAP_DELTA_4K 的页面数 */
++    uint64_t freqThreshold = (uint64_t)localActCount->freqMin + FREQ_SWAP_DELTA_4K;
++    uint64_t swappableNum = 0;
++    for (uint64_t f = freqThreshold + 1; f < FREQ_BUCKETS_SIZE; f++) {
++        swappableNum += remoteActCount->freqBuckets[f];
++    }
+     /* The number of pages with swap should not exceed 1% */
+     uint64_t maxByTotal = process->walkPage.nrPage / HUNDRED;
+-    if (freqBucketZero > numaOffset[localNid]) {
+-        lastZeroNum = freqBucketZero - numaOffset[localNid];
++    if (swappableNum > numaOffset[remoteNid]) {
++        swapByFreq = swappableNum - numaOffset[remoteNid];
+     } else {
+-        lastZeroNum = 0;
++        swapByFreq = 0;
++    }
++    uint64_t l1ColdNum = 0;
++    for (uint64_t f = 0; f <= freqThreshold; f++) {
++        l1ColdNum += localActCount->freqBuckets[f];
+     }
+     if (remoteActCount->freqNum > numaOffset[remoteNid]) {
+         lastFreqNum = remoteActCount->freqNum - numaOffset[remoteNid];
+@@ -356,11 +367,14 @@ static uint64_t CalcSwapNum4K(ProcessAttr *process, int localNid, int remoteNid,
+     }
+     migrateNum = MIN(localLen, process->separateParam.maxMigrate);
+     migrateNum = MIN(migrateNum, numaFreePage[localNid]);
+-    migrateNum = MIN(migrateNum, lastZeroNum);
++    migrateNum = MIN(migrateNum, swapByFreq);
+     migrateNum = MIN(migrateNum, lastFreqNum);
+     migrateNum = MIN(migrateNum, localFree);
+     migrateNum = MIN(migrateNum, remoteFree);
+     migrateNum = MIN(migrateNum, maxByTotal);
++    migrateNum = MIN(migrateNum, l1ColdNum);
++    SMAP_LOGGER_INFO("Pid %d Node%d->Node%d CalcSwapNum4K: localLen=%llu maxMigrate=%llu numaFree=%llu swapByFreq=%llu lastFreqNum=%llu localFree=%llu remoteFree=%llu maxByTotal=%llu l1ColdNum=%llu result=%llu",
++                     process->pid, localNid, remoteNid, localLen, process->separateParam.maxMigrate, numaFreePage[localNid], swapByFreq, lastFreqNum, localFree, remoteFree, maxByTotal, l1ColdNum, migrateNum);
+     return migrateNum;
+ }
+ 
+-- 
+2.54.0.windows.1
+
