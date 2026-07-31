@@ -1,0 +1,54 @@
+From 092ed6a21d771e580afeff67ccec187233c4a793 Mon Sep 17 00:00:00 2001
+From: yuyuanxun <2972982755@qq.com>
+Date: Sat, 4 Jul 2026 15:17:24 +0800
+Subject: [PATCH 14/43] Swap pages are not included in the bitmap
+
+---
+ plugins/smap/src/drivers/accessed_bit.c | 17 ++++++++++-------
+ 1 file changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index 415bfba..8eb8b57 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -609,8 +609,7 @@ static int hva_to_hpa_4k(struct kvm *kvm, u64 host_va, struct access_pid *ap,
+ 	if (is_young)
+ 		actc_data_lookup_entry(paddr, PAGE_SIZE);
+ 
+-	if (access_pid_cur_last_scanning(ap))
+-		add_to_bm_page(paddr, ap);
++	if (access_pid_cur_last_scanning(ap)) {
+ 		/*
+ 		 * End of period: update cold-period counter from
+ 		 * accumulated actc_data.
+@@ -618,18 +617,22 @@ static int hva_to_hpa_4k(struct kvm *kvm, u64 host_va, struct access_pid *ap,
+ 		page = pfn_to_online_page(PHYS_PFN(paddr));
+ 		if (!page || !try_get_page(page))
+ 			return 0;
+-		if (is_young)
++		if (is_young) {
+ 			smap_page_cold_periods_reset(page);
+-		else {
++			add_to_bm_page(paddr, ap);
++		} else {
+ 			int cold_nid = pfn_to_nid(PHYS_PFN(paddr));
+ 
+ 			if (smap_page_cold_periods_inc(page) >=
+ 				    SMAP_COLD_PERIOD_THRESHOLD &&
+-			    cold_nid >= nr_local_numa)
+-				smap_cold_queue_enqueue(cold_nid,
+-							PHYS_PFN(paddr));
++			    !smap_cold_queue_enqueue(cold_nid, PHYS_PFN(paddr))) {
++				/* enqueued into cold_queue; skip bitmap */
++			} else {
++				add_to_bm_page(paddr, ap);
++			}
+ 		}
+ 		put_page(page);
++	}
+ 
+ 	return 0;
+ }
+-- 
+2.54.0.windows.1
+

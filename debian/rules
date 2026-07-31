@@ -61,6 +61,11 @@ override_dh_auto_build:
 		cmake -DCMAKE_BUILD_TYPE=Release . && \
 		make -j$(NUMJOBS) install
 
+	# Build smap tool (smap_tool)
+	if [ -d $(CURDIR)/plugins/smap/tool ]; then \
+		cd $(CURDIR)/plugins/smap/tool && g++ smap_tool.cpp -o smap_tool -l smap -L ../output/smap/lib; \
+	fi
+
 	# 3. rmrs main framework
 	cd $(CURDIR) && bash -x build.sh -c
 
@@ -80,6 +85,7 @@ override_dh_auto_install:
 	install -d -m 0755 $(CURDIR)/debian/ubturbo-smap/lib/modules/ucache
 	install -d -m 0755 $(CURDIR)/debian/ubturbo-smap/usr/lib/aarch64-linux-gnu
 	install -d -m 0755 $(CURDIR)/debian/ubturbo-smap/etc/udev/rules.d
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-smap/usr/bin
 	install -m 0500 $(CURDIR)/plugins/smap/src/drivers/smap_tracking_core.ko \
 		$(CURDIR)/debian/ubturbo-smap/lib/modules/smap/
 	install -m 0500 $(CURDIR)/plugins/smap/src/drivers/smap_access_tracking.ko \
@@ -94,6 +100,8 @@ override_dh_auto_install:
 		$(CURDIR)/debian/ubturbo-smap/usr/lib/aarch64-linux-gnu/libsmap.so
 	install -m 0640 $(CURDIR)/plugins/smap/99-smap.rules \
 		$(CURDIR)/debian/ubturbo-smap/etc/udev/rules.d/99-smap.rules
+	install -m 0640 $(CURDIR)/plugins/smap/tool/smap_tool \
+    		$(CURDIR)/debian/ubturbo-smap/usr/bin/smap_tool
 
 	# ---- ubturbo-rmrs ----
 	install -d -m 0755 $(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/bin

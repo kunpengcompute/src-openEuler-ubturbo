@@ -1,0 +1,130 @@
+From b70128f7a56a3b0150d7693acfd2a9bf399762b5 Mon Sep 17 00:00:00 2001
+From: Jiming Pang <discrete_brain@163.com>
+Date: Sat, 11 Jul 2026 14:34:01 +0800
+Subject: [PATCH 30/43] smap: guard scan timing instrumentation with
+ DEBUG_SCAN_DETAIL
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Wrap per-PTE walk/update time measurement in process_memslot_pages()
+and TLB flush time measurement in scan_kvm_memslots() and
+scan_kvm_memslots_4k() behind #ifdef DEBUG_SCAN_DETAIL. The Makefile
+gates the macro with a top-level "ifdef DEBUG_SCAN_DETAIL" so the
+timing code is compiled out by default, avoiding ktime_get() overhead
+in production builds.
+
+The struct fields (total_walk_time_ns, total_update_time_ns,
+total_tlb_time_ns) and their procfs reporting are left unconditional
+— they simply remain zero when the macro is off.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ plugins/smap/src/drivers/accessed_bit.c | 28 +++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index 7d96d5a..4d25932 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -995,8 +995,10 @@ static int process_memslot_pages(struct kvm *kvm,
+ 	for (gpa = memslot->base_gfn << PAGE_SHIFT;
+ 	     gpa < (memslot->base_gfn + memslot->npages) << PAGE_SHIFT;
+ 	     gpa += (gpa_t)page_size) {
++#ifdef DEBUG_SCAN_DETAIL
+ 		ktime_t start_time, end_time;
+ 		s64 walk_time, update_time;
++#endif
+ 
+ 		hva = gfn_to_hva_memslot(memslot, gpa_to_gfn(gpa));
+ 
+@@ -1027,12 +1029,16 @@ static int process_memslot_pages(struct kvm *kvm,
+ 				continue;
+ 		}
+ 
++#ifdef DEBUG_SCAN_DETAIL
+ 		start_time = ktime_get();
++#endif
+ 		is_young =
+ 			smap_kvm_pgtable_stage2_mkold(kvm->arch.mmu.pgt, gpa, &paddr);
++#ifdef DEBUG_SCAN_DETAIL
+ 		end_time = ktime_get();
+ 		walk_time = ktime_to_ns(ktime_sub(end_time, start_time));
+ 		ap->total_walk_time_ns += walk_time;
++#endif
+ 
+ 		if (use_bloom) {
+ 			pmd_total++;
+@@ -1079,11 +1085,15 @@ static int process_memslot_pages(struct kvm *kvm,
+ 		}
+ 		if (page_size == HPAGE_SIZE && !get_vma_if_huge_page(kvm, hva))
+ 			continue;
++#ifdef DEBUG_SCAN_DETAIL
+ 		start_time = ktime_get();
++#endif
+ 		ret = hva_to_hpa(kvm, hva, ap, is_young);
++#ifdef DEBUG_SCAN_DETAIL
+ 		end_time = ktime_get();
+ 		update_time = ktime_to_ns(ktime_sub(end_time, start_time));
+ 		ap->total_update_time_ns += update_time;
++#endif
+ 		if (ret)
+ 			continue;
+ 	}
+@@ -1105,8 +1115,10 @@ static int scan_kvm_memslots(struct kvm *kvm, struct access_pid *ap,
+ 	int bkt;
+ 	u64 nr_pages, cur_index;
+ 	u64 *vaddr;
++#ifdef DEBUG_SCAN_DETAIL
+ 	ktime_t start_time, end_time;
+ 	s64 tlb_time;
++#endif
+ 
+ 	if (!kvm || !kvm->arch.mmu.pgt) {
+ 		pr_err("invalid kvm passed to scan kvm memslots\n");
+@@ -1146,11 +1158,15 @@ static int scan_kvm_memslots(struct kvm *kvm, struct access_pid *ap,
+ 				continue;
+ 			process_memslot_pages(kvm, memslot, ap, page_size);
+ 		}
++#ifdef DEBUG_SCAN_DETAIL
+ 		start_time = ktime_get();
++#endif
+ 		kvm_flush_remote_tlbs(kvm);
++#ifdef DEBUG_SCAN_DETAIL
+ 		end_time = ktime_get();
+ 		tlb_time = ktime_to_ns(ktime_sub(end_time, start_time));
+ 		ap->total_tlb_time_ns += tlb_time;
++#endif
+ 	}
+ 	return 0;
+ }
+@@ -1161,6 +1177,10 @@ static int scan_kvm_memslots_4k(struct kvm *kvm, struct access_pid *ap,
+ 	struct kvm_memslots *slots;
+ 	struct kvm_memory_slot *memslot;
+ 	int bkt;
++#ifdef DEBUG_SCAN_DETAIL
++	ktime_t start_time, end_time;
++	s64 tlb_time;
++#endif
+ 
+ 	if (!kvm || !kvm->arch.mmu.pgt) {
+ 		pr_err("invalid kvm passed to scan kvm memslots\n");
+@@ -1180,7 +1200,15 @@ static int scan_kvm_memslots_4k(struct kvm *kvm, struct access_pid *ap,
+ 			continue;
+ 		process_memslot_pages(kvm, memslot, ap, page_size);
+ 	}
++#ifdef DEBUG_SCAN_DETAIL
++	start_time = ktime_get();
++#endif
+ 	kvm_flush_remote_tlbs(kvm);
++#ifdef DEBUG_SCAN_DETAIL
++	end_time = ktime_get();
++	tlb_time = ktime_to_ns(ktime_sub(end_time, start_time));
++	ap->total_tlb_time_ns += tlb_time;
++#endif
+ 	return 0;
+ }
+ 
+-- 
+2.54.0.windows.1
+

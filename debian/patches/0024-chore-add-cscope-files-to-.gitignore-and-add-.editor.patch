@@ -1,0 +1,25 @@
+From 08680ae131e7aee4e73d011bad419c6e77910535 Mon Sep 17 00:00:00 2001
+From: Jiming Pang <discrete_brain@163.com>
+Date: Tue, 30 Jun 2026 21:39:25 +0800
+Subject: [PATCH 24/43] chore: add cscope files to .gitignore and add
+ .editorconfig
+
+---
+ plugins/smap/.gitignore | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/plugins/smap/.gitignore b/plugins/smap/.gitignore
+index 97eb4e7..73ff41c 100644
+--- a/plugins/smap/.gitignore
++++ b/plugins/smap/.gitignore
+@@ -3,3 +3,7 @@ build
+ .idea
+ .vscode
+ cmake-build-debug
++
++# cscope files
++cscope.*
++ncscope.*
+-- 
+2.54.0.windows.1
+

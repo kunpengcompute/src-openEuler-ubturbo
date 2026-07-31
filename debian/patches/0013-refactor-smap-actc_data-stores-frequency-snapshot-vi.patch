@@ -1,0 +1,176 @@
+From 45d11af7312db966156ad5c5b43608e72674b347 Mon Sep 17 00:00:00 2001
+From: yuyuanxun <2972982755@qq.com>
+Date: Thu, 2 Jul 2026 20:35:36 +0800
+Subject: [PATCH 13/43] refactor(smap): actc_data stores frequency snapshot via
+ smap_acc_cnt_get
+
+actc_data_lookup_entry and actc_data_update now write the per-page
+accumulated frequency (smap_acc_cnt_get) into access_bit_actc_data
+instead of the per-scan self-increment. actc_data_update gains a
+paddr parameter to resolve the page.
+
+Drop the redundant is_young && entry { (*entry)++; smap_acc_cnt_inc }
+blocks in hva_to_hpa_hugetlb / hva_to_hpa_4k (the frequency is now
+recorded inside actc_data_lookup_entry) and the first_scan reset
+block in the 4K path.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ plugins/smap/src/drivers/accessed_bit.c       | 56 +++++++------------
+ plugins/smap/src/tiering/smap_migrate_pages.c |  4 +-
+ plugins/smap/src/user/manage/manage.c         |  1 +
+ 3 files changed, 24 insertions(+), 37 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index 0e0bcc5..415bfba 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -396,17 +396,29 @@ static actc_t *actc_data_lookup_entry(phys_addr_t paddr, u32 page_size)
+ 	if (unlikely(!adev || pa_index >= adev->page_count || adev->is_hist))
+ 		return NULL;
+ 
++	if (!adev->is_hist) {
++		struct page *page = pfn_to_online_page(PHYS_PFN(paddr));
++		if (!page)
++			return NULL;
++		smap_acc_cnt_inc(page);
++		adev->access_bit_actc_data[pa_index] = smap_acc_cnt_get(page);
++	}
++
+ 	return &adev->access_bit_actc_data[pa_index];
+ }
+ 
+-static void actc_data_update(int nid, u64 pa_index)
++static void actc_data_update(int nid, phys_addr_t paddr, u64 pa_index)
+ {
+ 	struct access_tracking_dev *adev = get_access_tracking_dev(nid);
+ 
+ 	if (unlikely(!adev || pa_index >= adev->page_count))
+ 		return;
+-	if (!adev->is_hist)
+-		adev->access_bit_actc_data[pa_index]++;
++	if (!adev->is_hist) {
++		struct page *page = pfn_to_online_page(PHYS_PFN(paddr));
++		if (!page)
++			return;
++		adev->access_bit_actc_data[pa_index] = smap_acc_cnt_get(page);
++	}
+ }
+ 
+ static int hva_to_hpa_hugetlb(struct kvm *kvm, u64 host_va,
+@@ -457,14 +469,6 @@ static int hva_to_hpa_hugetlb(struct kvm *kvm, u64 host_va,
+ 	if (is_young || access_pid_cur_last_scanning(ap))
+ 		entry = actc_data_lookup_entry(paddr, g_pagesize_huge);
+ 
+-	if (is_young && entry) {
+-		(*entry)++;
+-		/* Side statistic: per-page access frequency in page->flags. */
+-		page = pfn_to_online_page(PHYS_PFN(paddr));
+-		if (page)
+-			smap_acc_cnt_inc(page);
+-	}
+-
+ 	if (access_pid_cur_last_scanning(ap)) {
+ 		add_to_bm_huge(host_va, paddr, ap);
+ 		/*
+@@ -476,7 +480,7 @@ static int hva_to_hpa_hugetlb(struct kvm *kvm, u64 host_va,
+ 		page = pfn_to_online_page(PHYS_PFN(paddr));
+ 		if (!page || !try_get_page(page))
+ 			return 0;
+-		if (*entry > 0)
++		if (is_young)
+ 			smap_page_cold_periods_reset(page);
+ 		else {
+ 			int cold_nid = pfn_to_nid(PHYS_PFN(paddr));
+@@ -578,7 +582,6 @@ static int hva_to_hpa_4k(struct kvm *kvm, u64 host_va, struct access_pid *ap,
+ 	pte_t *ptep;
+ 	pte_t pte;
+ 	phys_addr_t paddr;
+-	actc_t *entry = NULL;
+ 	struct page *page;
+ 
+ 	if (!kvm)
+@@ -603,25 +606,8 @@ static int hva_to_hpa_4k(struct kvm *kvm, u64 host_va, struct access_pid *ap,
+ 	}
+ 	pte_unmap(ptep);
+ 
+-	if (ap->first_scan) {
+-		page = pfn_to_online_page(PHYS_PFN(paddr));
+-		if (page && try_get_page(page)) {
+-			smap_page_cold_periods_reset(page);
+-			smap_acc_cnt_reset(page);
+-			put_page(page);
+-		}
+-	}
+-
+-	if (is_young || access_pid_cur_last_scanning(ap))
+-		entry = actc_data_lookup_entry(paddr, PAGE_SIZE);
+-
+-	if (is_young && entry) {
+-		(*entry)++;
+-		/* Side statistic: per-page access frequency in page->flags. */
+-		page = pfn_to_online_page(PHYS_PFN(paddr));
+-		if (page)
+-			smap_acc_cnt_inc(page);
+-	}
++	if (is_young)
++		actc_data_lookup_entry(paddr, PAGE_SIZE);
+ 
+ 	if (access_pid_cur_last_scanning(ap))
+ 		add_to_bm_page(paddr, ap);
+@@ -629,12 +615,10 @@ static int hva_to_hpa_4k(struct kvm *kvm, u64 host_va, struct access_pid *ap,
+ 		 * End of period: update cold-period counter from
+ 		 * accumulated actc_data.
+ 		 */
+-		if (!entry)
+-			return 0;
+ 		page = pfn_to_online_page(PHYS_PFN(paddr));
+ 		if (!page || !try_get_page(page))
+ 			return 0;
+-		if (*entry > 0)
++		if (is_young)
+ 			smap_page_cold_periods_reset(page);
+ 		else {
+ 			int cold_nid = pfn_to_nid(PHYS_PFN(paddr));
+@@ -1626,7 +1610,7 @@ static void process_scan_results(struct pte_walk *pte_walk)
+ 		if (ret)
+ 			continue;
+ 		if (entry->hot)
+-			actc_data_update(entry->nid, pa_idx);
++			actc_data_update(entry->nid, entry->paddr, pa_idx);
+ 		if (!is_last_scan)
+ 			continue;
+ 
+diff --git a/plugins/smap/src/tiering/smap_migrate_pages.c b/plugins/smap/src/tiering/smap_migrate_pages.c
+index 8204623..bd5296e 100644
+--- a/plugins/smap/src/tiering/smap_migrate_pages.c
++++ b/plugins/smap/src/tiering/smap_migrate_pages.c
+@@ -916,10 +916,12 @@ again:
+ 
+ 		mig_list[i].failed_pre_migrated_nr +=
+ 			nr_this_migrate - tmp_pre_migrate_nr;
+-		if (nr_folios == 0) {
++		if (nr_folios == 0 && nr_remain_folios == 0) {
+ 			pr_debug("no page to migrate\n");
+ 			vfree(migrate_folios);
+ 			continue;
++		} else if (nr_folios == 0) {
++			goto again;
+ 		}
+ 		mig_list[i].failed_mig_nr +=
+ 			smu_migrate(migrate_folios, nr_folios, mig_list[i].to,
+diff --git a/plugins/smap/src/user/manage/manage.c b/plugins/smap/src/user/manage/manage.c
+index a5b4307..870e6df 100644
+--- a/plugins/smap/src/user/manage/manage.c
++++ b/plugins/smap/src/user/manage/manage.c
+@@ -1288,6 +1288,7 @@ static void CalcActcStats(ProcessAttr *attr)
+             }
+             if (actc[i].isWhiteListPage) {
+                 count->whiteNum++;
++                continue;
+             }
+             count->freqMax = MAX(count->freqMax, freq);
+             count->freqMin = MIN(count->freqMin, freq);
+-- 
+2.54.0.windows.1
+

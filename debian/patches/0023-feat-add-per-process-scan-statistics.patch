@@ -1,0 +1,118 @@
+From bae02d25d9c03e3b442a322366f747ee8b4a8edc Mon Sep 17 00:00:00 2001
+From: Jiming Pang <discrete_brain@163.com>
+Date: Wed, 1 Jul 2026 16:53:55 +0800
+Subject: [PATCH 23/43] feat: add per-process scan statistics
+
+Accumulate scan time and scanned pages across all scan rounds in
+work_func(), and expose the aggregate via /proc/smap/<pid>/scan_stat.
+
+Userspace reads the stats after DisableTracking() in ScanMigrateWork()
+to analyze scan overhead vs memory size relationship per process.
+
+New fields in struct access_pid:
+- total_scan_time_us: cumulative scan time (microseconds)
+- total_scanned_pages: cumulative pages scanned
+- scan_done_count: number of completed scan rounds
+---
+ plugins/smap/src/drivers/access_pid.h      |  3 +++
+ plugins/smap/src/drivers/access_tracking.c |  9 ++++-----
+ plugins/smap/src/drivers/accessed_bit.c    | 17 +++++++++++++++++
+ 3 files changed, 24 insertions(+), 5 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/access_pid.h b/plugins/smap/src/drivers/access_pid.h
+index d14b39e..54f428a 100644
+--- a/plugins/smap/src/drivers/access_pid.h
++++ b/plugins/smap/src/drivers/access_pid.h
+@@ -79,6 +79,9 @@ struct access_pid {
+ 	struct proc_dir_entry *proc_freq;
+ 	/* scan statistics: accumulated across all scan rounds */
+ 	s64 total_scan_time_us;
++	s64 total_walk_time_ns;
++	s64 total_update_time_ns;
++	s64 total_tlb_time_ns;
+ 	size_t total_scanned_pages;
+ 	u32 scan_done_count;
+ 	bool first_scan;
+diff --git a/plugins/smap/src/drivers/access_tracking.c b/plugins/smap/src/drivers/access_tracking.c
+index 2b35ac4..81d2d9e 100644
+--- a/plugins/smap/src/drivers/access_tracking.c
++++ b/plugins/smap/src/drivers/access_tracking.c
+@@ -134,6 +134,9 @@ static void submit_scan_works(struct access_tracking_dev *adev)
+ 	list_for_each_entry(ap, &ap_data.list, node) {
+ 		ap->cur_times = 0;
+ 		ap->total_scan_time_us = 0;
++		ap->total_walk_time_ns = 0;
++		ap->total_update_time_ns = 0;
++		ap->total_tlb_time_ns = 0;
+ 		ap->total_scanned_pages = 0;
+ 		ap->scan_done_count = 0;
+ 		submit_one_work(ap);
+@@ -522,11 +525,7 @@ static void work_func(struct work_struct *work)
+ 	/* accumulate scan statistics */
+ 	ap->total_scan_time_us += scan_time;
+ 	ap->scan_done_count++;
+-	if (page_size == g_pagesize_huge) {
+-		ap->total_scanned_pages += ap->info.vm_size;
+-	} else {
+-		ap->total_scanned_pages += calc_process_page_number(ap);
+-	}
++	ap->total_scanned_pages += calc_process_page_number(ap);
+ 
+ 	scan_delay_ms = ap->scan_time;
+ 	if (ap->type == STATISTIC_SCAN) {
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index ff7d37d..73e7c42 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -980,8 +980,15 @@ static int process_memslot_pages(struct kvm *kvm,
+ 	for (gpa = memslot->base_gfn << PAGE_SHIFT;
+ 	     gpa < (memslot->base_gfn + memslot->npages) << PAGE_SHIFT;
+ 	     gpa += (gpa_t)page_size) {
++		ktime_t start_time, end_time;
++		s64 walk_time, update_time;
++
++		start_time = ktime_get();
+ 		is_young =
+ 			smap_kvm_pgtable_stage2_mkold(kvm->arch.mmu.pgt, gpa, &paddr);
++		end_time = ktime_get();
++		walk_time = ktime_to_ns(ktime_sub(end_time, start_time));
++		ap->total_walk_time_ns += walk_time;
+ 		if (!is_young && !access_pid_cur_last_scanning(ap))
+ 			continue;
+ 		if (paddr) {
+@@ -1022,7 +1029,11 @@ static int process_memslot_pages(struct kvm *kvm,
+ 		hva = gfn_to_hva_memslot(memslot, gpa_to_gfn(gpa));
+ 		if (page_size == HPAGE_SIZE && !get_vma_if_huge_page(kvm, hva))
+ 			continue;
++		start_time = ktime_get();
+ 		ret = hva_to_hpa(kvm, hva, ap, is_young);
++		end_time = ktime_get();
++		update_time = ktime_to_ns(ktime_sub(end_time, start_time));
++		ap->total_update_time_ns += update_time;
+ 		if (ret)
+ 			continue;
+ 	}
+@@ -1037,6 +1048,8 @@ static int scan_kvm_memslots(struct kvm *kvm, struct access_pid *ap,
+ 	int bkt;
+ 	u64 nr_pages, cur_index;
+ 	u64 *vaddr;
++	ktime_t start_time, end_time;
++	s64 tlb_time;
+ 
+ 	if (!kvm || !kvm->arch.mmu.pgt) {
+ 		pr_err("invalid kvm passed to scan kvm memslots\n");
+@@ -1076,7 +1089,11 @@ static int scan_kvm_memslots(struct kvm *kvm, struct access_pid *ap,
+ 				continue;
+ 			process_memslot_pages(kvm, memslot, ap, page_size);
+ 		}
++		start_time = ktime_get();
+ 		kvm_flush_remote_tlbs(kvm);
++		end_time = ktime_get();
++		tlb_time = ktime_to_ns(ktime_sub(end_time, start_time));
++		ap->total_tlb_time_ns += tlb_time;
+ 	}
+ 	return 0;
+ }
+-- 
+2.54.0.windows.1
+

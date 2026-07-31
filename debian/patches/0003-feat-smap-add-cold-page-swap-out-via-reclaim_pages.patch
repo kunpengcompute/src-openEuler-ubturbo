@@ -1,0 +1,283 @@
+From 3358d91b459720476264220409956cd95d9031b2 Mon Sep 17 00:00:00 2001
+From: Pang Jiming <discrete_brain@163.com>
+Date: Tue, 16 Jun 2026 18:44:06 +0800
+Subject: [PATCH 03/43] feat(smap): add cold page swap-out via reclaim_pages
+
+Drain per-node cold page queues during migrate ioctl, isolate the
+folios from LRU, and reclaim them in batches via reclaim_pages().
+Extend smap_cold_queue_drain to handle base (non-hugetlb) folios in
+addition to hugetlb. For base pages, isolate from LRU via
+folio_isolate_lru, skip unevictable pages, and clear PG_referenced
+before reclaim.
+---
+ plugins/smap/src/tiering/mig_init.c           | 176 ++++++++++++++++++
+ .../smap/src/tiering/smap_migrate_wrapper.c   |  22 +++
+ .../smap/src/tiering/smap_migrate_wrapper.h   |   5 +
+ 3 files changed, 203 insertions(+)
+
+diff --git a/plugins/smap/src/tiering/mig_init.c b/plugins/smap/src/tiering/mig_init.c
+index b4f4c4b..e0e6ec9 100644
+--- a/plugins/smap/src/tiering/mig_init.c
++++ b/plugins/smap/src/tiering/mig_init.c
+@@ -15,12 +15,15 @@
+ #include <linux/sort.h>
+ #include <linux/fs.h>
+ #include <linux/mm.h>
++#include <linux/list.h>
+ 
+ #include "common.h"
+ #include "acpi_mem.h"
+ #include "iomem.h"
+ #include "ham_migration.h"
+ #include "smap_migrate_pages.h"
++#include "../drivers/smap_page_flags.h"
++#include "../drivers/smap_cold_queue.h"
+ #include "mig_init.h"
+ 
+ #undef pr_fmt
+@@ -219,6 +222,174 @@ static bool is_migrate_msg_valid(struct migrate_msg *msg)
+ 	return true;
+ }
+ 
++static struct folio *smap_get_folio(unsigned long pfn)
++{
++	struct page *page = pfn_to_online_page(pfn);
++	struct folio *folio;
++
++	if (!page || PageTail(page))
++		return NULL;
++
++	folio = page_folio(page);
++	if (folio_test_hugetlb(folio)) {
++		if (unlikely(page_folio(page) != folio))
++			folio = NULL;
++	} else {
++		if (!folio_test_lru(folio) || !folio_try_get(folio))
++			return NULL;
++		if (unlikely(page_folio(page) != folio ||
++			     !folio_test_lru(folio))) {
++			folio_put(folio);
++			folio = NULL;
++		}
++	}
++	return folio;
++}
++
++#define DRAIN_BATCH_SIZE 256
++
++struct drain_stats {
++	u64 nr_total;
++	u64 nr_dequeued;
++	u64 nr_skip_lru;
++	u64 nr_skip_isolated;
++	u64 nr_unevictable;
++	u64 nr_isolated;
++	u64 nr_reclaimed;
++};
++
++static void drain_stats_log(int nid, const struct drain_stats *s)
++{
++	/* Skip nodes with no cold pages queued -- draining the full array every
++	 * migration cycle would otherwise spam 22 lines, most of them empty. */
++	if (s->nr_total == 0)
++		return;
++	pr_info("[cold_drain] nid=%d total=%llu dequeued=%llu "
++		"skip_lru=%llu skip_isolated=%llu unevictable=%llu "
++		"isolated=%llu reclaimed=%llu\n",
++		nid, s->nr_total, s->nr_dequeued, s->nr_skip_lru,
++		s->nr_skip_isolated, s->nr_unevictable, s->nr_isolated,
++		s->nr_reclaimed);
++}
++
++static u64 smap_cold_queue_drain_entry(int nid, struct smap_cold_queue *q,
++				       u64 *batch)
++{
++	struct drain_stats stats = { 0 };
++	unsigned long flags;
++	u64 i;
++
++	spin_lock_irqsave(&smap_cold_pid_lock, flags);
++	stats.nr_total = q->count;
++	spin_unlock_irqrestore(&smap_cold_pid_lock, flags);
++	while (1) {
++		LIST_HEAD(folio_list);
++		struct folio *folio;
++		u64 dequeued = 0;
++
++		cond_resched();
++
++		/* Dequeue PFNs from this node's queue */
++		spin_lock_irqsave(&smap_cold_pid_lock, flags);
++		while (q->count > 0 && dequeued < DRAIN_BATCH_SIZE) {
++			batch[dequeued++] = q->pfn[q->head];
++			q->head = (q->head + 1) & SMAP_COLD_QUEUE_PID_MAX_MASK;
++			q->count--;
++		}
++		spin_unlock_irqrestore(&smap_cold_pid_lock, flags);
++		if (dequeued == 0)
++			break;
++		stats.nr_dequeued += dequeued;
++
++		for (i = 0; i < dequeued; i++) {
++			folio = smap_get_folio(batch[i]);
++			if (!folio) {
++				stats.nr_skip_lru++;
++				continue;
++			}
++
++			if (folio_test_hugetlb(folio)) {
++				if (!fp_isolate_hugetlb(folio, &folio_list)) {
++					stats.nr_skip_isolated++;
++					continue;
++				}
++			} else {
++				folio_clear_referenced(folio);
++				if (!fp_folio_isolate_lru(folio)) {
++					stats.nr_skip_isolated++;
++					folio_put(folio);
++					continue;
++				}
++				if (folio_test_unevictable(folio)) {
++					stats.nr_unevictable++;
++					fp_folio_putback_lru(folio);
++					continue;
++				} else {
++					list_add(&folio->lru, &folio_list);
++					folio_put(folio);
++				}
++			}
++			stats.nr_isolated++;
++		}
++
++		if (!list_empty(&folio_list))
++			stats.nr_reclaimed +=
++				fp_reclaim_pages(&folio_list, true);
++	}
++
++	drain_stats_log(nid, &stats);
++
++	return stats.nr_reclaimed;
++}
++
++extern struct smap_cold_queue smap_cold_numa_queue[SMAP_MAX_NUMNODES];
++
++/*
++ * smap_cold_queue_drain - Drain per-node cold page queues and reclaim via swap
++ *
++ * Dequeues PFNs from every per-node cold queue (populated by the scan path
++ * when a remote page's cold-period counter >= SMAP_COLD_PERIOD_THRESHOLD),
++ * resolves folios, isolates them from LRU, and calls reclaim_pages() in
++ * batches.  Local-node queues are expected to be empty and skipped quickly.
++ *
++ * Returns 0 on success, -ENOSYS if kernel symbols are not resolved.
++ */
++static int smap_cold_queue_drain(void)
++{
++	u64 total_reclaimed = 0;
++	u64 *batch;
++	int nid;
++
++	if (!fp_reclaim_pages || !fp_isolate_hugetlb || !fp_folio_putback_lru ||
++	    !fp_folio_isolate_lru) {
++		pr_err("swap-out symbols not resolved (reclaim_pages=%p "
++		       "isolate_hugetlb=%p folio_putback_lru=%p "
++		       "folio_isolate_lru=%p)\n",
++		       fp_reclaim_pages, fp_isolate_hugetlb,
++		       fp_folio_putback_lru, fp_folio_isolate_lru);
++		return -ENOSYS;
++	}
++
++	/* One batch buffer reused across all nodes. */
++	batch = kmalloc(DRAIN_BATCH_SIZE * sizeof(u64), GFP_KERNEL);
++	if (!batch) {
++		pr_err("[cold_drain] alloc memory failed\n");
++		return -ENOMEM;
++	}
++
++	for (nid = 0; nid < SMAP_MAX_NUMNODES; nid++) {
++		total_reclaimed +=
++			smap_cold_queue_drain_entry(nid,
++						    &smap_cold_numa_queue[nid],
++						    batch);
++	}
++	kfree(batch);
++
++	if (total_reclaimed)
++		pr_info("[cold_drain] total_reclaimed=%llu\n", total_reclaimed);
++	return 0;
++}
++
+ static int __ioctl_migrate(void __user *argp)
+ {
+ 	struct migrate_msg msg;
+@@ -234,6 +405,11 @@ static int __ioctl_migrate(void __user *argp)
+ 	if (ret) {
+ 		return ret;
+ 	}
++
++	ret = smap_cold_queue_drain();
++	if (ret)
++		pr_warn("failed to drain cold queue: %d\n", ret);
++
+ 	ret = do_migrate(&msg, mig_list);
+ 	filter_4k_migrate_info();
+ 	if (copy_to_user(argp, &msg, sizeof(msg)))
+diff --git a/plugins/smap/src/tiering/smap_migrate_wrapper.c b/plugins/smap/src/tiering/smap_migrate_wrapper.c
+index 325b830..1618101 100644
+--- a/plugins/smap/src/tiering/smap_migrate_wrapper.c
++++ b/plugins/smap/src/tiering/smap_migrate_wrapper.c
+@@ -20,6 +20,11 @@ int (*fp_migrate_pages)(struct list_head *from, new_folio_t get_new_folio,
+ void (*fp_putback_movable_pages)(struct list_head *l) = NULL;
+ bool (*fp_isolate_folio_to_list)(struct folio *folio,
+ 				 struct list_head *list) = NULL;
++unsigned long (*fp_reclaim_pages)(struct list_head *folio_list,
++				  bool ignore_references) = NULL;
++bool (*fp_isolate_hugetlb)(struct folio *folio, struct list_head *list) = NULL;
++void (*fp_folio_putback_lru)(struct folio *folio) = NULL;
++bool (*fp_folio_isolate_lru)(struct folio *folio) = NULL;
+ 
+ static inline unsigned long *get_pageblock_bitmap(const struct page *p,
+ 						  unsigned long pfn)
+@@ -67,6 +72,23 @@ int smap_process_symbols(void)
+ 	      fp_isolate_folio_to_list))
+ 		return -EFAULT;
+ 
++	/* Reclaim-path symbols for swap-out */
++	fp_reclaim_pages = (unsigned long (*)(struct list_head *, bool))
++		fp_kallsyms_lookup_name("reclaim_pages");
++	fp_isolate_hugetlb = (bool (*)(struct folio *, struct list_head *))
++		fp_kallsyms_lookup_name("isolate_hugetlb");
++	fp_folio_putback_lru = (void (*)(
++		struct folio *))fp_kallsyms_lookup_name("folio_putback_lru");
++	fp_folio_isolate_lru = (bool (*)(
++		struct folio *))fp_kallsyms_lookup_name("folio_isolate_lru");
++	if (!fp_reclaim_pages || !fp_isolate_hugetlb || !fp_folio_putback_lru ||
++	    !fp_folio_isolate_lru)
++		pr_warn("smap: swap-out symbols missing (reclaim_pages=%p "
++			"isolate_hugetlb=%p folio_putback_lru=%p "
++			"folio_isolate_lru=%p)\n",
++			fp_reclaim_pages, fp_isolate_hugetlb,
++			fp_folio_putback_lru, fp_folio_isolate_lru);
++
+ 	return 0;
+ }
+ 
+diff --git a/plugins/smap/src/tiering/smap_migrate_wrapper.h b/plugins/smap/src/tiering/smap_migrate_wrapper.h
+index 814c0e3..b8c9fab 100644
+--- a/plugins/smap/src/tiering/smap_migrate_wrapper.h
++++ b/plugins/smap/src/tiering/smap_migrate_wrapper.h
+@@ -131,6 +131,11 @@ extern int (*fp_migrate_pages)(struct list_head *from,
+ extern void (*fp_putback_movable_pages)(struct list_head *l);
+ extern bool (*fp_isolate_folio_to_list)(struct folio *folio,
+ 					struct list_head *list);
++extern unsigned long (*fp_reclaim_pages)(struct list_head *folio_list,
++					 bool ignore_references);
++extern bool (*fp_isolate_hugetlb)(struct folio *folio, struct list_head *list);
++extern void (*fp_folio_putback_lru)(struct folio *folio);
++extern bool (*fp_folio_isolate_lru)(struct folio *folio);
+ 
+ int smap_process_symbols(void);
+ struct folio *smap_alloc_huge_page_node(struct folio *folio, int nid,
+-- 
+2.54.0.windows.1
+

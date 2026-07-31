@@ -1,0 +1,136 @@
+From d30d599a5681d97f3557c02aaf5c152f5109caf6 Mon Sep 17 00:00:00 2001
+From: lucas <1358497393@qq.com>
+Date: Tue, 7 Jul 2026 14:19:29 +0800
+Subject: [PATCH 16/43] feat(smap): use cached mean value for new page
+ initialization in actc_data_lookup_entry
+
+Problem: New pages (detected by smap_page_init) were initialized with
+actc_data = 0, causing them to be misclassified as cold pages and
+potentially triggering unnecessary memory migration.
+
+Solution: Cache the mean value of non-zero actc_data entries in
+access_tracking_dev.actc_mean_value. Update it after each scan cycle
+in work_func. New pages now use this cached mean as their initial
+value, giving them a reasonable 'hotness' level.
+
+Changes:
+- Add actc_mean_value field to access_tracking_dev struct
+- Implement calc_actc_mean_value() to compute mean of non-zero entries
+- Call calc_actc_mean_value() in work_func after scan completion
+- Use cached mean instead of 0 in actc_data_lookup_entry
+
+The initial value is 0 (from kzalloc), which is reasonable for the
+first scan cycle when all pages are cold.
+---
+ plugins/smap/src/drivers/access_tracking.c |  7 +++++
+ plugins/smap/src/drivers/accessed_bit.c    | 30 +++++++++++++++++++++-
+ plugins/smap/src/drivers/accessed_bit.h    |  2 ++
+ plugins/smap/src/drivers/hist_tracking.h   |  1 +
+ 4 files changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/plugins/smap/src/drivers/access_tracking.c b/plugins/smap/src/drivers/access_tracking.c
+index 838a119..6090cbd 100644
+--- a/plugins/smap/src/drivers/access_tracking.c
++++ b/plugins/smap/src/drivers/access_tracking.c
+@@ -483,6 +483,7 @@ static void work_func(struct work_struct *work)
+ 	int ret = 0;
+ 	int page_size;
+ 	struct access_tracking_dev *adev = get_first_access_dev();
++	struct access_tracking_dev *adev_iter;
+ 	struct access_pid *ap;
+ 	struct delayed_work *scan_work;
+ 	ktime_t start_time, end_time;
+@@ -507,6 +508,12 @@ static void work_func(struct work_struct *work)
+ 	}
+ 	ap->first_scan = false;
+ 	up_read(&ap_data.lock);
++
++	/* Update cached mean value for all access tracking devices */
++	list_for_each_entry(adev_iter, &access_dev, list) {
++		adev_iter->actc_mean_value = calc_actc_mean_value(adev_iter);
++	}
++
+ 	adev_buffer_up_read();
+ 	end_time = ktime_get();
+ 	scan_time = ktime_to_us(ktime_sub(end_time, start_time));
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index 64ada91..ccb240c 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -369,6 +369,33 @@ static inline int get_numa_id_by_paddr(phys_addr_t paddr)
+ 	return page_to_nid(page);
+ }
+ 
++/*
++ * calc_actc_mean_value - Calculate the mean of non-zero actc_data entries.
++ * @adev: access tracking device
++ *
++ * Traverses the access_bit_actc_data array and computes the average of
++ * all non-zero entries. Returns 0 if all entries are zero (e.g. during
++ * the first scan cycle).
++ */
++actc_t calc_actc_mean_value(struct access_tracking_dev *adev)
++{
++	u64 sum = 0;
++	u64 count = 0;
++	u64 i;
++
++	if (!adev->access_bit_actc_data || adev->page_count == 0)
++		return 0;
++
++	for (i = 0; i < adev->page_count; i++) {
++		if (adev->access_bit_actc_data[i] > 0) {
++			sum += adev->access_bit_actc_data[i];
++			count++;
++		}
++	}
++
++	return count > 0 ? (actc_t)(sum / count) : 0;
++}
++
+ /*
+  * Common lookup: resolve paddr → &actc_data[pa_index].
+  * Returns NULL for non-local, non-tracked, or histogram pages.
+@@ -402,7 +429,8 @@ static void actc_data_lookup_entry(phys_addr_t paddr, u32 page_size, struct acce
+ 		return;
+ 	if (smap_page_init(page)) {
+ 		smap_page_mark(page);
+-		adev->access_bit_actc_data[pa_index] = 0; // todo 均值或中位值，需增加额外逻辑
++		/* New pages are considered relatively hot: use cached mean value */
++		adev->access_bit_actc_data[pa_index] = adev->actc_mean_value;
+ 	} else {
+ 		adev->access_bit_actc_data[pa_index]++;
+ 		if (adev->access_bit_actc_data[pa_index] >= ACTC_MAX) {
+diff --git a/plugins/smap/src/drivers/accessed_bit.h b/plugins/smap/src/drivers/accessed_bit.h
+index 6c0fc56..6933fa6 100644
+--- a/plugins/smap/src/drivers/accessed_bit.h
++++ b/plugins/smap/src/drivers/accessed_bit.h
+@@ -13,6 +13,7 @@
+ #include "check.h"
+ #include "kvm_pgtable.h"
+ 
++struct access_tracking_dev;
+ #define SCAN_PERIOD_UNIT_MS 50
+ 
+ #define MMAPLOCK_BATCH_SIZE (64UL * 1024 * 1024)
+@@ -95,4 +96,5 @@ int scan_hva_info(pid_t pid_nr, u64 *l1_page_num, u64 *l2_page_num,
+ 		  u64 **l1_vaddr, u64 **l2_vaddr);
+ int scan_hva_info_4k(pid_t pid, u64 *l1_page_num, u64 *l2_page_num,
+ 		     u64 **l1_vaddr, u64 **l2_vaddr);
++actc_t calc_actc_mean_value(struct access_tracking_dev *adev);
+ #endif /* _SRC_ACCESSED_BIT_H */
+diff --git a/plugins/smap/src/drivers/hist_tracking.h b/plugins/smap/src/drivers/hist_tracking.h
+index cd1f2a2..351ad75 100644
+--- a/plugins/smap/src/drivers/hist_tracking.h
++++ b/plugins/smap/src/drivers/hist_tracking.h
+@@ -30,6 +30,7 @@ struct access_tracking_dev {
+ 	void *tracking_dev;
+ 	actc_t *access_bit_actc_data;
+ 	u64 page_count;
++	actc_t actc_mean_value;	/* cached mean of non-zero actc_data entries */
+ 	u8 page_size_mode;
+ 	bool enable_on;
+ 	bool is_hist;
+-- 
+2.54.0.windows.1
+

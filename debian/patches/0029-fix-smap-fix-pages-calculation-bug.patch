@@ -1,0 +1,35 @@
+From c02d449b2465a23a6e71a06b0c481d592bf102bd Mon Sep 17 00:00:00 2001
+From: discrete_brain <discrete_brain@163.com>
+Date: Thu, 9 Jul 2026 19:15:20 +0800
+Subject: [PATCH 29/43] fix(smap): fix pages calculation bug
+
+---
+ plugins/smap/src/drivers/access_tracking.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/plugins/smap/src/drivers/access_tracking.c b/plugins/smap/src/drivers/access_tracking.c
+index c6a264e..01d82c4 100644
+--- a/plugins/smap/src/drivers/access_tracking.c
++++ b/plugins/smap/src/drivers/access_tracking.c
+@@ -545,7 +545,6 @@ static void work_func(struct work_struct *work)
+ 	/* accumulate scan statistics */
+ 	ap->total_scan_time_us += scan_time;
+ 	ap->scan_done_count++;
+-	ap->total_scanned_pages += calc_process_page_number(ap);
+ 
+ 	scan_delay_ms = ap->scan_time;
+ 	if (ap->type == STATISTIC_SCAN) {
+@@ -563,6 +562,10 @@ static void work_func(struct work_struct *work)
+ 			filtered, ap->scan_seq,
+ 			ap->force_scan ? "true" : "false");
+ 	}
++	if (ap->type == NORMAL_SCAN && ap->cur_times >= ap->ntimes) {
++		ap->total_scanned_pages +=
++			calc_process_page_number(ap) * ap->ntimes;
++	}
+ 
+ 	if (ap->cur_times < ap->ntimes) {
+ 		queue_delayed_work(adev->scanq, &ap->scan_work,
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,400 @@
+From 8fe05e8652753aba206d710fb1e331df3c281bdc Mon Sep 17 00:00:00 2001
+From: yuyuanxun <2972982755@qq.com>
+Date: Tue, 21 Jul 2026 15:16:53 +0800
+Subject: [PATCH 37/43] feat(smap): change do_migrate to perform concurrent
+ migration grouped by mig_list items
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+把 do_migrate 从串行(每轮选 from 最大项)改为 nr_workers 个
+kthread 并发:msg->cnt 个 item 按原下标连续分成最多 4 组,每个
+worker 串行处理自己的组,组间并发。
+
+- 抽取 do_migrate_one_item:处理单项的 again 批量循环,项内
+  smu_migrate 用 is_mul_thread=false 单线程分支(避免并发 worker
+  撞全局 mig[] 数组)
+- migrate_item_worker:组内按 from 降序选择排序后再处理,恢复
+  promotion 先于 demotion 的组内顺序
+- do_migrate:分配独立指针数组(per-worker)便于组内排序且不
+  影响 caller 的 mig_list 索引;per-worker abnormal 分桶后合并到
+  全局 nr_abnormal,避免并发写竞态;kthread 失败主线程内联兜底
+
+全局无严格 from 降序(并发固有),仅组内降序。
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ plugins/smap/src/tiering/smap_migrate_pages.c | 282 ++++++++++++------
+ 1 file changed, 199 insertions(+), 83 deletions(-)
+
+diff --git a/plugins/smap/src/tiering/smap_migrate_pages.c b/plugins/smap/src/tiering/smap_migrate_pages.c
+index 3089850..bdea307 100644
+--- a/plugins/smap/src/tiering/smap_migrate_pages.c
++++ b/plugins/smap/src/tiering/smap_migrate_pages.c
+@@ -63,6 +63,22 @@ struct multi_migrate_struct {
+ };
+ static struct multi_migrate_struct mig[MAX_NR_MIGRATE_THREADS];
+ 
++/* Item-level (mig_list entry) parallelism in do_migrate: several mig_list
++ * entries are migrated concurrently by independent kthreads, each running
++ * the single-threaded migrate path so the global mig[] array is untouched. */
++#define MIG_ITEM_MAX_WORKERS 4
++
++struct mig_item_work {
++	struct mig_list **items; /* items assigned to this worker */
++	unsigned int nr_items;    /* count of items in the group */
++	struct migrate_msg *msg;
++	struct mig_pra *single; /* mul_mig with is_mul_thread=false */
++	unsigned int total_failed; /* sum of failed_mig_nr across the group */
++	size_t abnormal[NR_ABNORMAL]; /* per-worker, merged by caller */
++	struct completion comp;
++	struct task_struct *ts;
++};
++
+ static struct migrate_node {
+ 	int next_nid;
+ 	unsigned long nr[SMAP_MAX_NUMNODES];
+@@ -778,92 +794,69 @@ static inline bool is_filter_anon(struct page *page)
+ 	return !PageAnon(page) || page_mapcount(page) > 1;
+ }
+ 
+-int do_migrate(struct migrate_msg *msg, struct mig_list *mig_list)
++/* Migrate a single mig_list entry (its again-batch loop). Runs single-threaded
++ * (smu_migrate with is_mul_thread=false) so concurrent items never touch the
++ * global mig[] array. abnormal[] is per-worker to avoid a global race. */
++static unsigned int do_migrate_one_item(struct mig_list *item,
++					struct migrate_msg *msg,
++					struct mig_pra *single,
++					size_t *abnormal)
+ {
+-	int i;
+ 	int pre_migrate_err;
+ 	u64 j, p_addr;
+ 	unsigned int mig_num = 0;
+ 	unsigned int pre_migrate_num;
+ 	unsigned int pre_migrate_failed;
+-	unsigned int failed_num = 0;
+-	unsigned int non_anon_num = 0;
+-	unsigned int swap_cache_num = 0;
+ 	unsigned int tmp_pre_migrate_nr;
+ 	unsigned long pfn;
+ 	int pre_migrate_flag = -1;
+ 	struct page *p_page = NULL;
+-	int *arr;
+-	memset(nr_abnormal, 0, sizeof(nr_abnormal));
+-	if (msg->cnt == 0) {
++	u64 nr_remain_folios;
++
++	pr_info("pid %d from %d to %d nr %llu\n", item->pid, item->from,
++		item->to, item->nr);
++
++	if (is_node_invalid(item->from) || is_node_invalid(item->to))
++		return 0;
++	if (item->nr <= 0 || item->nr > MAX_MIG_LIST_NR)
+ 		return 0;
+-	}
+ 
+-	arr = kzalloc(msg->cnt * sizeof(*arr), GFP_KERNEL);
+-	if (!arr)
+-		return -ENOMEM;
++	nr_remain_folios = item->nr;
++	item->failed_pre_migrated_nr = 0;
++	item->failed_mig_nr = 0;
+ 
+-	while (1) {
+-		int index;
+-		int max_from = NUMA_NO_NODE;
++again:
++	pre_migrate_failed = 0;
++	pre_migrate_num = 0;
++	tmp_pre_migrate_nr = 0;
++	if (node_is_critical_err(item->from) || node_is_critical_err(item->to))
++		return item->failed_mig_nr;
++
++	{
+ 		struct folio **migrate_folios;
+ 		unsigned int nr_folios = 0;
+-		u64 nr_remain_folios, nr_this_migrate, folio_index;
++		u64 nr_this_migrate, folio_index;
+ 		int cnt;
+ 
+-		/* Do promotion before demotion */
+-		for (index = 0; index < msg->cnt; index++) {
+-			if (arr[index])
+-				continue;
+-			if (mig_list[index].from > max_from) {
+-				max_from = mig_list[index].from;
+-				i = index;
+-			}
+-		}
+-		if (max_from == NUMA_NO_NODE) {
+-			break;
+-		}
+-		pr_info("[%d] pid %d from %d to %d nr %llu\n", i,
+-			mig_list[i].pid, mig_list[i].from, mig_list[i].to,
+-			mig_list[i].nr);
+-		arr[i] = 1;
+-
+-		if (is_node_invalid(mig_list[i].from) ||
+-		    is_node_invalid(mig_list[i].to)) {
+-			continue;
+-		}
+-		if (mig_list[i].nr <= 0 || mig_list[i].nr > MAX_MIG_LIST_NR) {
+-			continue;
+-		}
+-		pre_migrate_failed = 0;
+-		pre_migrate_num = 0;
+-
+-		nr_remain_folios = mig_list[i].nr;
+-		mig_list[i].failed_pre_migrated_nr = 0;
+-		mig_list[i].failed_mig_nr = 0;
+-
+-again:
+-		tmp_pre_migrate_nr = 0;
+ 		nr_this_migrate = MIN(nr_remain_folios, NR_BATCHED_MIGRATION);
+-		folio_index = mig_list[i].nr - nr_remain_folios;
++		folio_index = item->nr - nr_remain_folios;
+ 
+ 		migrate_folios =
+ 			vzalloc(nr_this_migrate * sizeof(struct folio *));
+ 		if (!migrate_folios) {
+-			kfree(arr);
+-			return -ENOMEM;
++			pr_warn("vzalloc migrate_folios failed, skip batch\n");
++			return item->failed_mig_nr;
+ 		}
+ 
+ 		cnt = nr_folios = 0;
+ 		for (j = folio_index;
+-		     j < mig_list[i].nr && cnt < nr_this_migrate; j++, cnt++) {
++		     j < item->nr && cnt < nr_this_migrate; j++, cnt++) {
+ 			int err;
+ 
+ 			mig_num++;
+-			p_addr = mig_list[i].addr[j];
+-			if (p_addr == INVALID_PADDR) {
++			p_addr = item->addr[j];
++			if (p_addr == INVALID_PADDR)
+ 				continue;
+-			}
+ 			pfn = PHYS_PFN(p_addr);
+ 			if (!pfn_valid(pfn)) {
+ 				pr_debug("invalid PA\n");
+@@ -872,24 +865,21 @@ again:
+ 			p_page = pfn_to_online_page(pfn);
+ 			if (!p_page)
+ 				continue;
+-			if (mig_list[i].from < nr_local_numa &&
++			if (item->from < nr_local_numa &&
+ 			    is_filter_anon(p_page)) {
+-				non_anon_num++;
+ 				continue;
+ 			}
+ 			err = is_filter_4k(p_page, msg->mul_mig.page_size);
+ 			if (err >= 0) {
+-				nr_abnormal[err]++;
++				if (abnormal)
++					abnormal[err]++;
+ 				continue;
+ 			}
+-			if (PageSwapCache(p_page)) {
+-				if (!fp_folio_free_swap(page_folio(p_page))) {
+-					swap_cache_num++;
+-				}
+-			}
++			if (PageSwapCache(p_page))
++				(void)fp_folio_free_swap(page_folio(p_page));
+ 			pre_migrate_flag = smap_add_page_for_migration(
+ 				p_page, migrate_folios, &nr_folios,
+-				mig_list[i].pid, MPOL_MF_MOVE_ALL);
++				item->pid, MPOL_MF_MOVE_ALL);
+ 			if (pre_migrate_flag == 0) {
+ 				pre_migrate_num++;
+ 				tmp_pre_migrate_nr++;
+@@ -905,39 +895,165 @@ again:
+ 				pre_migrate_failed, pre_migrate_err);
+ 		}
+ 
+-		mig_list[i].failed_pre_migrated_nr +=
++		item->failed_pre_migrated_nr +=
+ 			nr_this_migrate - tmp_pre_migrate_nr;
+ 		if (nr_folios == 0 && nr_remain_folios == 0) {
+ 			pr_debug("no page to migrate\n");
+ 			vfree(migrate_folios);
+-			continue;
++			return item->failed_mig_nr;
+ 		} else if (nr_folios == 0) {
++			vfree(migrate_folios);
+ 			goto again;
+ 		}
+-		mig_list[i].failed_mig_nr +=
+-			smu_migrate(migrate_folios, nr_folios, mig_list[i].to,
+-				    &msg->mul_mig);
+-		failed_num += mig_list[i].failed_mig_nr;
+-		mig_list[i].success_to_user = true;
+-		if (mig_list[i].failed_mig_nr) {
++		item->failed_mig_nr +=
++			smu_migrate(migrate_folios, nr_folios, item->to,
++				   single);
++		item->success_to_user = true;
++		if (item->failed_mig_nr) {
+ 			pr_debug(
+-				"[%d]: migrate failed, pre_migrate_num: %d, failed_num: %llu\n",
+-				i, pre_migrate_num, mig_list[i].failed_mig_nr);
++				"pid %d: migrate failed, pre_migrate_num: %d, failed_num: %llu\n",
++				item->pid, pre_migrate_num, item->failed_mig_nr);
+ 		}
+ 		pr_debug(
+-			"[%d]: mig_num %d, pre_migrate_num %d, failed_num %llu\n",
+-			i, mig_num, pre_migrate_num, mig_list[i].failed_mig_nr);
++			"pid %d: mig_num %d, pre_migrate_num %d, failed_num %llu\n",
++			item->pid, mig_num, pre_migrate_num, item->failed_mig_nr);
+ 		vfree(migrate_folios);
++	}
+ 
+-		if (nr_remain_folios > 0)
+-			goto again;
++	if (nr_remain_folios > 0)
++		goto again;
++	return item->failed_mig_nr;
++}
++
++static int migrate_item_worker(void *data)
++{
++	struct mig_item_work *w = data;
++	unsigned int i, k;
++
++	/* Sort this worker's items by source node descending, so higher-from
++	 * (promotion) entries migrate before lower-from (demotion) ones within
++	 * the group -- mirroring the old serial "max_from" selection order. */
++	for (i = 0; i + 1 < w->nr_items; i++) {
++		unsigned int max = i;
++
++		for (k = i + 1; k < w->nr_items; k++) {
++			if (w->items[k]->from > w->items[max]->from)
++				max = k;
++		}
++		if (max != i) {
++			struct mig_list *tmp = w->items[i];
++
++			w->items[i] = w->items[max];
++			w->items[max] = tmp;
++		}
+ 	}
+-	kfree(arr);
+-	pr_debug("non anon page number: %u\n", non_anon_num);
+-	pr_debug("swap cache numa: %u\n", swap_cache_num);
+-	return failed_num;
++
++	/* single->is_mul_thread is false: item-internal migrate runs
++	 * single-threaded so concurrent items don't race the global mig[]. */
++	for (i = 0; i < w->nr_items; i++) {
++		unsigned int failed;
++
++		failed = do_migrate_one_item(w->items[i], w->msg, w->single,
++					     w->abnormal);
++		w->total_failed += failed;
++	}
++	complete(&w->comp);
++	return 0;
++}
++
++int do_migrate(struct migrate_msg *msg, struct mig_list *mig_list)
++{
++	int i, j;
++	unsigned int total_failed = 0;
++	unsigned int nr_workers;
++	unsigned int base, extra, cur;
++	struct mig_item_work *works;
++	struct mig_pra single;
++
++	memset(nr_abnormal, 0, sizeof(nr_abnormal));
++	if (msg->cnt == 0)
++		return 0;
++
++	/* Item-internal migrate is forced single-threaded: the per-worker kthreads
++	 * below already provide parallelism across mig_list entries, and touching
++	 * the global mig[] from concurrent items would corrupt it. */
++	single = msg->mul_mig;
++	single.is_mul_thread = false;
++	single.nr_thread = 1;
++
++	/* Split the msg->cnt items into nr_workers contiguous groups; each worker
++	 * serially migrates its own group. Extra items are spread one-per-worker so
++	 * the first (msg->cnt % nr_workers) workers get one extra item. */
++	nr_workers = min((unsigned int)msg->cnt,
++			 (unsigned int)MIG_ITEM_MAX_WORKERS);
++	works = kcalloc(nr_workers, sizeof(*works), GFP_KERNEL);
++	if (!works)
++		return -ENOMEM;
++
++	base = msg->cnt / nr_workers;
++	extra = msg->cnt % nr_workers;
++	cur = 0;
++	for (i = 0; i < nr_workers; i++) {
++		unsigned int group = base + (i < extra ? 1 : 0);
++		unsigned int k;
++
++		init_completion(&works[i].comp);
++		/* Independent pointer array so the worker can reorder it (by from,
++		 * descending) without disturbing the caller's mig_list indexing. */
++		works[i].items =
++			kmalloc_array(group, sizeof(*works[i].items), GFP_KERNEL);
++		if (!works[i].items) {
++			works[i].nr_items = 0;
++			pr_err("failed to allocate item array for worker %d\n", i);
++			cur += group;
++			continue;
++		}
++		for (k = 0; k < group; k++)
++			works[i].items[k] = &mig_list[cur + k];
++		works[i].nr_items = group;
++		works[i].msg = msg;
++		works[i].single = &single;
++		works[i].total_failed = 0;
++		memset(works[i].abnormal, 0, sizeof(works[i].abnormal));
++		works[i].ts = NULL;
++		cur += group;
++	}
++
++	/* Launch all workers concurrently. */
++	for (i = 0; i < nr_workers; i++) {
++		if (works[i].nr_items == 0)
++			continue;
++		works[i].ts = kthread_run(migrate_item_worker, &works[i],
++					  "smap_mig_item");
++		if (IS_ERR(works[i].ts)) {
++			works[i].ts = NULL;
++			pr_err("failed to start migrate worker %d\n", i);
++			/* Drain this group inline on the caller thread as a fallback. */
++			for (j = 0; j < (int)works[i].nr_items; j++) {
++				works[i].total_failed += do_migrate_one_item(
++					works[i].items[j], msg, &single,
++					works[i].abnormal);
++			}
++		}
++	}
++
++	/* Wait for every worker, merge per-worker stats into the globals. */
++	for (i = 0; i < nr_workers; i++) {
++		if (works[i].nr_items == 0 || !works[i].ts)
++			continue;
++		wait_for_completion(&works[i].comp);
++		total_failed += works[i].total_failed;
++		for (j = 0; j < NR_ABNORMAL; j++)
++			nr_abnormal[j] += works[i].abnormal[j];
++	}
++
++	for (i = 0; i < nr_workers; i++)
++		kfree(works[i].items);
++	kfree(works);
++	return total_failed;
+ }
+ 
++
+ static int smap_pre_migrate_range(struct folio **folios,
+ 				  unsigned int *nr_folios,
+ 				  unsigned long start_pfn,
+-- 
+2.54.0.windows.1
+

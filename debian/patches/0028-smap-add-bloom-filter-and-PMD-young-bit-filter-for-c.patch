@@ -1,0 +1,510 @@
+From bf58db7318dfceba1ba889b0d6672caad190780d Mon Sep 17 00:00:00 2001
+From: wsheng999 <2664101109@qq.com>
+Date: Sat, 4 Jul 2026 14:30:56 +0800
+Subject: [PATCH 28/43] smap: add bloom filter and PMD young bit filter for
+ cold PMD fast-skip
+
+- add bloom filter and PMD young bit filter for cold PMD fast-skip
+- add debug prints for PMD filtering ratio and suitable_to_scan
+- fix: count skipped_pmds per PMD in process_memslot_pages to match total_pmds granularity
+- change the granularity of forced scans to the scan period
+---
+ plugins/smap/src/drivers/access_pid.c      |  34 +++--
+ plugins/smap/src/drivers/access_pid.h      |  32 ++--
+ plugins/smap/src/drivers/access_tracking.c |  36 ++---
+ plugins/smap/src/drivers/accessed_bit.c    | 161 +++++++++++++++++----
+ plugins/smap/src/drivers/accessed_bit.h    |   9 +-
+ 5 files changed, 196 insertions(+), 76 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/access_pid.c b/plugins/smap/src/drivers/access_pid.c
+index c72e577..8edf97a 100644
+--- a/plugins/smap/src/drivers/access_pid.c
++++ b/plugins/smap/src/drivers/access_pid.c
+@@ -60,7 +60,10 @@ void destroy_access_pid(struct access_pid *elem)
+ 		vfree(elem->info.mapping);
+ 		elem->info.mapping = NULL;
+ 	}
+-	kfree(elem->bloom_filter);
++	for (int i = 0; i < SMAP_NR_BLOOM_FILTERS; i++) {
++		kfree(elem->bloom_filters[i]);
++		elem->bloom_filters[i] = NULL;
++	}
+ 	kfree(elem);
+ 	return;
+ }
+@@ -580,22 +583,29 @@ int init_access_pid(struct access_add_pid_payload *payload,
+ 
+ 	if (payload->type == NORMAL_SCAN) {
+ 		if (enable_bloom_filter) {
+-			ap->bloom_filter =
+-				kzalloc(SMAP_BLOOM_FILTER_SIZE, GFP_KERNEL);
+-			if (!ap->bloom_filter) {
+-				if (ap->info.mapping) {
+-					vfree(ap->info.mapping);
+-					ap->info.mapping = NULL;
++			for (int i = 0; i < SMAP_NR_BLOOM_FILTERS; i++) {
++				ap->bloom_filters[i] =
++					kzalloc(SMAP_BLOOM_FILTER_SIZE,
++						GFP_KERNEL);
++				if (!ap->bloom_filters[i]) {
++					for (int j = 0; j < i; j++) {
++						kfree(ap->bloom_filters[j]);
++						ap->bloom_filters[j] = NULL;
++					}
++					if (ap->info.mapping) {
++						vfree(ap->info.mapping);
++						ap->info.mapping = NULL;
++					}
++					kfree(ap);
++					return -ENOMEM;
+ 				}
+-				kfree(ap);
+-				return -ENOMEM;
+ 			}
+ 		}
+-		ap->force_scan = true; /* first scan is always a full scan */
+-		ap->scan_round = 0;
++		ap->force_scan = true;
++		ap->scan_seq = 0;
++		ap->force_scan_interval = force_scan_interval;
+ 		ap->total_pmds = 0;
+ 		ap->skipped_pmds = 0;
+-		ap->force_scan_interval = force_scan_interval;
+ 	}
+ 
+ 	ret = access_walk_pagemap_prepare(ap);
+diff --git a/plugins/smap/src/drivers/access_pid.h b/plugins/smap/src/drivers/access_pid.h
+index 1b0f345..499cbc2 100644
+--- a/plugins/smap/src/drivers/access_pid.h
++++ b/plugins/smap/src/drivers/access_pid.h
+@@ -8,6 +8,7 @@
+ #define _SRC_ACCESS_PID_H
+ 
+ #include <linux/bitops.h>
++#include <linux/bitmap.h>
+ 
+ #include "check.h"
+ #include "access_ioctl.h"
+@@ -20,11 +21,17 @@
+ #define NON_EXIST_PID (-1)
+ #define DUPLICATE_PID (-2) /* completely duplicate, skip processing */
+ 
+-/* Bloom filter: marks PMDs that had hot pages last round */
+-#define SMAP_BLOOM_FILTER_SHIFT 15 /* 32768 bits = 4 KiB */
++/* Bloom filter: double-buffered, k=2 hash, marks PMDs that had hot pages */
++#define SMAP_NR_BLOOM_FILTERS 2
++#define SMAP_BLOOM_FILTER_SHIFT 15
+ #define SMAP_BLOOM_FILTER_BITS (1UL << SMAP_BLOOM_FILTER_SHIFT)
+ #define SMAP_BLOOM_FILTER_SIZE (SMAP_BLOOM_FILTER_BITS / BITS_PER_BYTE)
+ 
++static inline int filter_gen_from_seq(unsigned long seq)
++{
++	return seq % SMAP_NR_BLOOM_FILTERS;
++}
++
+ extern int nr_local_numa;
+ 
+ enum ap_state {
+@@ -90,13 +97,13 @@ struct access_pid {
+ 	size_t total_scanned_pages;
+ 	u32 scan_done_count;
+ 
+-	/* Bloom filter: marks PMDs that had hot pages last round */
+-	unsigned long *bloom_filter;
+-	unsigned int scan_round; /* monotonic scan round counter */
+-	unsigned int force_scan_interval; /* full scan every N rounds */
+-	bool force_scan; /* true = skip bloom filter, scan all PMDs */
+-	u64 total_pmds; /* PMDs visited this round */
+-	u64 skipped_pmds; /* PMDs actually walked this round */
++	/* Bloom filter: double-buffer, k=2 hash */
++	unsigned long *bloom_filters[SMAP_NR_BLOOM_FILTERS];
++	unsigned long scan_seq;
++	unsigned int force_scan_interval;
++	bool force_scan;
++	u64 total_pmds;
++	u64 skipped_pmds;
+ 	bool first_scan;
+ 	bool decay_flag;
+ 	/* Per-PID actc mean value (VM scan path only) */
+@@ -105,6 +112,13 @@ struct access_pid {
+ 	u64 actc_count;
+ };
+ 
++static inline void reset_bloom_filter(struct access_pid *ap, unsigned long seq)
++{
++	unsigned long *filter = ap->bloom_filters[filter_gen_from_seq(seq)];
++	if (filter)
++		bitmap_zero(filter, SMAP_BLOOM_FILTER_BITS);
++}
++
+ typedef struct {
+ 	u64 pme;
+ } pagemap_entry_t;
+diff --git a/plugins/smap/src/drivers/access_tracking.c b/plugins/smap/src/drivers/access_tracking.c
+index cf9a0a2..c6a264e 100644
+--- a/plugins/smap/src/drivers/access_tracking.c
++++ b/plugins/smap/src/drivers/access_tracking.c
+@@ -491,14 +491,6 @@ static void handle_statistic_scan(struct access_pid *ap, ktime_t start_time,
+ 		ap->pid, delay_buffer_ms, *scan_delay_ms);
+ }
+ 
+-static void log_bloom_stats(struct access_pid *ap)
+-{
+-	pr_info("[bloom_filter] pid=%d total_pmd=%llu skipped_pmd=%llu skip_rate=%llu%% scan_round=%u force=%s\n",
+-		ap->pid, ap->total_pmds, ap->skipped_pmds,
+-		ap->total_pmds ? (ap->skipped_pmds * 100) / ap->total_pmds : 0,
+-		ap->scan_round, ap->force_scan ? "true" : "false");
+-}
+-
+ static void work_func(struct work_struct *work)
+ {
+ 	int ret = 0;
+@@ -514,17 +506,14 @@ static void work_func(struct work_struct *work)
+ 	scan_work = to_delay_work(work);
+ 	ap = delay_work_to_ap(scan_work);
+ 
+-	/* Bloom filter: round-level decisions at start, per-scan counters */
++	/* Bloom filter: double-buffering flip & round-level decisions */
+ 	if (ap->type == NORMAL_SCAN && enable_bloom_filter) {
+-		if (ap->cur_times == 0) {
+-			ap->force_scan =
+-				(ap->scan_round % force_scan_interval == 0);
+-			if (ap->force_scan)
+-				reset_bloom_filter(ap);
+-			ap->scan_round++;
+-			ap->total_pmds = 0;
+-			ap->skipped_pmds = 0;
+-		}
++		ap->force_scan =
++			(ap->scan_seq % ap->force_scan_interval == 0);
++		reset_bloom_filter(ap, ap->scan_seq + 1);
++		ap->scan_seq++;
++		ap->total_pmds = 0;
++		ap->skipped_pmds = 0;
+ 	}
+ 
+ 	if (access_pid_cur_last_scanning(ap))
+@@ -566,9 +555,14 @@ static void work_func(struct work_struct *work)
+ 	ap->last_scan_delay_ms = scan_delay_ms;
+ 
+ 	/* Print bloom filter stats at end of each scan round */
+-	if (ap->type == NORMAL_SCAN && enable_bloom_filter &&
+-	    ap->cur_times >= ap->ntimes)
+-		log_bloom_stats(ap);
++	if (ap->type == NORMAL_SCAN && enable_bloom_filter) {
++		u64 filtered = ap->total_pmds > 0 ?
++			ap->skipped_pmds * 100ULL / ap->total_pmds : 0;
++		pr_info("[bloom_filter] pid=%d total_pmd=%llu skipped_pmd=%llu filtered_ratio=%llu%% scan_seq=%lu force=%s\n",
++			ap->pid, ap->total_pmds, ap->skipped_pmds,
++			filtered, ap->scan_seq,
++			ap->force_scan ? "true" : "false");
++	}
+ 
+ 	if (ap->cur_times < ap->ntimes) {
+ 		queue_delayed_work(adev->scanq, &ap->scan_work,
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index bf81a57..7d96d5a 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -8,6 +8,7 @@
+ #include <asm/kvm_mmu.h>
+ #include <asm/kvm_pgtable.h>
+ #include <asm/stage2_pgtable.h>
++#include <asm/cache.h>
+ 
+ #include <linux/rmap.h>
+ #include <linux/vmalloc.h>
+@@ -49,9 +50,13 @@
+ #undef pr_fmt
+ #define pr_fmt(fmt) "access-bit: " fmt
+ 
+-/* Bloom filter forward declarations — defined after check_pte_young */
+-static bool test_bloom_filter(struct access_pid *ap, unsigned long pmd_addr);
+-static void update_bloom_filter(struct access_pid *ap, unsigned long pmd_addr);
++/* Bloom filter forward declarations */
++static void get_item_key(unsigned long pmd_addr, int key[2]);
++static bool test_bloom_filter(struct access_pid *ap, unsigned long seq,
++			      unsigned long pmd_addr);
++static void update_bloom_filter(struct access_pid *ap, unsigned long seq,
++				unsigned long pmd_addr);
++static bool suitable_to_scan(int total, int young);
+ 
+ LIST_HEAD(ham_pid_list);
+ LIST_HEAD(statistic_pid_list);
+@@ -982,8 +987,10 @@ static int process_memslot_pages(struct kvm *kvm,
+ 	u64 paddr;
+ 	struct page *page;
+ 	unsigned long last_pmd = 0;
++	int pmd_total = 0;
++	int pmd_young = 0;
+ 	bool use_bloom = (page_size == PAGE_SIZE && ap->type == NORMAL_SCAN &&
+-			  ap->bloom_filter);
++			  ap->bloom_filter[0]);
+ 
+ 	for (gpa = memslot->base_gfn << PAGE_SHIFT;
+ 	     gpa < (memslot->base_gfn + memslot->npages) << PAGE_SHIFT;
+@@ -993,17 +1000,25 @@ static int process_memslot_pages(struct kvm *kvm,
+ 
+ 		hva = gfn_to_hva_memslot(memslot, gpa_to_gfn(gpa));
+ 
+-		/* PMD-level counting for 4K NORMAL_SCAN */
+ 		if (use_bloom) {
+ 			unsigned long pmd = hva & PMD_MASK;
+-			bool skip = !ap->force_scan &&
+-				    !access_pid_cur_last_scanning(ap) &&
+-				    !test_bloom_filter(ap, pmd);
++			bool skip;
++
++			if (pmd != last_pmd && last_pmd != 0) {
++				if (pmd_total > 0 &&
++				    suitable_to_scan(pmd_total, pmd_young))
++					update_bloom_filter(ap, ap->scan_seq,
++							    last_pmd);
++				pmd_total = 0;
++				pmd_young = 0;
++			}
+ 
+ 			if (pmd != last_pmd) {
+ 				ap->total_pmds++;
+ 				last_pmd = pmd;
+-				/* count skipped once per PMD */
++				skip = !ap->force_scan &&
++				       !access_pid_cur_last_scanning(ap) &&
++				       !test_bloom_filter(ap, ap->scan_seq - 1, pmd);
+ 				if (skip)
+ 					ap->skipped_pmds++;
+ 			}
+@@ -1018,6 +1033,13 @@ static int process_memslot_pages(struct kvm *kvm,
+ 		end_time = ktime_get();
+ 		walk_time = ktime_to_ns(ktime_sub(end_time, start_time));
+ 		ap->total_walk_time_ns += walk_time;
++
++		if (use_bloom) {
++			pmd_total++;
++			if (is_young)
++				pmd_young++;
++		}
++
+ 		if (!is_young && !access_pid_cur_last_scanning(ap))
+ 			continue;
+ 		if (paddr) {
+@@ -1065,6 +1087,13 @@ static int process_memslot_pages(struct kvm *kvm,
+ 		if (ret)
+ 			continue;
+ 	}
++
++	if (use_bloom && last_pmd != 0) {
++		if (pmd_total > 0 &&
++		    suitable_to_scan(pmd_total, pmd_young))
++			update_bloom_filter(ap, ap->scan_seq, last_pmd);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1688,34 +1717,61 @@ static inline void smap_flush_tlb_mm(struct mm_struct *mm)
+ }
+ 
+ /*
+- * Bloom filter helpers — marks PMDs that had hot pages so the next scan
+- * round can skip cold PMDs. Uses hash_64() with PMD-shifted address for
+- * uniform distribution across the 4096-bit filter.
++ * Bloom filter helpers — double-buffered, k=2 hash.
++ * Borrow MGLRU's pattern: query current-generation filter, write to next.
+  */
+-static unsigned long bloom_filter_hash(unsigned long pmd_addr)
++static void get_item_key(unsigned long pmd_addr, int key[2])
+ {
+-	return hash_64(pmd_addr >> PMD_SHIFT, SMAP_BLOOM_FILTER_SHIFT);
++	u32 hash = hash_64(pmd_addr >> PMD_SHIFT, SMAP_BLOOM_FILTER_SHIFT * 2);
++
++	BUILD_BUG_ON(SMAP_BLOOM_FILTER_SHIFT * 2 > BITS_PER_TYPE(u32));
++
++	key[0] = hash & (BIT(SMAP_BLOOM_FILTER_SHIFT) - 1);
++	key[1] = hash >> SMAP_BLOOM_FILTER_SHIFT;
+ }
+ 
+-static bool test_bloom_filter(struct access_pid *ap, unsigned long pmd_addr)
++static bool test_bloom_filter(struct access_pid *ap, unsigned long seq,
++			      unsigned long pmd_addr)
+ {
+-	if (!ap || !ap->bloom_filter)
++	int key[2];
++	unsigned long *filter;
++	int gen = filter_gen_from_seq(seq);
++
++	filter = ap->bloom_filters[gen];
++	if (!filter)
+ 		return false;
+-	return test_bit(bloom_filter_hash(pmd_addr), ap->bloom_filter);
++
++	get_item_key(pmd_addr, key);
++	return test_bit(key[0], filter) && test_bit(key[1], filter);
+ }
+ 
+-static void update_bloom_filter(struct access_pid *ap, unsigned long pmd_addr)
++static void update_bloom_filter(struct access_pid *ap, unsigned long seq,
++				unsigned long pmd_addr)
+ {
+-	if (!ap || !ap->bloom_filter)
++	int key[2];
++	unsigned long *filter;
++	int gen = filter_gen_from_seq(seq);
++
++	filter = ap->bloom_filters[gen];
++	if (!filter)
+ 		return;
+-	set_bit(bloom_filter_hash(pmd_addr), ap->bloom_filter);
++
++	get_item_key(pmd_addr, key);
++	if (!test_bit(key[0], filter))
++		set_bit(key[0], filter);
++	if (!test_bit(key[1], filter))
++		set_bit(key[1], filter);
+ }
+ 
+-void reset_bloom_filter(struct access_pid *ap)
++/*
++ * suitable_to_scan — MGLRU's threshold: a PMD is hot if the average number
++ * of young PTEs per cacheline is >= 1. n scales with cache_line_size().
++ */
++static bool suitable_to_scan(int total, int young)
+ {
+-	if (!ap || !ap->bloom_filter)
+-		return;
+-	bitmap_zero(ap->bloom_filter, SMAP_BLOOM_FILTER_BITS);
++	int n = clamp_t(int, cache_line_size() / sizeof(pte_t), 2, 8);
++	pr_debug("suitable_to_scan: total=%d young=%d\n", total, young);
++	return young * n >= total;
+ }
+ 
+ static int smap_pmd_entry(pmd_t *pmd, unsigned long addr, unsigned long next,
+@@ -1723,17 +1779,40 @@ static int smap_pmd_entry(pmd_t *pmd, unsigned long addr, unsigned long next,
+ {
+ 	struct pte_walk *pte_walk = walk->private;
+ 	struct access_pid *ap = pte_walk->ap;
++	unsigned long current_pmd_addr = addr & PMD_MASK;
++	pmd_t val = pmdp_get_lockless(pmd);
++
++	/* Flush previous PMD's suitable_to_scan result into bloom filter */
++	if (pte_walk->current_pmd_valid &&
++	    pte_walk->current_pmd != current_pmd_addr &&
++	    ap->bloom_filters[0] && pte_walk->pmd_total > 0) {
++		if (suitable_to_scan(pte_walk->pmd_total, pte_walk->pmd_young))
++			update_bloom_filter(ap, ap->scan_seq,
++					    pte_walk->current_pmd);
++		pte_walk->pmd_total = 0;
++		pte_walk->pmd_young = 0;
++	}
++	pte_walk->current_pmd = current_pmd_addr;
++	pte_walk->current_pmd_valid = true;
+ 
+ 	ap->total_pmds++;
+ 
+-	/* No bloom filter → scan everything (non-NORMAL_SCAN or not yet allocated) */
+-	if (!ap->bloom_filter || pte_walk->force_scan)
++	if (!pmd_present(val) || pmd_trans_huge(val) || pmd_devmap(val))
++		return 0;
++
++	/* Layer 1: PMD young bit fast-path — skip PMDs not accessed */
++	if (!pte_walk->force_scan && !pmd_young(val) &&
++	    !access_pid_cur_last_scanning(ap))
++		goto skip_pmd;
++
++	/* Layer 2: Bloom filter — skip PMDs not marked hot last round */
++	if (!ap->bloom_filters[0] || pte_walk->force_scan)
+ 		return 0;
+ 
+-	if (test_bloom_filter(ap, addr))
++	if (test_bloom_filter(ap, ap->scan_seq - 1, current_pmd_addr))
+ 		return 0;
+ 
+-	/* Skip this PMD's PTEs, continue to next PMD */
++skip_pmd:
+ 	ap->skipped_pmds++;
+ 	walk->action = ACTION_CONTINUE;
+ 	return 0;
+@@ -1766,9 +1845,13 @@ static int check_pte_young(pte_t *pte, unsigned long addr, unsigned long next,
+ 	is_local = nid < nr_local_numa;
+ 	if (!is_local && enable_hist && pte_walk->type == NORMAL_SCAN) {
+ 		is_young = false;
+-		goto save_res;
+ 	}
+ 
++	/* Accumulate per-PMD counters for suitable_to_scan */
++	pte_walk->pmd_total++;
++	if (is_young)
++		pte_walk->pmd_young++;
++
+ 	/* 64KiB分组优化：NORMAL_SCAN类型，首页young则跳过后续页 */
+ 	if (pte_walk->type == NORMAL_SCAN) {
+ 		bool is_first = (addr & (SCAN_GROUP_SIZE - 1)) == 0;
+@@ -1795,8 +1878,6 @@ static int check_pte_young(pte_t *pte, unsigned long addr, unsigned long next,
+ #endif
+ 		}
+ 		pte_walk->flag = true;
+-		/* Mark this PMD for re-scan next round */
+-		update_bloom_filter(pte_walk->ap, addr & PMD_MASK);
+ 	}
+ 
+ save_res:
+@@ -1867,6 +1948,23 @@ static void process_scan_results(struct pte_walk *pte_walk)
+ 	}
+ }
+ 
++static void flush_last_pmd_bloom(struct pte_walk *pte_walk)
++{
++	struct access_pid *ap = pte_walk->ap;
++
++	if (!ap || !ap->bloom_filters[0])
++		return;
++	if (!pte_walk->current_pmd_valid)
++		return;
++	if (pte_walk->pmd_total > 0 &&
++	    suitable_to_scan(pte_walk->pmd_total, pte_walk->pmd_young))
++		update_bloom_filter(ap, ap->scan_seq, pte_walk->current_pmd);
++	pte_walk->pmd_total = 0;
++	pte_walk->pmd_young = 0;
++	pte_walk->current_pmd = 0;
++	pte_walk->current_pmd_valid = false;
++}
++
+ static int small_vma_walk(struct mm_struct *mm, unsigned long start_vaddr,
+ 			  unsigned long end_vaddr, struct pte_walk *pte_walk,
+ 			  const struct mm_walk_ops *ops)
+@@ -1882,6 +1980,7 @@ static int small_vma_walk(struct mm_struct *mm, unsigned long start_vaddr,
+ 
+ 	ret = walk_page_range(mm, start_vaddr, end_vaddr, ops, pte_walk);
+ 	mmap_read_unlock(mm);
++	flush_last_pmd_bloom(pte_walk);
+ 	cond_resched();
+ 	process_scan_results(pte_walk);
+ 	return ret;
+diff --git a/plugins/smap/src/drivers/accessed_bit.h b/plugins/smap/src/drivers/accessed_bit.h
+index 9b480bb..634bdd9 100644
+--- a/plugins/smap/src/drivers/accessed_bit.h
++++ b/plugins/smap/src/drivers/accessed_bit.h
+@@ -76,8 +76,12 @@ struct pte_walk {
+ 	bool group_hot;
+ 	u64 group_hot_skip_cnt;
+ 	struct scan_result_entry *scan_results;
+-	u64 scan_result_cnt; /* 当前缓冲区计数 */
+-	bool force_scan; /* bloom filter bypass for this walk */
++	u64 scan_result_cnt;
++	bool force_scan;
++	int pmd_total;
++	int pmd_young;
++	unsigned long current_pmd;
++	bool current_pmd_valid;
+ };
+ 
+ struct freq_info {
+@@ -97,5 +101,4 @@ int scan_hva_info(pid_t pid_nr, u64 *l1_page_num, u64 *l2_page_num,
+ int scan_hva_info_4k(pid_t pid, u64 *l1_page_num, u64 *l2_page_num,
+ 		     u64 **l1_vaddr, u64 **l2_vaddr);
+ int smap_cold_threshold_proc_init(void);
+-void reset_bloom_filter(struct access_pid *ap);
+ #endif /* _SRC_ACCESSED_BIT_H */
+-- 
+2.54.0.windows.1
+

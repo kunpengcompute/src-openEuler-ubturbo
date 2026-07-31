@@ -1,0 +1,211 @@
+From ef536ee956701e1991cc661b5fbe40c3ef4df04e Mon Sep 17 00:00:00 2001
+From: discrete_brain <discrete_brain@163.com>
+Date: Tue, 14 Jul 2026 17:01:01 +0800
+Subject: [PATCH 33/43] perf(smap): remove redundant find_vma
+
+---
+ plugins/smap/src/drivers/accessed_bit.c | 84 +++++++++++--------------
+ 1 file changed, 37 insertions(+), 47 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index a47fd5e..94662b5 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -557,7 +557,7 @@ static void actc_data_add_fast(phys_addr_t paddr, u32 page_size,
+ 	}
+ }
+ 
+-static int hva_to_hpa_hugetlb(struct kvm *kvm, u64 host_va,
++static int hva_to_hpa_hugetlb(struct mm_struct *mm, u64 host_va,
+ 			      struct access_pid *ap, bool is_young)
+ {
+ 	struct hstate *h;
+@@ -568,16 +568,13 @@ static int hva_to_hpa_hugetlb(struct kvm *kvm, u64 host_va,
+ 	phys_addr_t paddr;
+ 	struct page *page;
+ 
+-	if (!kvm)
+-		return -EINVAL;
+-
+-	h = hstate_vma(find_vma(kvm->mm, host_va));
++	h = hstate_vma(find_vma(mm, host_va));
+ 	hmask = huge_page_mask(h);
+ 	sz = huge_page_size(h);
+ 	if (sz != g_pagesize_huge)
+ 		return -EINVAL;
+ 
+-	ptep = huge_pte_offset(kvm->mm, host_va & hmask, sz);
++	ptep = huge_pte_offset(mm, host_va & hmask, sz);
+ 	if (!ptep)
+ 		return -EFAULT;
+ 
+@@ -708,18 +705,15 @@ pte_t *stub_pte_offset(struct mm_struct *mm, unsigned long addr)
+ 	return pte;
+ }
+ 
+-static int hva_to_hpa_4k(struct kvm *kvm, u64 host_va, struct access_pid *ap,
+-			 bool is_young)
++static int hva_to_hpa_4k(struct mm_struct *mm, u64 host_va,
++			 struct access_pid *ap, bool is_young)
+ {
+ 	pte_t *ptep;
+ 	pte_t pte;
+ 	phys_addr_t paddr;
+ 	struct page *page;
+ 
+-	if (!kvm)
+-		return -EINVAL;
+-
+-	ptep = stub_pte_offset(kvm->mm, host_va);
++	ptep = stub_pte_offset(mm, host_va);
+ 	if (!ptep) {
+ 		return -EFAULT;
+ 	}
+@@ -815,7 +809,7 @@ static void ham_actc_data_add(int pid, phys_addr_t paddr, u32 page_size)
+ 	spin_unlock(&ham_lock);
+ }
+ 
+-static int hva_to_hpa_ham(struct kvm *kvm, u64 host_va, pid_t pid)
++static int hva_to_hpa_ham(struct mm_struct *mm, u64 host_va, pid_t pid)
+ {
+ 	struct hstate *h;
+ 	unsigned long hmask;
+@@ -824,17 +818,14 @@ static int hva_to_hpa_ham(struct kvm *kvm, u64 host_va, pid_t pid)
+ 	pte_t pte;
+ 	phys_addr_t paddr;
+ 
+-	if (!kvm)
+-		return -EINVAL;
+-
+-	h = hstate_vma(find_vma(kvm->mm, host_va));
++	h = hstate_vma(find_vma(mm, host_va));
+ 	hmask = huge_page_mask(h);
+ 	sz = huge_page_size(h);
+ 	if (sz != g_pagesize_huge) {
+ 		return -EINVAL;
+ 	}
+ 
+-	ptep = huge_pte_offset(kvm->mm, host_va & hmask, sz);
++	ptep = huge_pte_offset(mm, host_va & hmask, sz);
+ 	if (!ptep) {
+ 		return -EFAULT;
+ 	}
+@@ -867,27 +858,19 @@ static struct vm_area_struct *get_vma_if_huge_page(struct kvm *kvm,
+ 	return vma;
+ }
+ 
+-static int hva_to_hpa(struct kvm *kvm, u64 host_va, struct access_pid *ap,
+-		      bool is_young)
++static int hva_to_hpa(struct mm_struct *mm, u64 host_va, struct access_pid *ap,
++		      bool is_young, bool hugepage_mode)
+ {
+ 	int ret = 0;
+-	struct vm_area_struct *vma;
+ 
+-	if (!kvm || !kvm->mm)
+-		return -EINVAL;
+-	vma = find_vma(kvm->mm, host_va);
+-	if (!vma) {
+-		return -EFAULT;
+-	}
+-
+-	if (is_vm_hugetlb_page(vma)) {
++	if (hugepage_mode) {
+ 		if (ap->type == HAM_SCAN) {
+-			hva_to_hpa_ham(kvm, host_va, ap->pid);
++			hva_to_hpa_ham(mm, host_va, ap->pid);
+ 		} else {
+-			ret = hva_to_hpa_hugetlb(kvm, host_va, ap, is_young);
++			ret = hva_to_hpa_hugetlb(mm, host_va, ap, is_young);
+ 		}
+ 	} else {
+-		ret = hva_to_hpa_4k(kvm, host_va, ap, is_young);
++		ret = hva_to_hpa_4k(mm, host_va, ap, is_young);
+ 	}
+ 	return ret;
+ }
+@@ -1041,7 +1024,7 @@ static int smap_bulk_pte_cb(u64 gpa, u64 hpa, bool young, bool pte_valid,
+ 		}
+ 	} else {
+ 		hva = gfn_to_hva_memslot(ctx->memslot, gpa >> PAGE_SHIFT);
+-		ret = hva_to_hpa(ctx->kvm, hva, ap, young);
++		ret = hva_to_hpa(ctx->kvm->mm, hva, ap, young, false);
+ 	}
+ 
+ 	return ret;
+@@ -1061,7 +1044,7 @@ static void smap_bulk_hole_cb(u64 gpa_start, u64 gpa_end, void *arg)
+ 
+ 	for (gfn = start; gfn < end; gfn++) {
+ 		hva = gfn_to_hva_memslot(ctx->memslot, gfn);
+-		(void)hva_to_hpa(ctx->kvm, hva, ap, false);
++		(void)hva_to_hpa(ctx->kvm->mm, hva, ap, false, false);
+ 	}
+ }
+ 
+@@ -1135,23 +1118,34 @@ static int process_memslot_pages(struct kvm *kvm,
+ 				 struct kvm_memory_slot *memslot,
+ 				 struct access_pid *ap, int page_size)
+ {
+-	gpa_t gpa;
++	gpa_t gpa, gpa_end;
+ 	unsigned long hva;
+-	bool is_young;
+-	int ret;
++	bool is_young, hugepage_mode;
++	struct vm_area_struct *vma;
+ 	u64 paddr;
+ 	struct page *page;
+ 
+-	for (gpa = memslot->base_gfn << PAGE_SHIFT;
+-	     gpa < (memslot->base_gfn + memslot->npages) << PAGE_SHIFT;
+-	     gpa += (gpa_t)page_size) {
++	if (!kvm || !kvm->mm)
++		return -EINVAL;
++
++	gpa = memslot->base_gfn << PAGE_SHIFT;
++	gpa_end = (memslot->base_gfn + memslot->npages) << PAGE_SHIFT;
++	hva = gfn_to_hva_memslot(memslot, gpa_to_gfn(gpa));
++
++	vma = find_vma(kvm->mm, hva);
++	if (!vma || (vma->vm_end - vma->vm_start) != (gpa_end - gpa))
++		return -EFAULT;
++
++	hugepage_mode = page_size == HPAGE_SIZE;
++	if (hugepage_mode != is_vm_hugetlb_page(vma))
++		return -EFAULT;
++
++	for (; gpa < gpa_end; gpa += (gpa_t)page_size, hva += page_size) {
+ #ifdef DEBUG_SCAN_DETAIL
+ 		ktime_t start_time, end_time;
+ 		s64 walk_time, update_time;
+ #endif
+ 
+-		hva = gfn_to_hva_memslot(memslot, gpa_to_gfn(gpa));
+-
+ #ifdef DEBUG_SCAN_DETAIL
+ 		start_time = ktime_get();
+ #endif
+@@ -1200,19 +1194,15 @@ static int process_memslot_pages(struct kvm *kvm,
+ 			}
+ 			continue;
+ 		}
+-		if (page_size == HPAGE_SIZE && !get_vma_if_huge_page(kvm, hva))
+-			continue;
+ #ifdef DEBUG_SCAN_DETAIL
+ 		start_time = ktime_get();
+ #endif
+-		ret = hva_to_hpa(kvm, hva, ap, is_young);
++		(void)hva_to_hpa(kvm->mm, hva, ap, is_young, hugepage_mode);
+ #ifdef DEBUG_SCAN_DETAIL
+ 		end_time = ktime_get();
+ 		update_time = ktime_to_ns(ktime_sub(end_time, start_time));
+ 		ap->total_update_time_ns += update_time;
+ #endif
+-		if (ret)
+-			continue;
+ 	}
+ 
+ 	return 0;
+-- 
+2.54.0.windows.1
+

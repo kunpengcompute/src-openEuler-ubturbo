@@ -1,0 +1,69 @@
+From 0618b5dc91560bf7308fa0212ceb76faad3829fd Mon Sep 17 00:00:00 2001
+From: yuyuanxun <2972982755@qq.com>
+Date: Thu, 25 Jun 2026 19:48:25 +0800
+Subject: [PATCH 04/43] first scan reset page code periods
+
+---
+ plugins/smap/src/drivers/access_pid.c      | 1 +
+ plugins/smap/src/drivers/access_pid.h      | 1 +
+ plugins/smap/src/drivers/access_tracking.c | 1 +
+ plugins/smap/src/drivers/accessed_bit.c    | 7 +++++++
+ 4 files changed, 10 insertions(+)
+
+diff --git a/plugins/smap/src/drivers/access_pid.c b/plugins/smap/src/drivers/access_pid.c
+index d408656..52a60b1 100644
+--- a/plugins/smap/src/drivers/access_pid.c
++++ b/plugins/smap/src/drivers/access_pid.c
+@@ -495,6 +495,7 @@ int init_access_pid(struct access_add_pid_payload *payload,
+ 	ap->scan_time = payload->scan_time;
+ 	ap->ntimes = payload->ntimes;
+ 	ap->type = payload->type;
++	ap->first_scan = true;
+ 	init_completion(&ap->work_done);
+ 	for (int i = 0; i < SMAP_MAX_NUMNODES; i++) {
+ 		ap->scan_count[i] = 0;
+diff --git a/plugins/smap/src/drivers/access_pid.h b/plugins/smap/src/drivers/access_pid.h
+index 2aa51d2..a91a323 100644
+--- a/plugins/smap/src/drivers/access_pid.h
++++ b/plugins/smap/src/drivers/access_pid.h
+@@ -76,6 +76,7 @@ struct access_pid {
+ 	unsigned long last_scan_delay_ms;
+ 	struct proc_dir_entry *proc_root;
+ 	struct proc_dir_entry *proc_freq;
++	bool first_scan;
+ };
+ 
+ typedef struct {
+diff --git a/plugins/smap/src/drivers/access_tracking.c b/plugins/smap/src/drivers/access_tracking.c
+index 1738c56..475bc5e 100644
+--- a/plugins/smap/src/drivers/access_tracking.c
++++ b/plugins/smap/src/drivers/access_tracking.c
+@@ -469,6 +469,7 @@ static void work_func(struct work_struct *work)
+ 	} else {
+ 		ret = scan_accessed_bit_forward_mm(ap, page_size);
+ 	}
++	ap->first_scan = false;
+ 	up_read(&ap_data.lock);
+ 	adev_buffer_up_read();
+ 	end_time = ktime_get();
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index 3a382cf..1746c33 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -442,6 +442,13 @@ static int hva_to_hpa_hugetlb(struct kvm *kvm, u64 host_va,
+ 
+ 	paddr = PFN_PHYS(pte_pfn(pte));
+ 
++	if (ap->first_scan) {
++		page = pfn_to_online_page(PHYS_PFN(paddr));
++		if (page && try_get_page(page)) {
++			smap_page_cold_periods_reset(page);
++			put_page(page);
++		}
++	}
+ 	/*
+ 	 * Resolve actc_data once so we can reuse the entry for both
+ 	 * access recording and end-of-period cold-period update.
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,431 @@
+From d8f0ec7cc2b976a22673e9acb7d2c4410cc688d9 Mon Sep 17 00:00:00 2001
+From: lucas <1358497393@qq.com>
+Date: Sat, 4 Jul 2026 16:26:12 +0800
+Subject: [PATCH 15/43] feat(smap): use access_bit_actc_data for accumulated
+ access frequency with decay
+
+Replace the previous usage of page->flags for access tracking. Now
+access_bit_actc_data records cumulative access frequency with aging/decay,
+while page->flags is reserved solely to indicate whether a page is newly
+allocated.
+---
+ plugins/smap/src/drivers/access_pid.c      |  5 ++
+ plugins/smap/src/drivers/access_pid.h      |  2 +
+ plugins/smap/src/drivers/access_tracking.c |  5 +-
+ plugins/smap/src/drivers/accessed_bit.c    | 86 ++++++++++++++++------
+ plugins/smap/src/drivers/kvm_pgtable.c     | 23 ++++--
+ plugins/smap/src/drivers/kvm_pgtable.h     |  2 +-
+ plugins/smap/src/drivers/smap_page_flags.h | 37 ++++++++++
+ 7 files changed, 128 insertions(+), 32 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/access_pid.c b/plugins/smap/src/drivers/access_pid.c
+index c015ea8..bf86b26 100644
+--- a/plugins/smap/src/drivers/access_pid.c
++++ b/plugins/smap/src/drivers/access_pid.c
+@@ -286,6 +286,9 @@ static void fill_actc_data_by_bitmap(struct access_pid *ap, int nid,
+ 
+ 		/* 填充freq */
+ 		actc[len_cnt].freq = adev->access_bit_actc_data[acidx];
++		if (ap->decay_flag) {
++			adev->access_bit_actc_data[acidx] >>= 1;
++		}
+ 
+ 		/* 填充prior - 从mapping获取 */
+ 		if (ap->info.vm_size && ap->info.mapping &&
+@@ -547,6 +550,7 @@ int init_access_pid(struct access_add_pid_payload *payload,
+ 	ap->ntimes = payload->ntimes;
+ 	ap->type = payload->type;
+ 	ap->first_scan = true;
++	ap->decay_flag = false;
+ 	init_completion(&ap->work_done);
+ 	for (int i = 0; i < SMAP_MAX_NUMNODES; i++) {
+ 		ap->scan_count[i] = 0;
+@@ -561,6 +565,7 @@ int init_access_pid(struct access_add_pid_payload *payload,
+ 			return -EINVAL;
+ 		}
+ 	}
++
+ 	ret = access_walk_pagemap_prepare(ap);
+ 	if (ret) {
+ 		if (ap->info.mapping) {
+diff --git a/plugins/smap/src/drivers/access_pid.h b/plugins/smap/src/drivers/access_pid.h
+index 49cd47e..f56e946 100644
+--- a/plugins/smap/src/drivers/access_pid.h
++++ b/plugins/smap/src/drivers/access_pid.h
+@@ -19,6 +19,7 @@
+ #define SEC_TO_MS 1000
+ #define NON_EXIST_PID (-1)
+ #define DUPLICATE_PID (-2) /* completely duplicate, skip processing */
++
+ extern int nr_local_numa;
+ 
+ enum ap_state {
+@@ -81,6 +82,7 @@ struct access_pid {
+ 	size_t total_scanned_pages;
+ 	u32 scan_done_count;
+ 	bool first_scan;
++	bool decay_flag;
+ };
+ 
+ typedef struct {
+diff --git a/plugins/smap/src/drivers/access_tracking.c b/plugins/smap/src/drivers/access_tracking.c
+index c0de0b5..838a119 100644
+--- a/plugins/smap/src/drivers/access_tracking.c
++++ b/plugins/smap/src/drivers/access_tracking.c
+@@ -89,7 +89,7 @@ void migrate_folio_actc(struct folio *folio_from, struct folio *folio_to)
+ 		return;
+ 	}
+ 
+-	adev_to->access_bit_actc_data[index_to] = smap_acc_cnt_get(&folio_from->page);
++	adev_to->access_bit_actc_data[index_to] = adev_from->access_bit_actc_data[index_from];
+ 	adev_from->access_bit_actc_data[index_from] = 0;
+ }
+ EXPORT_SYMBOL(migrate_folio_actc);
+@@ -492,9 +492,11 @@ static void work_func(struct work_struct *work)
+ 	start_time = ktime_get();
+ 	scan_work = to_delay_work(work);
+ 	ap = delay_work_to_ap(scan_work);
++
+ 	if (access_pid_cur_last_scanning(ap))
+ 		access_walk_pagemap_prepare(ap);
+ 
++	ap->decay_flag = false;
+ 	adev_buffer_down_read();
+ 	down_read(&ap_data.lock);
+ 	page_size = get_page_size(adev);
+@@ -531,6 +533,7 @@ static void work_func(struct work_struct *work)
+ 				      &scan_delay_ms);
+ 	}
+ 	ap->last_scan_delay_ms = scan_delay_ms;
++
+ 	if (ap->cur_times < ap->ntimes) {
+ 		queue_delayed_work(adev->scanq, &ap->scan_work,
+ 				   msecs_to_jiffies(scan_delay_ms));
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index 8eb8b57..64ada91 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -42,6 +42,7 @@
+ #define DEFAULT_REF_COUNT 0
+ #define TRUE_REF 1
+ #define MAX_NR_KVM 100
++#define ACTC_MAX 255
+ #undef pr_fmt
+ #define pr_fmt(fmt) "access-bit: " fmt
+ 
+@@ -372,7 +373,7 @@ static inline int get_numa_id_by_paddr(phys_addr_t paddr)
+  * Common lookup: resolve paddr → &actc_data[pa_index].
+  * Returns NULL for non-local, non-tracked, or histogram pages.
+  */
+-static actc_t *actc_data_lookup_entry(phys_addr_t paddr, u32 page_size)
++static void actc_data_lookup_entry(phys_addr_t paddr, u32 page_size, struct access_pid *ap)
+ {
+ 	struct access_tracking_dev *adev;
+ 	int ret, nid;
+@@ -380,7 +381,7 @@ static actc_t *actc_data_lookup_entry(phys_addr_t paddr, u32 page_size)
+ 
+ 	nid = get_numa_id_by_paddr(paddr);
+ 	if (unlikely(nid == NUMA_NO_NODE))
+-		return NULL;
++		return;
+ 
+ 	if (nid < nr_local_numa)
+ 		ret = calc_paddr_acidx_acpi_known_nid(paddr, nid, &pa_index,
+@@ -390,21 +391,24 @@ static actc_t *actc_data_lookup_entry(phys_addr_t paddr, u32 page_size)
+ 						       page_size);
+ 
+ 	if (unlikely(ret))
+-		return NULL;
++		return;
+ 
+ 	adev = get_access_tracking_dev(nid);
+ 	if (unlikely(!adev || pa_index >= adev->page_count || adev->is_hist))
+-		return NULL;
++		return;
+ 
+-	if (!adev->is_hist) {
+-		struct page *page = pfn_to_online_page(PHYS_PFN(paddr));
+-		if (!page)
+-			return NULL;
+-		smap_acc_cnt_inc(page);
+-		adev->access_bit_actc_data[pa_index] = smap_acc_cnt_get(page);
++	struct page *page = pfn_to_online_page(PHYS_PFN(paddr));
++	if (!page)
++		return;
++	if (smap_page_init(page)) {
++		smap_page_mark(page);
++		adev->access_bit_actc_data[pa_index] = 0; // todo 均值或中位值，需增加额外逻辑
++	} else {
++		adev->access_bit_actc_data[pa_index]++;
++		if (adev->access_bit_actc_data[pa_index] >= ACTC_MAX) {
++			ap->decay_flag = true;
++		}
+ 	}
+-
+-	return &adev->access_bit_actc_data[pa_index];
+ }
+ 
+ static void actc_data_update(int nid, phys_addr_t paddr, u64 pa_index)
+@@ -430,7 +434,6 @@ static int hva_to_hpa_hugetlb(struct kvm *kvm, u64 host_va,
+ 	pte_t *ptep;
+ 	pte_t pte;
+ 	phys_addr_t paddr;
+-	actc_t *entry = NULL;
+ 	struct page *page;
+ 
+ 	if (!kvm)
+@@ -463,11 +466,10 @@ static int hva_to_hpa_hugetlb(struct kvm *kvm, u64 host_va,
+ 		}
+ 	}
+ 	/*
+-	 * Resolve actc_data once so we can reuse the entry for both
+-	 * access recording and end-of-period cold-period update.
++	 * Resolve actc_data for access recording.
+ 	 */
+ 	if (is_young || access_pid_cur_last_scanning(ap))
+-		entry = actc_data_lookup_entry(paddr, g_pagesize_huge);
++		actc_data_lookup_entry(paddr, g_pagesize_huge, ap);
+ 
+ 	if (access_pid_cur_last_scanning(ap)) {
+ 		add_to_bm_huge(host_va, paddr, ap);
+@@ -475,8 +477,6 @@ static int hva_to_hpa_hugetlb(struct kvm *kvm, u64 host_va,
+ 		 * End of period: update cold-period counter from
+ 		 * accumulated actc_data.
+ 		 */
+-		if (!entry)
+-			return 0;
+ 		page = pfn_to_online_page(PHYS_PFN(paddr));
+ 		if (!page || !try_get_page(page))
+ 			return 0;
+@@ -607,12 +607,14 @@ static int hva_to_hpa_4k(struct kvm *kvm, u64 host_va, struct access_pid *ap,
+ 	pte_unmap(ptep);
+ 
+ 	if (is_young)
+-		actc_data_lookup_entry(paddr, PAGE_SIZE);
++		actc_data_lookup_entry(paddr, PAGE_SIZE, ap);
+ 
+ 	if (access_pid_cur_last_scanning(ap)) {
+ 		/*
+-		 * End of period: update cold-period counter from
+-		 * accumulated actc_data.
++		 * End of period: update cold-period counter and
++		 * record in bitmap.  A page successfully enqueued
++		 * into cold_queue is handled by the swap-out path
++		 * and skips add_to_bm_page.
+ 		 */
+ 		page = pfn_to_online_page(PHYS_PFN(paddr));
+ 		if (!page || !try_get_page(page))
+@@ -858,12 +860,13 @@ static int collect_statistic_vaddr(struct kvm *kvm,
+ 	gpa_t gpa;
+ 	unsigned long hva;
+ 	bool is_young;
++	u64 paddr;
+ 
+ 	for (gpa = memslot->base_gfn << PAGE_SHIFT;
+ 	     gpa < (memslot->base_gfn + memslot->npages) << PAGE_SHIFT;
+ 	     gpa += (gpa_t)page_size) {
+ 		is_young =
+-			smap_kvm_pgtable_stage2_mkold(kvm->arch.mmu.pgt, gpa);
++			smap_kvm_pgtable_stage2_mkold(kvm->arch.mmu.pgt, gpa, &paddr);
+ 		if (!is_young && !access_pid_cur_last_scanning(ap))
+ 			continue;
+ 		hva = gfn_to_hva_memslot(memslot, gpa_to_gfn(gpa));
+@@ -886,14 +889,51 @@ static int process_memslot_pages(struct kvm *kvm,
+ 	unsigned long hva;
+ 	bool is_young;
+ 	int ret;
++	u64 paddr;
++	struct page *page;
+ 
+ 	for (gpa = memslot->base_gfn << PAGE_SHIFT;
+ 	     gpa < (memslot->base_gfn + memslot->npages) << PAGE_SHIFT;
+ 	     gpa += (gpa_t)page_size) {
+ 		is_young =
+-			smap_kvm_pgtable_stage2_mkold(kvm->arch.mmu.pgt, gpa);
++			smap_kvm_pgtable_stage2_mkold(kvm->arch.mmu.pgt, gpa, &paddr);
+ 		if (!is_young && !access_pid_cur_last_scanning(ap))
+ 			continue;
++		if (paddr) {
++			if (is_young)
++				actc_data_lookup_entry(paddr, PAGE_SIZE, ap);
++
++			if (access_pid_cur_last_scanning(ap)) {
++				/*
++				 * End of period: update cold-period counter and
++				 * record in bitmap.  A page successfully enqueued
++				 * into cold_queue is handled by the swap-out path
++				 * and skips add_to_bm_page.
++				 */
++				page = pfn_to_online_page(PHYS_PFN(paddr));
++				if (!page || !try_get_page(page)) {
++					pr_err("get page failed\n");
++					continue;
++				}
++				if (is_young) {
++					smap_page_cold_periods_reset(page);
++					add_to_bm_page(paddr, ap);
++				} else {
++					int cold_nid = pfn_to_nid(PHYS_PFN(paddr));
++
++					if (smap_page_cold_periods_inc(page) >=
++						    SMAP_COLD_PERIOD_THRESHOLD &&
++					    !smap_cold_queue_enqueue(cold_nid,
++								     PHYS_PFN(paddr))) {
++					/* enqueued into cold_queue; skip bitmap */
++					} else {
++						add_to_bm_page(paddr, ap);
++					}
++				}
++				put_page(page);
++			}
++			continue;
++		}
+ 		hva = gfn_to_hva_memslot(memslot, gpa_to_gfn(gpa));
+ 		if (page_size == HPAGE_SIZE && !get_vma_if_huge_page(kvm, hva))
+ 			continue;
+diff --git a/plugins/smap/src/drivers/kvm_pgtable.c b/plugins/smap/src/drivers/kvm_pgtable.c
+index df3223d..a5d03d0 100644
+--- a/plugins/smap/src/drivers/kvm_pgtable.c
++++ b/plugins/smap/src/drivers/kvm_pgtable.c
+@@ -257,6 +257,7 @@ struct smap_stage2_test_clear_young_data {
+ 	kvm_pte_t pte;
+ 	u32 level;
+ 	bool young;
++	u64 paddr;
+ };
+ 
+ static inline bool stage2_pte_executable(kvm_pte_t pte)
+@@ -273,7 +274,12 @@ smap_stage2_test_clear_young_walker(const struct kvm_pgtable_visit_ctx *ctx,
+ 	struct smap_stage2_test_clear_young_data *data = ctx->arg;
+ 	struct kvm_pgtable_mm_ops *mm_ops = ctx->mm_ops;
+ 
+-	if (!kvm_pte_valid(ctx->old) || new == ctx->old)
++	if (!kvm_pte_valid(ctx->old))
++		return 0;
++
++	data->paddr = kvm_pte_to_phys(pte);
++
++	if (new == ctx->old)
+ 		return 0;
+ 
+ 	data->young = true;
+@@ -305,7 +311,8 @@ static int smap_stage2_test_clear_young(struct kvm_pgtable *pgt, u64 addr,
+ 					kvm_pte_t attr_clr, bool mkold,
+ 					kvm_pte_t *orig_pte, int *level,
+ 					bool *young,
+-					enum kvm_pgtable_walk_flags flags)
++					enum kvm_pgtable_walk_flags flags,
++					u64 *paddr)
+ {
+ 	int ret;
+ 	kvm_pte_t attr_mask = KVM_PTE_LEAF_ATTR_LO | KVM_PTE_LEAF_ATTR_HI;
+@@ -313,6 +320,7 @@ static int smap_stage2_test_clear_young(struct kvm_pgtable *pgt, u64 addr,
+ 		.attr_set = attr_set & attr_mask,
+ 		.attr_clr = attr_clr & attr_mask,
+ 		.mkold = mkold,
++		.paddr = 0,
+ 	};
+ 	struct kvm_pgtable_walker walker = {
+ 		.cb = smap_stage2_test_clear_young_walker,
+@@ -324,6 +332,7 @@ static int smap_stage2_test_clear_young(struct kvm_pgtable *pgt, u64 addr,
+ 	if (ret)
+ 		return ret;
+ 
++	*paddr = data.paddr;
+ 	if (young)
+ 		*young = data.young;
+ 
+@@ -337,7 +346,7 @@ static int smap_stage2_test_clear_young(struct kvm_pgtable *pgt, u64 addr,
+ }
+ 
+ bool smap_kvm_pgtable_stage2_test_clear_young(struct kvm_pgtable *pgt, u64 addr,
+-					      bool mkold)
++					      bool mkold, u64 *paddr)
+ {
+ 	kvm_pte_t pte = 0;
+ 	int ret;
+@@ -346,18 +355,18 @@ bool smap_kvm_pgtable_stage2_test_clear_young(struct kvm_pgtable *pgt, u64 addr,
+ 	ret = smap_stage2_test_clear_young(
+ 		pgt, addr, 1, 0, KVM_PTE_LEAF_ATTR_LO_S2_AF, mkold, &pte, NULL,
+ 		&young,
+-		KVM_PGTABLE_WALK_HANDLE_FAULT | KVM_PGTABLE_WALK_SHARED);
++		KVM_PGTABLE_WALK_HANDLE_FAULT | KVM_PGTABLE_WALK_SHARED, paddr);
+ 	if (!ret)
+ 		dsb(ishst);
+ 	return young;
+ }
+ 
+-bool smap_kvm_pgtable_stage2_mkold(struct kvm_pgtable *pgt, u64 addr)
++bool smap_kvm_pgtable_stage2_mkold(struct kvm_pgtable *pgt, u64 addr, u64 *paddr)
+ {
+-	return smap_kvm_pgtable_stage2_test_clear_young(pgt, addr, true);
++	return smap_kvm_pgtable_stage2_test_clear_young(pgt, addr, true, paddr);
+ }
+ 
+ bool smap_kvm_pgtable_stage2_is_young(struct kvm_pgtable *pgt, u64 addr)
+ {
+-	return smap_kvm_pgtable_stage2_test_clear_young(pgt, addr, false);
++	return smap_kvm_pgtable_stage2_test_clear_young(pgt, addr, false, NULL);
+ }
+diff --git a/plugins/smap/src/drivers/kvm_pgtable.h b/plugins/smap/src/drivers/kvm_pgtable.h
+index 4f55b51..e7f889c 100644
+--- a/plugins/smap/src/drivers/kvm_pgtable.h
++++ b/plugins/smap/src/drivers/kvm_pgtable.h
+@@ -11,7 +11,7 @@
+ #include <linux/kvm_host.h>
+ 
+ typedef u64 kvm_pte_t;
+-bool smap_kvm_pgtable_stage2_mkold(struct kvm_pgtable *pgt, u64 addr);
++bool smap_kvm_pgtable_stage2_mkold(struct kvm_pgtable *pgt, u64 addr, u64 *paddr);
+ 
+ bool smap_kvm_pgtable_stage2_is_young(struct kvm_pgtable *pgt, u64 addr);
+ 
+diff --git a/plugins/smap/src/drivers/smap_page_flags.h b/plugins/smap/src/drivers/smap_page_flags.h
+index 2fc97eb..fe100af 100644
+--- a/plugins/smap/src/drivers/smap_page_flags.h
++++ b/plugins/smap/src/drivers/smap_page_flags.h
+@@ -190,4 +190,41 @@ static inline void smap_acc_cnt_reset(struct page *page)
+ 	} while (unlikely(cmpxchg(&page->flags, flags, new_flags) != flags));
+ }
+ 
++/**
++ * smap_page_init - Check whether the access-frequency flag bits are all 1s
++ *
++ * @page: target page
++ *
++ * Returns true if every bit in the SMAP_ACC_CNT field is set (i.e. the
++ * counter has reached SMAP_ACC_CNT_MAX = 0xFFF), false otherwise.
++ * Only inspects the 12-bit frequency field; the low 4-bit cold-period
++ * counter is not considered.
++ */
++static inline bool smap_page_init(struct page *page)
++{
++	unsigned long flags = READ_ONCE(page->flags);
++	u16 cnt = (flags >> SMAP_ACC_CNT_SHIFT) & SMAP_ACC_CNT_MASK;
++	return cnt == SMAP_ACC_CNT_MAX;
++}
++
++/**
++ * smap_page_mark - Clear the access-frequency flag bits, keeping only the lowest bit set
++ *
++ * @page: target page
++ *
++ * Atomically sets the SMAP_ACC_CNT field to 1 (binary 000000000001),
++ * i.e. all 12 frequency bits are cleared except the lowest-order one.
++ * The low 4-bit cold-period counter (SMAP_COLD_FIELD) is preserved.
++ */
++static inline void smap_page_mark(struct page *page)
++{
++	unsigned long flags, new_flags;
++
++	do {
++		flags = READ_ONCE(page->flags);
++		new_flags = flags & ~SMAP_ACC_FIELD_MASK;
++		new_flags |= (unsigned long)1 << SMAP_ACC_CNT_SHIFT;
++	} while (unlikely(cmpxchg(&page->flags, flags, new_flags) != flags));
++}
++
+ #endif /* _SRC_SMAP_PAGE_FLAGS_H */
+-- 
+2.54.0.windows.1
+

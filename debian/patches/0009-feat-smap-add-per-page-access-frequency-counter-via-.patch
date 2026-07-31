@@ -1,0 +1,273 @@
+From f503aa02b2fa8f311f1119b55ee7841411e80eed Mon Sep 17 00:00:00 2001
+From: Pang Jiming <discrete_brain@163.com>
+Date: Mon, 15 Jun 2026 15:38:30 +0800
+Subject: [PATCH 09/43] feat(smap): add per-page access frequency counter via
+ page flags
+
+Repurpose the unused LAST_CPUPID field in page->flags to store a
+per-page accumulated access frequency counter. SMAP disables NUMA
+balancing, so the 16-bit LAST_CPUPID field is otherwise idle.
+
+The counter is incremented on each young access observation in both
+the 4K MM path (check_pte_young) and the 2M VM path (hva_to_hpa_hugetlb).
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ plugins/smap/src/drivers/access_tracking.c |   2 -
+ plugins/smap/src/drivers/accessed_bit.c    |  23 ++++-
+ plugins/smap/src/drivers/smap_page_flags.h | 110 ++++++++++++++++++---
+ 3 files changed, 116 insertions(+), 19 deletions(-)
+
+diff --git a/plugins/smap/src/drivers/access_tracking.c b/plugins/smap/src/drivers/access_tracking.c
+index 049995d..517ed23 100644
+--- a/plugins/smap/src/drivers/access_tracking.c
++++ b/plugins/smap/src/drivers/access_tracking.c
+@@ -239,8 +239,6 @@ static void access_tracking_enable(struct device *ldev)
+ 			return;
+ 		}
+ 		adev->need_reinit_actc = false;
+-	} else {
+-		init_actc_data(adev);
+ 	}
+ 	up_write(&adev->buffer_lock);
+ 	submit_scan_works(adev);
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index e048cc8..0e0bcc5 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -446,6 +446,7 @@ static int hva_to_hpa_hugetlb(struct kvm *kvm, u64 host_va,
+ 		page = pfn_to_online_page(PHYS_PFN(paddr));
+ 		if (page && try_get_page(page)) {
+ 			smap_page_cold_periods_reset(page);
++			smap_acc_cnt_reset(page);
+ 			put_page(page);
+ 		}
+ 	}
+@@ -456,8 +457,13 @@ static int hva_to_hpa_hugetlb(struct kvm *kvm, u64 host_va,
+ 	if (is_young || access_pid_cur_last_scanning(ap))
+ 		entry = actc_data_lookup_entry(paddr, g_pagesize_huge);
+ 
+-	if (is_young && entry)
++	if (is_young && entry) {
+ 		(*entry)++;
++		/* Side statistic: per-page access frequency in page->flags. */
++		page = pfn_to_online_page(PHYS_PFN(paddr));
++		if (page)
++			smap_acc_cnt_inc(page);
++	}
+ 
+ 	if (access_pid_cur_last_scanning(ap)) {
+ 		add_to_bm_huge(host_va, paddr, ap);
+@@ -601,6 +607,7 @@ static int hva_to_hpa_4k(struct kvm *kvm, u64 host_va, struct access_pid *ap,
+ 		page = pfn_to_online_page(PHYS_PFN(paddr));
+ 		if (page && try_get_page(page)) {
+ 			smap_page_cold_periods_reset(page);
++			smap_acc_cnt_reset(page);
+ 			put_page(page);
+ 		}
+ 	}
+@@ -608,8 +615,13 @@ static int hva_to_hpa_4k(struct kvm *kvm, u64 host_va, struct access_pid *ap,
+ 	if (is_young || access_pid_cur_last_scanning(ap))
+ 		entry = actc_data_lookup_entry(paddr, PAGE_SIZE);
+ 
+-	if (is_young && entry)
++	if (is_young && entry) {
+ 		(*entry)++;
++		/* Side statistic: per-page access frequency in page->flags. */
++		page = pfn_to_online_page(PHYS_PFN(paddr));
++		if (page)
++			smap_acc_cnt_inc(page);
++	}
+ 
+ 	if (access_pid_cur_last_scanning(ap))
+ 		add_to_bm_page(paddr, ap);
+@@ -1538,7 +1550,6 @@ static int check_pte_young(pte_t *pte, unsigned long addr, unsigned long next,
+ 	if (pte_walk->scan_result_cnt >= SCAN_RESULT_CAPACITY)
+ 		return 0;
+ 
+-	/* 锁内：获取 page 用于 inc_smap_acc_cnt */
+ 	if (!pfn_valid(pfn))
+ 		return 0;
+ 	page = pfn_to_online_page(pfn);
+@@ -1558,6 +1569,8 @@ static int check_pte_young(pte_t *pte, unsigned long addr, unsigned long next,
+ 			pte_walk->group_hot = is_young;
+ 		else if (pte_walk->group_hot) {
+ 			pte_walk->group_hot_skip_cnt++;
++			if (is_young && !is_file_or_shared_page(page))
++				smap_acc_cnt_inc(page);
+ 			goto save_res;
+ 		}
+ 	}
+@@ -1566,8 +1579,10 @@ static int check_pte_young(pte_t *pte, unsigned long addr, unsigned long next,
+ 		if (pte_walk->type == STATISTIC_SCAN)
+ 			pte_walk->statistic_vaddr[pte_walk->statistic_cnt++] =
+ 				addr;
+-		if (!is_file_or_shared_page(page))
++		if (!is_file_or_shared_page(page)) {
++			smap_acc_cnt_inc(page);
+ 			__ptep_test_and_clear_young(NULL, 0, pte);
++		}
+ 		pte_walk->flag = true;
+ 	}
+ 
+diff --git a/plugins/smap/src/drivers/smap_page_flags.h b/plugins/smap/src/drivers/smap_page_flags.h
+index 1b6b7e3..2fc97eb 100644
+--- a/plugins/smap/src/drivers/smap_page_flags.h
++++ b/plugins/smap/src/drivers/smap_page_flags.h
+@@ -1,11 +1,18 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+ /*
+  * Copyright (c) Huawei Technologies Co., Ltd. 2024-2024. All rights reserved.
+- * Description: SMAP page->flags helpers for cold-period tracking
++ * Description: SMAP page->flags helpers for cold-period and access-frequency
+  *
+- * On aarch64 the LAST_CPUPID field in page->flags is unused when NUMA
+- * balancing is disabled. We repurpose the least-significant 4 bits to
+- * store a consecutive-cold-period counter.
++ * On aarch64 the LAST_CPUPID field (16 bits) in page->flags is unused when
++ * NUMA balancing is disabled.  We split it into two sub-counters that
++ * coexist without interfering:
++ *
++ *   bits [0..3]   (4 bits)  consecutive-cold-period counter  (0..14, 0xF = uninitialised sentinel)
++ *   bits [4..15]  (12 bits) accumulated access-frequency count (0..4095)
++ *
++ * The cold-period counter drives the cold_queue swap-out path; the access
++ * frequency counter is a side statistic incremented on each young access
++ * observation and does not participate in swap-out decisions.
+  */
+ 
+ #ifndef _SRC_SMAP_PAGE_FLAGS_H
+@@ -13,12 +20,27 @@
+ 
+ #include <linux/bits.h>
+ #include <linux/compiler.h> /* for READ_ONCE */
+-#include <linux/mmzone.h> /* for NR_PAGEFLAGS, SECTIONS/NODES/ZONES_WIDTH */
++#include <linux/mm.h>
++#include <linux/mmzone.h> /* for LAST_CPUPID_PGSHIFT, LAST_CPUPID_MASK */
+ #include <asm/cmpxchg.h>
+ 
++/* ---- bit layout inside the LAST_CPUPID field ---- */
+ #define SMAP_COLD_PERIOD_WIDTH 4
+-#define SMAP_COLD_PERIOD_MASK ((1UL << SMAP_COLD_PERIOD_WIDTH) - 1)
+-#define SMAP_COLD_PERIOD_MAX 16
++#define SMAP_COLD_PERIOD_MASK  ((1UL << SMAP_COLD_PERIOD_WIDTH) - 1)
++/* SMAP_COLD_PERIOD_MASK (0xF) is reserved as an "uninitialised" sentinel;
++ * the effective counter range is 0..14.  See smap_page_cold_periods_inc. */
++
++/* Access-frequency counter occupies the high 12 bits of the 16-bit field. */
++#define SMAP_ACC_CNT_SHIFT  (LAST_CPUPID_PGSHIFT + SMAP_COLD_PERIOD_WIDTH)
++#define SMAP_ACC_CNT_WIDTH  12
++#define SMAP_ACC_CNT_MASK   ((1UL << SMAP_ACC_CNT_WIDTH) - 1)
++#define SMAP_ACC_CNT_MAX    SMAP_ACC_CNT_MASK /* 4095 */
++
++/* Field-local masks (already shifted to LAST_CPUPID_PGSHIFT origin). */
++#define SMAP_COLD_FIELD_MASK \
++	(SMAP_COLD_PERIOD_MASK << LAST_CPUPID_PGSHIFT)
++#define SMAP_ACC_FIELD_MASK \
++	(SMAP_ACC_CNT_MASK << SMAP_ACC_CNT_SHIFT)
+ 
+ /**
+  * smap_page_cold_periods_get - Read the consecutive-cold-period counter
+@@ -46,7 +68,8 @@ static inline u8 smap_page_cold_periods_get(struct page *page)
+  *
+  * @page: target page
+  *
+- * Call when the page was accessed during the current period.
++ * Call when the page was accessed during the current period.  Only clears
++ * the low 4 bits; the access-frequency bits are preserved.
+  */
+ static inline void smap_page_cold_periods_reset(struct page *page)
+ {
+@@ -54,8 +77,7 @@ static inline void smap_page_cold_periods_reset(struct page *page)
+ 
+ 	do {
+ 		old = READ_ONCE(page->flags);
+-		new = old;
+-		new &= ~(LAST_CPUPID_MASK << LAST_CPUPID_PGSHIFT);
++		new = old & ~SMAP_COLD_FIELD_MASK;
+ 	} while (unlikely(cmpxchg(&page->flags, old, new) != old));
+ }
+ 
+@@ -92,9 +114,8 @@ static inline u8 smap_page_cold_periods_inc(struct page *page)
+ 		else if (cnt < SMAP_COLD_PERIOD_MASK - 1)
+ 			cnt++;    /* saturate at 14, keep 0xF as sentinel */
+ 		/* else: cnt == 14, stay at cap. */
+-		new = old;
+-		new &= ~(LAST_CPUPID_MASK << LAST_CPUPID_PGSHIFT);
+-		new |= ((unsigned long)cnt<< LAST_CPUPID_PGSHIFT);
++		new = old & ~SMAP_COLD_FIELD_MASK;
++		new |= (unsigned long)cnt << LAST_CPUPID_PGSHIFT;
+ 	} while (unlikely(cmpxchg(&page->flags, old, new) != old));
+ 
+ 	return cnt;
+@@ -106,4 +127,67 @@ static inline u8 smap_page_cold_periods_inc(struct page *page)
+  */
+ #define SMAP_COLD_PERIOD_THRESHOLD 10
+ 
++/**
++ * smap_acc_cnt_get - Read the accumulated access-frequency counter
++ *
++ * @page: target page
++ *
++ * Returns a value 0..4095.  Returns 0 when the counter has saturated/wrapped
++ * (matches the original feat_accumulate_freq semantics).
++ */
++static inline u16 smap_acc_cnt_get(struct page *page)
++{
++	unsigned long flags = READ_ONCE(page->flags);
++	u16 cnt = (flags >> SMAP_ACC_CNT_SHIFT) & SMAP_ACC_CNT_MASK;
++
++	if (cnt == SMAP_ACC_CNT_MAX)
++		return 0;
++	return cnt;
++}
++
++/**
++ * smap_acc_cnt_inc - Increment the access-frequency counter
++ *
++ * @page: target page
++ *
++ * Called on each young access observation.  Only touches the high 12 bits;
++ * the cold-period bits are preserved.
++ */
++static inline void smap_acc_cnt_inc(struct page *page)
++{
++	unsigned long flags;
++	unsigned long new_flags;
++	u16 cnt;
++
++	do {
++		flags = READ_ONCE(page->flags);
++		cnt = (flags >> SMAP_ACC_CNT_SHIFT) & SMAP_ACC_CNT_MASK;
++		if (cnt == SMAP_ACC_CNT_MAX)
++			cnt = 0;
++		else if (cnt < SMAP_ACC_CNT_MAX - 1)
++			cnt++;
++		new_flags = flags & ~SMAP_ACC_FIELD_MASK;
++		new_flags |= (unsigned long)cnt << SMAP_ACC_CNT_SHIFT;
++	} while (unlikely(cmpxchg(&page->flags, flags, new_flags) != flags));
++}
++
++/**
++ * smap_acc_cnt_reset - Reset the access-frequency counter to 0
++ *
++ * @page: target page
++ *
++ * Only clears the high 12 bits (frequency); the low 4-bit cold-period
++ * counter is preserved so cold_queue tracking is not disturbed.
++ */
++static inline void smap_acc_cnt_reset(struct page *page)
++{
++	unsigned long flags;
++	unsigned long new_flags;
++
++	do {
++		flags = READ_ONCE(page->flags);
++		new_flags = flags & ~SMAP_ACC_FIELD_MASK;
++	} while (unlikely(cmpxchg(&page->flags, flags, new_flags) != flags));
++}
++
+ #endif /* _SRC_SMAP_PAGE_FLAGS_H */
+-- 
+2.54.0.windows.1
+

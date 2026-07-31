@@ -1,10 +1,20 @@
-Description: 适配不同内核版本 (Velinux/OCOS/OpenEuler)
- 1. feat: adapt to different kernels (c72c61c)
- 2. Bug: 修复KVM页表遍历中level异常判断的类型转换缺陷 (b102206)
-Author: Debian Packager
-Last-Update: 2026-07-29
+From be2b8030d9cce2c35e687af06d11c1a1ff663663 Mon Sep 17 00:00:00 2001
+From: lucas <1358497393@qq.com>
+Date: Wed, 3 Jun 2026 16:34:07 +0800
+Subject: [PATCH 19/43] feat: adapt to different kernels
 
 ---
+ plugins/smap/smap.spec                            |  5 +++--
+ plugins/smap/src/drivers/Makefile                 |  8 ++++++++
+ .../smap/src/drivers/access_tracking_wrapper.c    |  8 ++++++++
+ plugins/smap/src/drivers/accessed_bit.c           | 12 ++++++++++++
+ plugins/smap/src/drivers/kvm_pgtable.c            |  8 ++++++++
+ plugins/smap/src/tiering/Makefile                 | 15 ++++++++++++++-
+ plugins/smap/src/tiering/basic.c                  |  8 ++++++++
+ plugins/smap/src/tiering/mig_init.c               |  1 -
+ plugins/smap/src/tiering/smap_migrate_pages.c     |  6 ++++++
+ plugins/smap/src/tiering/tracking_manage.c        |  8 ++++++++
+ 10 files changed, 75 insertions(+), 4 deletions(-)
 
 diff --git a/plugins/smap/smap.spec b/plugins/smap/smap.spec
 index f2cab1a..c8cba77 100644
@@ -24,7 +34,7 @@ index f2cab1a..c8cba77 100644
  cd %{_builddir}/smap && cmake -DCMAKE_BUILD_TYPE=Release %{_builddir}/smap
  make -j`nproc` install
 diff --git a/plugins/smap/src/drivers/Makefile b/plugins/smap/src/drivers/Makefile
-index fca9738..6fa487b 100644
+index 254d12b..1bae0b9 100644
 --- a/plugins/smap/src/drivers/Makefile
 +++ b/plugins/smap/src/drivers/Makefile
 @@ -12,6 +12,14 @@ smap_histogram_tracking-objs := ub_hist.o
@@ -69,25 +79,34 @@ index 67bdeec..59677cd 100644
  			orig_pte = pte_mkdirty(orig_pte);
  		if (pte_young(pte))
 diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
-index 5e9492e..b92ef2f 100644
+index b8393ac..68d490d 100644
 --- a/plugins/smap/src/drivers/accessed_bit.c
 +++ b/plugins/smap/src/drivers/accessed_bit.c
-@@ -1337,8 +1337,13 @@ static int check_pte_young(pte_t *pte, unsigned long addr, unsigned long next,
- 		if (pte_walk->type == STATISTIC_SCAN)
- 			pte_walk->statistic_vaddr[pte_walk->statistic_cnt++] =
+@@ -593,7 +593,11 @@ static int hva_to_hpa_4k(struct kvm *kvm, u64 host_va, struct access_pid *ap,
+ 		return -EFAULT;
+ 	}
+ 
++#ifdef KERNEL_VELINUX
++	pte = ptep_get(ptep);
++#else
+ 	pte = __ptep_get(ptep);
++#endif
+ 	if (!pte_present(pte)) {
+ 		pr_debug("unable to get PTE\n");
+ 		pte_unmap(ptep);
+@@ -1609,7 +1613,11 @@ static int check_pte_young(pte_t *pte, unsigned long addr, unsigned long next,
  				addr;
--		if (!is_file_or_shared_page(page))
-+		if (!is_file_or_shared_page(page)) {
+ 		if (!is_file_or_shared_page(page)) {
+ 			smap_acc_cnt_inc(page);
 +#ifdef KERNEL_VELINUX
 +			__ptep_test_and_clear_young(pte);
 +#else
  			__ptep_test_and_clear_young(NULL, 0, pte);
 +#endif
-+		}
+ 		}
  		pte_walk->flag = true;
  	}
- 
-@@ -1604,7 +1609,11 @@ static int pte_pure_clear(pte_t *pte, unsigned long addr, unsigned long next,
+@@ -1900,7 +1908,11 @@ static int pte_pure_clear(pte_t *pte, unsigned long addr, unsigned long next,
  
  	if (pte_young(*pte)) {
  		pte_walk->flag = true;
@@ -99,8 +118,36 @@ index 5e9492e..b92ef2f 100644
  	}
  
  	return 0;
+diff --git a/plugins/smap/src/drivers/kvm_pgtable.c b/plugins/smap/src/drivers/kvm_pgtable.c
+index a5d03d0..4eb112d 100644
+--- a/plugins/smap/src/drivers/kvm_pgtable.c
++++ b/plugins/smap/src/drivers/kvm_pgtable.c
+@@ -49,7 +49,11 @@ static u32 kvm_pgtable_idx(struct kvm_pgtable_walk_data *data, u32 level)
+ 
+ static bool kvm_pte_table(kvm_pte_t pte, u32 level)
+ {
++#ifdef KERNEL_VELINUX
++	if (level == KVM_PGTABLE_LAST_LEVEL || !kvm_pte_valid(pte))
++#else
+ 	if (level == KVM_PGTABLE_MAX_LEVELS - 1 || !kvm_pte_valid(pte))
++#endif
+ 		return false;
+ 
+ 	return FIELD_GET(KVM_PTE_TYPE, pte) == KVM_PTE_TYPE_TABLE;
+@@ -167,7 +171,11 @@ static int __kvm_pgtable_walk(struct kvm_pgtable_walk_data *data,
+ 	u32 idx;
+ 	int ret = 0;
+ 
++#ifdef KERNEL_VELINUX
++	if (WARN_ON_ONCE(level > KVM_PGTABLE_LAST_LEVEL))
++#else
+ 	if (WARN_ON_ONCE(level >= KVM_PGTABLE_MAX_LEVELS))
++#endif
+ 		return -EINVAL;
+ 
+ 	for (idx = kvm_pgtable_idx(data, level); idx < PTRS_PER_PTE; ++idx) {
 diff --git a/plugins/smap/src/tiering/Makefile b/plugins/smap/src/tiering/Makefile
-index 9d099e5..cdc0352 100644
+index b0ac108..e891b41 100644
 --- a/plugins/smap/src/tiering/Makefile
 +++ b/plugins/smap/src/tiering/Makefile
 @@ -1,5 +1,9 @@
@@ -114,10 +161,10 @@ index 9d099e5..cdc0352 100644
  
  obj-m   := $(MODULE_NAME).o
  
-@@ -10,6 +14,14 @@ KBUILD_EXTRA_SYMBOLS = $(src)/depends/Module.symvers
- ifeq ($(CRITICAL), 0)
- 	ccflags-y := -DCRITICAL_OFF
- endif
+@@ -7,6 +11,15 @@ KERNELDIR ?= /lib/modules/$(shell uname -r)/build
+ PWD       := $(shell pwd)
+ KBUILD_EXTRA_SYMBOLS = $(src)/depends/Module.symvers
+ 
 +ifeq ($(KERNEL_VERSION), ocos)
 +    ccflags-y += -DKERNEL_OCOS
 +else ifeq ($(KERNEL_VERSION), velinux)
@@ -126,16 +173,10 @@ index 9d099e5..cdc0352 100644
 +    ccflags-y += -DHAM_ENABLED
 +    ccflags-y += -DKERNEL_OPENEULER
 +endif
- 
++
  .PHONY: modules
  default: modules
-@@ -18,4 +30,4 @@ modules:
- 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
  
- clean:
--	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
-\ No newline at end of file
-+	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
 diff --git a/plugins/smap/src/tiering/basic.c b/plugins/smap/src/tiering/basic.c
 index 9f46517..113e6e5 100644
 --- a/plugins/smap/src/tiering/basic.c
@@ -164,22 +205,22 @@ index 9f46517..113e6e5 100644
  			orig_pte = pte_mkdirty(orig_pte);
  
 diff --git a/plugins/smap/src/tiering/mig_init.c b/plugins/smap/src/tiering/mig_init.c
-index 856b5d4..5b3ebd9 100644
+index e63ed8e..13b5ed4 100644
 --- a/plugins/smap/src/tiering/mig_init.c
 +++ b/plugins/smap/src/tiering/mig_init.c
-@@ -19,7 +19,6 @@
+@@ -20,7 +20,6 @@
  #include "common.h"
  #include "acpi_mem.h"
  #include "iomem.h"
 -#include "ham_migration.h"
  #include "smap_migrate_pages.h"
- #ifdef CRITICAL_OFF
- #include "critical.h"
+ #include "../drivers/smap_page_flags.h"
+ #include "../drivers/smap_cold_queue.h"
 diff --git a/plugins/smap/src/tiering/smap_migrate_pages.c b/plugins/smap/src/tiering/smap_migrate_pages.c
-index 55d2394..4630851 100644
+index bd5296e..f675fa7 100644
 --- a/plugins/smap/src/tiering/smap_migrate_pages.c
 +++ b/plugins/smap/src/tiering/smap_migrate_pages.c
-@@ -71,6 +71,7 @@ static struct migrate_node {
+@@ -68,6 +68,7 @@ static struct migrate_node {
  	unsigned long nr[SMAP_MAX_NUMNODES];
  } migrate_node;
  
@@ -187,7 +228,7 @@ index 55d2394..4630851 100644
  void set_remote_migrate_mode(unsigned int mode)
  {
  	if (mode) {
-@@ -80,6 +81,11 @@ void set_remote_migrate_mode(unsigned int mode)
+@@ -75,6 +76,11 @@ void set_remote_migrate_mode(unsigned int mode)
  	}
  	pr_info("set remote migrate mode: %u\n", remote_migrate_mode);
  }
@@ -200,7 +241,7 @@ index 55d2394..4630851 100644
  static int smap_check_huge_page_for_migration(struct page *page, pid_t pid)
  {
 diff --git a/plugins/smap/src/tiering/tracking_manage.c b/plugins/smap/src/tiering/tracking_manage.c
-index 4236835..130e7e4 100644
+index ac6e957..1ba7ad9 100644
 --- a/plugins/smap/src/tiering/tracking_manage.c
 +++ b/plugins/smap/src/tiering/tracking_manage.c
 @@ -26,7 +26,9 @@
@@ -211,9 +252,9 @@ index 4236835..130e7e4 100644
  #include "ham_migration.h"
 +#endif
  #include "pid_ioctl.h"
- #ifdef CRITICAL_OFF
- #include "critical.h"
-@@ -91,7 +93,9 @@ static void resource(void)
+ #include "tracking_manage.h"
+ 
+@@ -88,7 +90,9 @@ static void resource(void)
  	exit_migrate();
  	smap_dev_exit();
  	smap_debugfs_mod_exit();
@@ -223,7 +264,7 @@ index 4236835..130e7e4 100644
  }
  
  static int is_qemu_name_valid(void)
-@@ -238,17 +242,21 @@ static int __init tracking_init(void)
+@@ -235,17 +239,21 @@ static int __init tracking_init(void)
  		pr_err("failed to init migrate, ret: %d\n", ret);
  		goto out_dev_int;
  	}
@@ -245,61 +286,6 @@ index 4236835..130e7e4 100644
  out_dev_int:
  	smap_dev_exit();
  out_debugfs:
-diff --git a/plugins/smap/test/CMakeLists.txt b/plugins/smap/test/CMakeLists.txt
-index 6fed2d5..fbf0afa 100644
---- a/plugins/smap/test/CMakeLists.txt
-+++ b/plugins/smap/test/CMakeLists.txt
-@@ -15,7 +15,7 @@ set(CMAKE_SHARED_LINKER_FLAGS " -lgcov --coverage ")
- 
- add_subdirectory(3rdparty)
- 
--add_compile_definitions(USE_DT)
-+add_compile_definitions(USE_DT CONFIG_MIGRATE_PAGES_DMA_OFFLOADING)
- 
- # include all source files
- aux_source_directory(${CMAKE_CURRENT_LIST_DIR}/tiering TEST_SRC)
-diff --git a/plugins/smap/test/user/manage/test_manage.cpp b/plugins/smap/test/user/manage/test_manage.cpp
-index d307a88..6592f57 100644
---- a/plugins/smap/test/user/manage/test_manage.cpp
-+++ b/plugins/smap/test/user/manage/test_manage.cpp
-@@ -1005,8 +1005,11 @@ TEST_F(ManageTest, TestGetNumaNodesForPid)
- {
-     int pid = 1234;
-     int node = 0;
-+    MOCKER(sched_getaffinity).stubs().will(returnValue(-1));
-     int ret = GetNumaNodesForPid(pid, &node);
-     EXPECT_EQ(ret, -EINVAL);
-+
-+    GlobalMockObject::verify();
-     MOCKER(sched_getaffinity).stubs().will(returnValue(0));
-     MOCKER(GetNodeFromCpu).stubs().will(returnValue(-EINVAL)).then(returnValue(0));
-     ret = GetNumaNodesForPid(pid, &node);
+-- 
+2.54.0.windows.1
 
-diff --git a/plugins/smap/src/drivers/kvm_pgtable.c b/plugins/smap/src/drivers/kvm_pgtable.c
-index df3223d..ca71c3d 100644
---- a/plugins/smap/src/drivers/kvm_pgtable.c
-+++ b/plugins/smap/src/drivers/kvm_pgtable.c
-@@ -49,7 +49,11 @@ static u32 kvm_pgtable_idx(struct kvm_pgtable_walk_data *data, u32 level)
- 
- static bool kvm_pte_table(kvm_pte_t pte, u32 level)
- {
-+#ifdef KERNEL_VELINUX
-+	if (level == KVM_PGTABLE_LAST_LEVEL || !kvm_pte_valid(pte))
-+#else
- 	if (level == KVM_PGTABLE_MAX_LEVELS - 1 || !kvm_pte_valid(pte))
-+#endif
- 		return false;
- 
- 	return FIELD_GET(KVM_PTE_TYPE, pte) == KVM_PTE_TYPE_TABLE;
-@@ -167,7 +171,11 @@ static int __kvm_pgtable_walk(struct kvm_pgtable_walk_data *data,
- 	u32 idx;
- 	int ret = 0;
- 
-+#ifdef KERNEL_VELINUX
-+	if (WARN_ON_ONCE(level > KVM_PGTABLE_LAST_LEVEL))
-+#else
- 	if (WARN_ON_ONCE(level >= KVM_PGTABLE_MAX_LEVELS))
-+#endif
- 		return -EINVAL;
- 
- 	for (idx = kvm_pgtable_idx(data, level); idx < PTRS_PER_PTE; ++idx) {

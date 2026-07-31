@@ -6,6 +6,8 @@ set -e
 # Mirrors RPM spec %post smap.
 SMAP_DIR=/lib/modules/smap
 UCACHE_DIR=/lib/modules/ucache
+SYSTEM_USER="ubturbo"
+SYSTEM_GROUP="ubturbo"
 
 case "$1" in
     configure)
@@ -26,6 +28,22 @@ case "$1" in
         fi
         ;;
 esac
+
+# Create system group
+if ! getent group "$SYSTEM_GROUP" > /dev/null 2>&1; then
+    groupadd -r "$SYSTEM_GROUP"
+fi
+
+# Create system user
+if ! getent passwd "$SYSTEM_USER" > /dev/null 2>&1; then
+    useradd -r -g "$SYSTEM_GROUP" -s /sbin/nologin "$SYSTEM_USER"
+fi
+
+# Ensure correct ownership after installation
+chmod 0500 /usr/lib64/libsmap.so 2>/dev/null || true
+chown "$SYSTEM_USER:$SYSTEM_GROUP" /usr/lib64/libsmap.so 2>/dev/null || true
+chmod 0500 /lib/modules/smap/* 2>/dev/null || true
+chown "$SYSTEM_USER:$SYSTEM_GROUP" /lib/modules/smap/* 2>/dev/null || true
 
 #DEBHELPER#
 

@@ -1,0 +1,37 @@
+From b58b11e6e51c1a4dfb478e7fbed54343a83dc44f Mon Sep 17 00:00:00 2001
+From: yuyuanxun <2972982755@qq.com>
+Date: Wed, 15 Jul 2026 16:57:51 +0800
+Subject: [PATCH 21/43] Migration cycle file configurations take effect
+ immediately
+
+---
+ plugins/smap/src/user/strategy/migration.c | 6 ++----
+ 1 file changed, 2 insertions(+), 4 deletions(-)
+
+diff --git a/plugins/smap/src/user/strategy/migration.c b/plugins/smap/src/user/strategy/migration.c
+index 407bb46..6ea7087 100644
+--- a/plugins/smap/src/user/strategy/migration.c
++++ b/plugins/smap/src/user/strategy/migration.c
+@@ -720,7 +720,7 @@ int ScanMigrateWork(ThreadCtx *ctx)
+         goto out;
+     }
+     SMAP_LOGGER_DEBUG("Tracking disabled.");
+-    ReadScanStats(manager);
++    // ReadScanStats(manager);
+     // 由于进程销毁是异步，后续涉及ProcessAttr需要合理处理异常
+     CheckAndRemoveInvalidProcess();
+     ret = PerformMigrationPreparation(manager);
+@@ -750,9 +750,7 @@ int ScanMigrateWork(ThreadCtx *ctx)
+     ret = PerformMigration(manager);
+     SMAP_LOGGER_INFO("Migration result: %d.", ret);
+     // 只在迁移成功时恢复新PID的扫描周期
+-    if (ret == 0) {
+-        RestoreNewPidScanTime(ctx);
+-    }
++    RestoreNewPidScanTime(ctx);
+ out:
+     // 启动扫描
+     EnableTracking(manager);
+-- 
+2.54.0.windows.1
+

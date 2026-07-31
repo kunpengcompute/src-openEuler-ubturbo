@@ -1,0 +1,293 @@
+From 511f4dcd642b9e8cbe017db8850e31b0e66c9a32 Mon Sep 17 00:00:00 2001
+From: Pang Jiming <discrete_brain@163.com>
+Date: Thu, 11 Jun 2026 17:02:44 +0800
+Subject: [PATCH 01/43] feat(smap): add per-page cold-period counter via page
+ flags
+
+Repurpose 4 bits of LAST_CPUPID in page->flags to store a
+consecutive-cold-period counter (0-15, saturating). Updated at end of
+each scan period in process_scan_results() only.
+---
+ plugins/smap/src/drivers/accessed_bit.c    | 99 ++++++++++++++++------
+ plugins/smap/src/drivers/smap_page_flags.h | 89 +++++++++++++++++++
+ 2 files changed, 162 insertions(+), 26 deletions(-)
+ create mode 100644 plugins/smap/src/drivers/smap_page_flags.h
+
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index 2119c66..3d68fa8 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -34,6 +34,7 @@
+ #include "access_pid.h"
+ #include "access_mmu.h"
+ #include "access_tracking.h"
++#include "smap_page_flags.h"
+ #include "accessed_bit.h"
+ 
+ #define DECIMAL 10
+@@ -366,17 +367,11 @@ static inline int get_numa_id_by_paddr(phys_addr_t paddr)
+ 	return page_to_nid(page);
+ }
+ 
+-static void actc_data_update(int nid, u64 pa_index)
+-{
+-	struct access_tracking_dev *adev = get_access_tracking_dev(nid);
+-
+-	if (unlikely(!adev || pa_index >= adev->page_count))
+-		return;
+-	if (!adev->is_hist)
+-		adev->access_bit_actc_data[pa_index]++;
+-}
+-
+-static void actc_data_add_fast(phys_addr_t paddr, u32 page_size)
++/*
++ * Common lookup: resolve paddr → &actc_data[pa_index].
++ * Returns NULL for non-local, non-tracked, or histogram pages.
++ */
++static actc_t *actc_data_lookup_entry(phys_addr_t paddr, u32 page_size)
+ {
+ 	struct access_tracking_dev *adev;
+ 	int ret, nid;
+@@ -384,23 +379,31 @@ static void actc_data_add_fast(phys_addr_t paddr, u32 page_size)
+ 
+ 	nid = get_numa_id_by_paddr(paddr);
+ 	if (unlikely(nid == NUMA_NO_NODE))
+-		return;
++		return NULL;
+ 
+-	if (nid < nr_local_numa) {
++	if (nid < nr_local_numa)
+ 		ret = calc_paddr_acidx_acpi_known_nid(paddr, nid, &pa_index,
+ 						      page_size);
+-	} else {
++	else
+ 		ret = calc_paddr_acidx_iomem_known_nid(paddr, nid, &pa_index,
+ 						       page_size);
+-	}
+ 
+ 	if (unlikely(ret))
+-		return;
++		return NULL;
+ 
+ 	adev = get_access_tracking_dev(nid);
++	if (unlikely(!adev || pa_index >= adev->page_count || adev->is_hist))
++		return NULL;
++
++	return &adev->access_bit_actc_data[pa_index];
++}
++
++static void actc_data_update(int nid, u64 pa_index)
++{
++	struct access_tracking_dev *adev = get_access_tracking_dev(nid);
++
+ 	if (unlikely(!adev || pa_index >= adev->page_count))
+ 		return;
+-
+ 	if (!adev->is_hist)
+ 		adev->access_bit_actc_data[pa_index]++;
+ }
+@@ -414,6 +417,8 @@ static int hva_to_hpa_hugetlb(struct kvm *kvm, u64 host_va,
+ 	pte_t *ptep;
+ 	pte_t pte;
+ 	phys_addr_t paddr;
++	actc_t *entry = NULL;
++	struct page *page;
+ 
+ 	if (!kvm)
+ 		return -EINVAL;
+@@ -425,9 +430,8 @@ static int hva_to_hpa_hugetlb(struct kvm *kvm, u64 host_va,
+ 		return -EINVAL;
+ 
+ 	ptep = huge_pte_offset(kvm->mm, host_va & hmask, sz);
+-	if (!ptep) {
++	if (!ptep)
+ 		return -EFAULT;
+-	}
+ 
+ 	pte = smap_huge_ptep_get(ptep);
+ 	if (!pte_present(pte)) {
+@@ -436,11 +440,33 @@ static int hva_to_hpa_hugetlb(struct kvm *kvm, u64 host_va,
+ 	}
+ 
+ 	paddr = PFN_PHYS(pte_pfn(pte));
+-	if (is_young)
+-		actc_data_add_fast(paddr, g_pagesize_huge);
+ 
+-	if (access_pid_cur_last_scanning(ap))
++	/*
++	 * Resolve actc_data once so we can reuse the entry for both
++	 * access recording and end-of-period cold-period update.
++	 */
++	if (is_young || access_pid_cur_last_scanning(ap))
++		entry = actc_data_lookup_entry(paddr, g_pagesize_huge);
++
++	if (is_young && entry)
++		(*entry)++;
++
++	if (access_pid_cur_last_scanning(ap)) {
+ 		add_to_bm_huge(host_va, paddr, ap);
++		/*
++		 * End of period: update cold-period counter from
++		 * accumulated actc_data.
++		 */
++		if (entry) {
++			page = pfn_to_online_page(PHYS_PFN(paddr));
++			if (page) {
++				if (*entry > 0)
++					smap_page_cold_periods_reset(page);
++				else
++					smap_page_cold_periods_inc(page);
++			}
++		}
++	}
+ 
+ 	return 0;
+ }
+@@ -1353,6 +1379,8 @@ static const struct mm_walk_ops pte_range_ops = {
+ 
+ static void process_scan_results(struct pte_walk *pte_walk)
+ {
++	struct access_tracking_dev *adev;
++	struct page *page;
+ 	u64 i, pa_idx;
+ 	int ret;
+ 	bool is_last_scan;
+@@ -1364,6 +1392,9 @@ static void process_scan_results(struct pte_walk *pte_walk)
+ 
+ 	for (i = 0; i < pte_walk->scan_result_cnt; i++) {
+ 		struct scan_result_entry *entry = &pte_walk->scan_results[i];
++
++		cond_resched();
++
+ 		if (entry->nid < nr_local_numa)
+ 			ret = calc_paddr_acidx_acpi_known_nid(
+ 				entry->paddr, entry->nid, &pa_idx, PAGE_SIZE);
+@@ -1374,10 +1405,26 @@ static void process_scan_results(struct pte_walk *pte_walk)
+ 			continue;
+ 		if (entry->hot)
+ 			actc_data_update(entry->nid, pa_idx);
+-		if (is_last_scan)
+-			add_to_bm_page_fast(entry->paddr, entry->nid, pa_idx,
+-					    pte_walk->ap);
+-		cond_resched();
++		if (!is_last_scan)
++			continue;
++
++		add_to_bm_page_fast(entry->paddr, entry->nid, pa_idx,
++				    pte_walk->ap);
++		/*
++		 * End of period: update cold-period counter from
++		 * accumulated actc_data (reuse already-computed pa_idx).
++		 */
++		adev = get_access_tracking_dev(entry->nid);
++		if (!adev || pa_idx >= adev->page_count || adev->is_hist)
++			continue;
++
++		page = pfn_to_online_page(PHYS_PFN(entry->paddr));
++		if (!page)
++			continue;
++		if (adev->access_bit_actc_data[pa_idx] > 0)
++			smap_page_cold_periods_reset(page);
++		else
++			smap_page_cold_periods_inc(page);
+ 	}
+ }
+ 
+diff --git a/plugins/smap/src/drivers/smap_page_flags.h b/plugins/smap/src/drivers/smap_page_flags.h
+new file mode 100644
+index 0000000..fb90c7f
+--- /dev/null
++++ b/plugins/smap/src/drivers/smap_page_flags.h
+@@ -0,0 +1,89 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (c) Huawei Technologies Co., Ltd. 2024-2024. All rights reserved.
++ * Description: SMAP page->flags helpers for cold-period tracking
++ *
++ * On aarch64 the LAST_CPUPID field in page->flags is unused when NUMA
++ * balancing is disabled. We repurpose the least-significant 4 bits to
++ * store a consecutive-cold-period counter.
++ */
++
++#ifndef _SRC_SMAP_PAGE_FLAGS_H
++#define _SRC_SMAP_PAGE_FLAGS_H
++
++#include <linux/bits.h>
++#include <linux/compiler.h> /* for READ_ONCE */
++#include <linux/mmzone.h> /* for NR_PAGEFLAGS, SECTIONS/NODES/ZONES_WIDTH */
++#include <asm/cmpxchg.h>
++
++#define SMAP_COLD_PERIOD_WIDTH 4
++#define SMAP_COLD_PERIOD_MASK ((1UL << SMAP_COLD_PERIOD_WIDTH) - 1)
++#define SMAP_COLD_PERIOD_MAX 16
++
++/**
++ * smap_page_cold_periods_get - Read the consecutive-cold-period counter
++ *
++ * @page: target page
++ *
++ * Returns a value 0..14: how many consecutive periods (ending with the
++ * most-recently-completed period) this page had zero access frequency.
++ *
++ * SMAP_COLD_PERIOD_MASK (0xF, all-1s) is reserved as a sentinel meaning
++ * "uninitialized" — the kernel sets LAST_CPUPID to all-1s when a page is
++ * freed, so returning 0xF would falsely flag a freshly-allocated page as
++ * extremely cold.  See smap_page_cold_periods_inc for details.
++ */
++static inline u8 smap_page_cold_periods_get(struct page *page)
++{
++	u8 cnt = (page->flags >> LAST_CPUPID_PGSHIFT) & SMAP_COLD_PERIOD_MASK;
++
++	/* all-1s (0xF) = kernel-initialised / never touched by SMAP → 0 */
++	return (cnt == SMAP_COLD_PERIOD_MASK) ? 0 : cnt;
++}
++
++/**
++ * smap_page_cold_periods_reset - Reset the cold-period counter to 0
++ *
++ * @page: target page
++ *
++ * Call when the page was accessed during the current period.
++ */
++static inline void smap_page_cold_periods_reset(struct page *page)
++{
++	unsigned long old, new;
++
++	do {
++		old = READ_ONCE(page->flags);
++		new = old;
++		new &= ~(LAST_CPUPID_MASK << LAST_CPUPID_PGSHIFT);
++	} while (unlikely(cmpxchg(&page->flags, old, new) != old));
++}
++
++/**
++ * smap_page_cold_periods_inc - Increment the cold-period counter (saturating)
++ *
++ * @page: target page
++ *
++ * Call at period end when the page was NOT accessed the entire period.
++ */
++static inline void smap_page_cold_periods_inc(struct page *page)
++{
++	unsigned long old, new;
++	u8 cnt;
++
++	do {
++		old = READ_ONCE(page->flags);
++		cnt = (old >> LAST_CPUPID_PGSHIFT) & SMAP_COLD_PERIOD_MASK;
++		if (cnt == SMAP_COLD_PERIOD_MASK)
++			cnt = 1;
++		else if (cnt < SMAP_COLD_PERIOD_MAX)
++			cnt++;
++		new = old;
++		new &= ~(LAST_CPUPID_MASK << LAST_CPUPID_PGSHIFT);
++		new |= ((unsigned long)cnt<< LAST_CPUPID_PGSHIFT);
++	} while (unlikely(cmpxchg(&page->flags, old, new) != old));
++
++	return cnt;
++}
++
++#endif /* _SRC_SMAP_PAGE_FLAGS_H */
+-- 
+2.54.0.windows.1
+

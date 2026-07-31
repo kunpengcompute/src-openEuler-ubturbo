@@ -1,0 +1,82 @@
+From 8a1d64c54fe89d877b4f9f316aa2ad20f4243206 Mon Sep 17 00:00:00 2001
+From: discrete_brain <discrete_brain@163.com>
+Date: Fri, 24 Jul 2026 10:52:58 +0800
+Subject: [PATCH 41/43] fix(smap): fix scan statistic bug
+
+---
+ plugins/smap/src/drivers/access_pid.c      |  1 +
+ plugins/smap/src/drivers/access_pid.h      | 11 +++++++++++
+ plugins/smap/src/drivers/access_tracking.c |  2 +-
+ plugins/smap/src/drivers/accessed_bit.c    |  2 ++
+ 4 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/plugins/smap/src/drivers/access_pid.c b/plugins/smap/src/drivers/access_pid.c
+index 8edf97a..ce78bc7 100644
+--- a/plugins/smap/src/drivers/access_pid.c
++++ b/plugins/smap/src/drivers/access_pid.c
+@@ -1334,6 +1334,7 @@ void clean_last_ap_data(struct access_pid *ap)
+ 		ap->white_list_bm[i] = NULL;
+ 		ap->bm_len[i] = 0;
+ 		ap->page_num[i] = 0;
++		ap->scan_num[i] = 0;
+ 	}
+ 	if (ap->info.mapping) {
+ 		vfree(ap->info.mapping);
+diff --git a/plugins/smap/src/drivers/access_pid.h b/plugins/smap/src/drivers/access_pid.h
+index 499cbc2..2a73214 100644
+--- a/plugins/smap/src/drivers/access_pid.h
++++ b/plugins/smap/src/drivers/access_pid.h
+@@ -80,6 +80,7 @@ struct access_pid {
+ 	struct completion work_done;
+ 	u32 scan_count[SMAP_MAX_NUMNODES];
+ 	size_t page_num[SMAP_MAX_NUMNODES];
++	size_t scan_num[SMAP_MAX_NUMNODES];
+ 	size_t bm_len[SMAP_MAX_NUMNODES];
+ 	unsigned long *paddr_bm[SMAP_MAX_NUMNODES];
+ 	unsigned long *white_list_bm[SMAP_MAX_NUMNODES];
+@@ -179,6 +180,16 @@ static inline size_t calc_process_page_number(struct access_pid *ap)
+ 	return ret_len;
+ }
+ 
++static inline size_t calc_process_scan_number(struct access_pid *ap)
++{
++	int i;
++	size_t ret_len = 0;
++	for (i = 0; i < SMAP_MAX_NUMNODES; i++) {
++		ret_len += ap->scan_num[i];
++	}
++	return ret_len;
++}
++
+ static inline bool access_pid_is_scanning(pid_t pid)
+ {
+ 	struct access_pid *ap = find_access_pid(pid);
+diff --git a/plugins/smap/src/drivers/access_tracking.c b/plugins/smap/src/drivers/access_tracking.c
+index e0a9c50..36bba3e 100644
+--- a/plugins/smap/src/drivers/access_tracking.c
++++ b/plugins/smap/src/drivers/access_tracking.c
+@@ -575,7 +575,7 @@ static void work_func(struct work_struct *work)
+ 
+ 	if (ap->type == NORMAL_SCAN && ap->cur_times >= ap->ntimes) {
+ 		ap->total_scanned_pages +=
+-			calc_process_page_number(ap) * ap->ntimes;
++			calc_process_scan_number(ap) * ap->ntimes;
+ 	}
+ 
+ 	if (ap->cur_times < ap->ntimes) {
+diff --git a/plugins/smap/src/drivers/accessed_bit.c b/plugins/smap/src/drivers/accessed_bit.c
+index e364da1..ac43e73 100644
+--- a/plugins/smap/src/drivers/accessed_bit.c
++++ b/plugins/smap/src/drivers/accessed_bit.c
+@@ -702,6 +702,8 @@ static void smap_handle_last_scan_4k(u64 pa, struct page *page, bool young,
+ 				     struct access_pid *ap)
+ {
+ 	int nid = page_to_nid(page);
++
++	ap->scan_num[nid]++;
+ 	/*
+ 	 * End of period: update cold-period counter and
+ 	 * record in bitmap.  A page successfully enqueued
+-- 
+2.54.0.windows.1
+
