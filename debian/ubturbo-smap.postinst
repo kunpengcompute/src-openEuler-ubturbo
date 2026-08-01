@@ -14,7 +14,9 @@ case "$1" in
 
         # Register the external module directories so depmod can find
         # the modules shipped outside /lib/modules/$(uname -r).
-        # The kernel version pattern follows the spec (6.6.0-*).
+        # Ensure /etc/depmod.d exists (kmod may not have created it on
+        # minimal systems); otherwise the redirect below fails under set -e.
+        install -d -m 0755 /etc/depmod.d
         echo "external 6.6.0-* ${SMAP_DIR}"   > /etc/depmod.d/smap.conf
         echo "external 6.6.0-* ${UCACHE_DIR}" > /etc/depmod.d/ucache.conf
         depmod -a 2>/dev/null || true
