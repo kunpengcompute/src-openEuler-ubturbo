@@ -56,8 +56,9 @@ case "$1" in
             else
                 target=/usr/lib/aarch64-linux-gnu/libubturbo_client.so
             fi
+            install -d -m 0755 "$(dirname "$target")"
             install -m 0755 "$PROGRAM_LIB_DIR/libubturbo_client.so" "$target"
-            chown "$SYSTEM_USER:$SYSTEM_GROUP" "$target"
+            chown "$SYSTEM_USER:$SYSTEM_GROUP" "$target" 2>/dev/null || true
         fi
 
         # Install the privileged helper and its sudoers fragment. The
