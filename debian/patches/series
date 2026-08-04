@@ -1,2 +1,4 @@
 remove-openEuler-release-dependency.patch
 adapt-to-different-kernels.patch
+find-libboundscheck-via-find-library.patch
+fix-missing-cstdint-include.patch

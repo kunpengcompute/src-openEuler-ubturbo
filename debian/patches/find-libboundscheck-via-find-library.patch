@@ -1,0 +1,45 @@
+Description: Find libboundscheck via find_library instead of hardcoded /usr/lib64
+ The upstream CMakeLists hardcodes /usr/lib64/libboundscheck.so, which is
+ the openEuler/RPM location. On Debian the libboundscheck-dev package
+ installs the shared object under the multiarch directory
+ /usr/lib/<triplet>/ (e.g. /usr/lib/aarch64-linux-gnu/), so the hardcoded
+ absolute path is missing at link time and ninja aborts with
+ "missing and no known rule to make it".
+ .
+ Replace the hardcoded path with find_library(), which searches the
+ standard library search paths (including the multiarch directory) and
+ yields the correct absolute path on both RPM- and Debian-based systems.
+Author: Debian Packager
+Last-Update: 2026-07-29
+
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -34,7 +34,11 @@
+     ${CMAKE_CURRENT_LIST_DIR}/sdk/include
+ )
+ 
+-set(BOUNDSCHECK_LIB /usr/lib64/libboundscheck.so)
++# Locate libboundscheck via the standard search paths instead of a
++# hardcoded /usr/lib64 path. On Debian the library lives under the
++# multiarch directory (e.g. /usr/lib/aarch64-linux-gnu/).
++find_library(BOUNDSCHECK_LIB boundscheck)
++message(STATUS "libboundscheck: ${BOUNDSCHECK_LIB}")
+ 
+ # 链接库到可执行文件
+ target_link_libraries(ubturbo_client PRIVATE
+--- a/plugins/rmrs/src/ubturbo_plugin/CMakeLists.txt
++++ b/plugins/rmrs/src/ubturbo_plugin/CMakeLists.txt
+@@ -45,7 +45,11 @@
+     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+ )
+ 
+-set(BOUNDSCHECK_LIB /usr/lib64/libboundscheck.so)
++# Locate libboundscheck via the standard search paths instead of a
++# hardcoded /usr/lib64 path. On Debian the library lives under the
++# multiarch directory (e.g. /usr/lib/aarch64-linux-gnu/).
++find_library(BOUNDSCHECK_LIB boundscheck)
++message(STATUS "libboundscheck: ${BOUNDSCHECK_LIB}")
+ target_link_libraries(rmrs_ubturbo_plugin PRIVATE ${BOUNDSCHECK_LIB})
+ target_include_directories(rmrs_ubturbo_plugin PRIVATE ${LIBVIRT_INCLUDE_DIRS})
+ target_link_libraries(rmrs_ubturbo_plugin PRIVATE ${LIBVIRT_LIBRARIES})
+
