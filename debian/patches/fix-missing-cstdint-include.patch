@@ -1,0 +1,64 @@
+Description: Add missing #include <cstdint> in headers using uint32_t/uint64_t
+Author: Debian Packager
+Last-Update: 2026-07-29
+
+--- a/src/sdk/turbo_ucache_interface.h
++++ b/src/sdk/turbo_ucache_interface.h
+@@ -16,6 +16,7 @@
+ #include <sstream>
+ #include <string>
+ #include <vector>
++#include <cstdint>
+ 
+ namespace turbo::ucache {
+ 
+--- a/plugins/rmrs/src/include/numa_info.h
++++ b/plugins/rmrs/src/include/numa_info.h
+@@ -15,6 +15,7 @@
+ #include <sstream>
+ #include <string>
+ #include <vector>
++#include <cstdint>
+ 
+ namespace mempooling {
+ 
+--- a/plugins/rmrs/src/include/vm_info.h
++++ b/plugins/rmrs/src/include/vm_info.h
+@@ -15,6 +15,7 @@
+ #include <sstream>
+ #include <string>
+ #include <vector>
++#include <cstdint>
+ 
+ namespace mempooling {
+ 
+--- a/plugins/rmrs/src/ubturbo_plugin/serialization/rmrs_json_helper.h
++++ b/plugins/rmrs/src/ubturbo_plugin/serialization/rmrs_json_helper.h
+@@ -15,6 +15,7 @@
+ #include <map>
+ #include <set>
+ #include <string>
++#include <cstdint>
+ 
+ namespace rmrs::serialization {
+ class RmrsJsonHelper {
+--- a/plugins/ucache/src/common/ucache_file_util.h
++++ b/plugins/ucache/src/common/ucache_file_util.h
+@@ -15,6 +15,7 @@
+ 
+ #include <string>
+ #include <vector>
++#include <cstdint>
+ 
+ namespace turbo::ucache {
+ using std::string;
+--- a/plugins/rmrs/src/include/rmrs_serialize.h
++++ b/plugins/rmrs/src/include/rmrs_serialize.h
+@@ -23,6 +23,7 @@
+ #include <unordered_set>
+ #include <vector>
+ #include "securec.h"
++#include <cstdint>
+ 
+ namespace rmrs::serialize {
+ 
