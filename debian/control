@@ -27,7 +27,7 @@ Homepage: https://gitee.com/openeuler/ubturbo
 Package: ubturbo-rmrs
 Architecture: arm64
 Depends: ${misc:Depends}, ${shlibs:Depends},
-         coreutils, ubturbo-smap (= ${binary:Version})
+         ubturbo-smap (= ${binary:Version})
 Recommends: ubturbo-ucache (= ${binary:Version})
 Description: UB Turbo resource management framework
  This package contains the ubturbo daemon (ub_turbo_exec),

@@ -1,0 +1,10 @@
+# ubturbo-smap: lintian overrides
+#
+# The following lintian tags are emitted by design because the Debian
+# packaging mirrors the upstream RPM spec (ubturbo.spec). They are reviewed
+# and considered acceptable.
+
+# The upstream RPM spec installs the udev rule to /etc/udev/rules.d/.
+# Migrating to /lib/udev/rules.d/ would deviate from the RPM spec and
+# the upstream install scripts.
+ubturbo-smap: udev-rule-in-etc

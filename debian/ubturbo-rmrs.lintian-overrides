@@ -1,0 +1,11 @@
+# ubturbo-rmrs: lintian overrides
+#
+# The following lintian tags are emitted by design because the Debian
+# packaging mirrors the upstream RPM spec (ubturbo.spec). They are reviewed
+# and considered acceptable.
+
+# The upstream RPM spec installs everything under /opt/ubturbo/. This path is
+# hardcoded in the daemon (ub_turbo_exec), the IPC socket path, config loading,
+# and the systemd service unit. Migrating to FHS standard paths would require
+# coordinated changes across the entire upstream codebase.
+ubturbo-rmrs: dir-or-file-in-opt
