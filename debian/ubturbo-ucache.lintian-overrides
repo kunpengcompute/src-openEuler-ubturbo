@@ -1,0 +1,15 @@
+# ubturbo-ucache: lintian overrides
+#
+# The following lintian tags are emitted by design because the Debian
+# packaging mirrors the upstream RPM spec (ubturbo.spec). They are reviewed
+# and considered acceptable.
+
+# The upstream RPM spec installs everything under /opt/ubturbo/. This path is
+# hardcoded in the daemon and plugin loading logic. Migrating to FHS standard
+# paths would require coordinated changes across the entire upstream codebase.
+ubturbo-ucache: dir-or-file-in-opt
+
+# The upstream RPM spec sets %global __strip /bin/true to preserve debug
+# symbols. Stripping is disabled in debian/rules (override_dh_strip) to
+# match this behavior.
+ubturbo-ucache: unstripped-binary-or-object
