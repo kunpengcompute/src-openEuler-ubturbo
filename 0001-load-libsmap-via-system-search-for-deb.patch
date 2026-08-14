@@ -1,0 +1,60 @@
+Description: Load libsmap.so via dynamic linker search instead of hardcoded /usr/lib64
+ The upstream sources hardcode the absolute path /usr/lib64/libsmap.so when
+ loading libsmap.so with dlopen(), which is the openEuler/RPM location. On
+ Debian the shared object is installed under the multiarch directory
+ /usr/lib/<triplet>/ (e.g. /usr/lib/aarch64-linux-gnu/), so the hardcoded
+ absolute path is missing and dlopen() fails at runtime.
+ .
+ Pass only the soname "libsmap.so" to dlopen() so the dynamic linker
+ searches the standard library search paths (including the multiarch
+ directory). Also drop the lstat()/S_ISLNK symlink check in
+ SmapModule::Init(), which is meaningless for a bare soname and would
+ stat() the wrong (cwd-relative) path.
+Author: Debian Packager
+Last-Update: 2026-08-13
+
+--- a/ubturbo/plugins/rmrs/src/ubturbo_plugin/common/smap/rmrs_smap_module.cpp
++++ b/ubturbo/plugins/rmrs/src/ubturbo_plugin/common/smap/rmrs_smap_module.cpp
+@@ -10,8 +10,6 @@
+  * See the Mulan PSL v2 for more details.
+  */
+ #include "rmrs_smap_module.h"
+-#include <sys/stat.h>
+-#include <unistd.h>
+ #include "rmrs_config.h"
+ #include "turbo_conf.h"
+ #include "turbo_logger.h"
+@@ -33,11 +31,6 @@ SmapQueryProcessConfigFunc SmapModule::smapQueryProcessConfigFunc = nullptr;
+ 
+ RmrsResult SmapModule::Init()
+ {
+-    struct stat sb;
+-    if (lstat(SMAP_LIBSMAPSO_PATH_RMRS, &sb) == 0 && S_ISLNK(sb.st_mode)) {
+-        UBTURBO_LOG_ERROR(RMRS_MODULE_NAME, RMRS_MODULE_CODE) << "[RmrsSmapModule] SMAP path is a symbolic link.";
+-        return RMRS_ERROR;
+-    }
+     smapHandle = dlopen(SMAP_LIBSMAPSO_PATH_RMRS, RTLD_LAZY);
+     if (smapHandle == nullptr) {
+         UBTURBO_LOG_ERROR(RMRS_MODULE_NAME, RMRS_MODULE_CODE) << "[RmrsSmapModule] Load libsmap.so failed.";
+--- a/ubturbo/plugins/rmrs/src/ubturbo_plugin/common/smap/rmrs_smap_module.h
++++ b/ubturbo/plugins/rmrs/src/ubturbo_plugin/common/smap/rmrs_smap_module.h
+@@ -17,7 +17,7 @@
+ #include "rmrs_error.h"
+ 
+ namespace rmrs::smap {
+-const char *const SMAP_LIBSMAPSO_PATH_RMRS = "/usr/lib64/libsmap.so";
++const char *const SMAP_LIBSMAPSO_PATH_RMRS = "libsmap.so";
+ const int RUN_MODE_RMRS = 1;
+ const int SMAP_RATIO_RMRS = 25;
+ const int MAX_NR_MIGOUT_RMRS = 40;
+--- a/ubturbo/src/smap/server/turbo_module_smap.cpp
++++ b/ubturbo/src/smap/server/turbo_module_smap.cpp
+@@ -32,7 +32,7 @@ namespace turbo::smap {
+ 
+ const std::string FILE_NAME = "/dev/shm/ubturbo_page_type.dat";
+ 
+-constexpr const char *LIB_SMAP_PATH = "/usr/lib64/libsmap.so";
++constexpr const char *LIB_SMAP_PATH = "libsmap.so";
+ 
+ static void *g_smapHandler = nullptr;
+ static SmapMigrateOutFunc g_smapMigrateOut = nullptr;
