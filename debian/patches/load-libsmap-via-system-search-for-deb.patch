@@ -13,8 +13,8 @@ Description: Load libsmap.so via dynamic linker search instead of hardcoded /usr
 Author: Debian Packager
 Last-Update: 2026-08-13
 
---- a/ubturbo/plugins/rmrs/src/ubturbo_plugin/common/smap/rmrs_smap_module.cpp
-+++ b/ubturbo/plugins/rmrs/src/ubturbo_plugin/common/smap/rmrs_smap_module.cpp
+--- a/plugins/rmrs/src/ubturbo_plugin/common/smap/rmrs_smap_module.cpp
++++ b/plugins/rmrs/src/ubturbo_plugin/common/smap/rmrs_smap_module.cpp
 @@ -10,8 +10,6 @@
   * See the Mulan PSL v2 for more details.
   */
@@ -36,8 +36,8 @@ Last-Update: 2026-08-13
      smapHandle = dlopen(SMAP_LIBSMAPSO_PATH_RMRS, RTLD_LAZY);
      if (smapHandle == nullptr) {
          UBTURBO_LOG_ERROR(RMRS_MODULE_NAME, RMRS_MODULE_CODE) << "[RmrsSmapModule] Load libsmap.so failed.";
---- a/ubturbo/plugins/rmrs/src/ubturbo_plugin/common/smap/rmrs_smap_module.h
-+++ b/ubturbo/plugins/rmrs/src/ubturbo_plugin/common/smap/rmrs_smap_module.h
+--- a/plugins/rmrs/src/ubturbo_plugin/common/smap/rmrs_smap_module.h
++++ b/plugins/rmrs/src/ubturbo_plugin/common/smap/rmrs_smap_module.h
 @@ -17,7 +17,7 @@
  #include "rmrs_error.h"
  
@@ -47,8 +47,8 @@ Last-Update: 2026-08-13
  const int RUN_MODE_RMRS = 1;
  const int SMAP_RATIO_RMRS = 25;
  const int MAX_NR_MIGOUT_RMRS = 40;
---- a/ubturbo/src/smap/server/turbo_module_smap.cpp
-+++ b/ubturbo/src/smap/server/turbo_module_smap.cpp
+--- a/src/smap/server/turbo_module_smap.cpp
++++ b/src/smap/server/turbo_module_smap.cpp
 @@ -32,7 +32,7 @@ namespace turbo::smap {
  
  const std::string FILE_NAME = "/dev/shm/ubturbo_page_type.dat";
