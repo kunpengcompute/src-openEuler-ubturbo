@@ -55,7 +55,7 @@ Description: UCache userspace plugin for ubturbo
  (libucache_os_turbo_plugin.so) and its configuration file
  loaded by the ubturbo daemon.
 
-Package: ubturbo-devel
+Package: ubturbo-dev
 Section: libdevel
 Architecture: arm64
 Multi-Arch: same
