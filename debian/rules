@@ -131,20 +131,20 @@ override_dh_auto_install:
 	patchelf --set-rpath '$$ORIGIN/../lib' \
 		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/bin/ub_turbo_exec || true
 
-	# ---- ubturbo-devel ----
-	install -d -m 0755 $(CURDIR)/debian/ubturbo-devel/usr/include/ubturbo
+	# ---- ubturbo-dev ----
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-dev/usr/include/ubturbo
 	for h in turbo_conf.h turbo_def.h turbo_ipc_client.h turbo_ipc_server.h turbo_logger.h; do \
 		install -m 0644 $(CURDIR)/include/$$h \
-			$(CURDIR)/debian/ubturbo-devel/usr/include/ubturbo/ ; \
+			$(CURDIR)/debian/ubturbo-dev/usr/include/ubturbo/ ; \
 	done
 	install -m 0644 $(CURDIR)/src/sdk/include/turbo_serialize.h \
-		$(CURDIR)/debian/ubturbo-devel/usr/include/ubturbo/
+		$(CURDIR)/debian/ubturbo-dev/usr/include/ubturbo/
 	install -m 0644 $(CURDIR)/src/sdk/turbo_rmrs_interface.h \
-		$(CURDIR)/debian/ubturbo-devel/usr/include/ubturbo/
+		$(CURDIR)/debian/ubturbo-dev/usr/include/ubturbo/
 	install -m 0644 $(CURDIR)/src/sdk/turbo_ucache_interface.h \
-		$(CURDIR)/debian/ubturbo-devel/usr/include/ubturbo/
+		$(CURDIR)/debian/ubturbo-dev/usr/include/ubturbo/
 	install -m 0644 $(CURDIR)/src/smap/smap_interface.h \
-		$(CURDIR)/debian/ubturbo-devel/usr/include/ubturbo/
+		$(CURDIR)/debian/ubturbo-dev/usr/include/ubturbo/
 
 # No upstream test suite.
 override_dh_auto_test:
