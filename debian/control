@@ -27,7 +27,6 @@ Homepage: https://gitee.com/openeuler/ubturbo
 Package: ubturbo-rmrs
 Architecture: arm64
 Depends: ${misc:Depends}, ${shlibs:Depends},
-         libboundscheck,
          ubturbo-smap (= ${binary:Version})
 Recommends: ubturbo-ucache (= ${binary:Version})
 Description: UB Turbo resource management framework
@@ -40,8 +39,7 @@ Description: UB Turbo resource management framework
 
 Package: ubturbo-smap
 Architecture: arm64
-Depends: ${misc:Depends}, ${shlibs:Depends}, kmod,
-         libboundscheck
+Depends: ${misc:Depends}, ${shlibs:Depends}, kmod
 Description: SMAP driver and tiering kernel modules for ubturbo
  This package contains the SMAP driver kernel modules
  (smap_tracking_core, smap_access_tracking, smap_histogram_tracking,
