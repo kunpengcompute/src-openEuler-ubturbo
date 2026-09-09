@@ -94,7 +94,7 @@ This package contains the ubturbo framework developmemt kit
 
 %build
 #build ubdma
-cd %{_builddir}/ubturbo/plugins/ubdma/src && make -j`nproc` -C /lib/modules/6.6.*/build M=%{_builddir}/ubturbo/plugins/ubdma/src modules
+#cd %{_builddir}/ubturbo/plugins/ubdma/src && make -j`nproc` -C /lib/modules/6.6.*/build M=%{_builddir}/ubturbo/plugins/ubdma/src modules
 
 #build smap
 cd %{_builddir}
@@ -129,7 +129,7 @@ cd %{_builddir}/ubturbo/plugins/ucache && bash -x build.sh -c
 echo "########RPM_BUILD_ROOT=${RPM_BUILD_ROOT}"
 rm -rf ${RPM_BUILD_ROOT}
 mkdir -p -m755 ${RPM_BUILD_ROOT}/%{ub_dma_dir}
-%{__install} -b -m 0500 %{_builddir}/ubturbo/plugins/ubdma/src/ub_dma.ko ${RPM_BUILD_ROOT}/%{ub_dma_dir}
+#%{__install} -b -m 0500 %{_builddir}/ubturbo/plugins/ubdma/src/ub_dma.ko ${RPM_BUILD_ROOT}/%{ub_dma_dir}
 
 #install smap
 mkdir -p -m755 ${RPM_BUILD_ROOT}/%{smap_dir}
@@ -189,7 +189,7 @@ rm -rf ${RPM_BUILD_ROOT}
 %files
 
 %files ubdma
-%{ub_dma_dir}/ub_dma.ko
+#%{ub_dma_dir}/ub_dma.ko
 
 %files smap
 %defattr(-,ubturbo,ubturbo)
