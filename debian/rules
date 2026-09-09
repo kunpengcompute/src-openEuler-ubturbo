@@ -3,68 +3,37 @@
 export DH_VERBOSE = 1
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all,-format
 
-# Kernel version/build tree used for out-of-tree module compilation.
-#
-# Override KVER from the environment or make command line:
-#   KVER=6.6.95 dpkg-buildpackage ...
-#   make -f debian/rules binary KVER=6.6.95
-#
-# When KVER is unset, auto-select the newest /lib/modules/<ver>/build symlink
-# on the host. Filtering on the "build" symlink avoids picking up non-kernel
-# directories (smap, ucache) that this very package installs under
-# /lib/modules. Use Make patsubst (not shell prefix stripping) to extract
-# <ver> so the "/build" suffix is removed cleanly.
-ifeq ($(KVER),)
-KDIR := $(shell ls -d /lib/modules/*/build 2>/dev/null | sort -V | tail -n 1)
-KVER := $(patsubst /lib/modules/%/build,%,$(KDIR))
-else
-KDIR := /lib/modules/$(KVER)/build
-endif
-
 NUMJOBS = $(shell nproc)
 
+# DKMS source tree staged for ubturbo-dkms (built on target by DKMS).
+DKMS_NAME := ubturbo-dkms
+DKMS_VERSION := 1.0.0
+DKMS_SRC := $(CURDIR)/debian/tmp/usr/src/$(DKMS_NAME)-$(DKMS_VERSION)
+
 %:
-	dh $@
+	dh $@ --with dkms
 
 # ---------------------------------------------------------------------------
-# Build all components defined in ubturbo.spec: smap, ucache, rmrs.
-# (ubdma is intentionally not built; its kernel module is not shipped.)
+# Build userspace components only: smap userspace lib, ucache plugin, rmrs.
+# Kernel modules (smap drivers/tiering/ucache) are NOT compiled at package
+# build time anymore; they are shipped as source in ubturbo-dkms and built on
+# the target machine via DKMS on install and on every kernel upgrade.
 # Quilt patches from debian/patches/series are applied at source preparation
 # time (see build-deb.sh -> dpkg-source --before-build), so rules does not
 # touch them.
 # ---------------------------------------------------------------------------
 override_dh_auto_build:
-	@echo "==> Building with kernel $(KVER) (KDIR=$(KDIR))"
-	@if [ -z "$(KDIR)" ] || [ ! -d "$(KDIR)" ]; then \
-		echo "E: No usable kernel build tree found (KDIR='$(KDIR)')." >&2; \
-		echo "E: Install the matching linux-headers-* package, or pass KVER=<ver>." >&2; \
-		exit 1; \
-	fi
-
-	# 1. smap driver kernel modules
-	cd $(CURDIR)/plugins/smap/src/drivers && \
-		make -j$(NUMJOBS) KERNEL_VERSION=velinux -C $(KDIR) M=$(CURDIR)/plugins/smap/src/drivers modules
-	# smap tiering depends on drivers' Module.symvers
-	install -d $(CURDIR)/plugins/smap/src/tiering/depends
-	cp $(CURDIR)/plugins/smap/src/drivers/Module.symvers \
-		$(CURDIR)/plugins/smap/src/tiering/depends/
-	cd $(CURDIR)/plugins/smap/src/tiering && \
-		make -j$(NUMJOBS) KERNEL_VERSION=velinux -C $(KDIR) M=$(CURDIR)/plugins/smap/src/tiering modules
-	# smap ucache kernel module
-	cd $(CURDIR)/plugins/smap/src/ucache && \
-		make -j$(NUMJOBS) -C $(KDIR) M=$(CURDIR)/plugins/smap/src/ucache modules
-
-	# 2. smap userspace (libsmap.so) via cmake. "make install" must run so
+	# 1. smap userspace (libsmap.so) via cmake. "make install" must run so
 	#    that libsmap.so is placed under output/smap/lib/ (the path referenced
 	#    by the install step below). Mirrors ubturbo.spec %build for smap.
 	cd $(CURDIR)/plugins/smap && \
 		cmake -DCMAKE_BUILD_TYPE=Release . && \
 		make -j$(NUMJOBS) install
 
-	# 3. rmrs main framework
+	# 2. rmrs main framework
 	cd $(CURDIR) && bash -x build.sh -c
 
-	# 4. ucache userspace plugin
+	# 3. ucache userspace plugin
 	cd $(CURDIR)/plugins/ucache && bash -x build.sh -c
 
 # ---------------------------------------------------------------------------
@@ -75,21 +44,23 @@ override_dh_auto_build:
 override_dh_auto_install:
 	dh_auto_install
 
-	# ---- ubturbo-smap ----
-	install -d -m 0755 $(CURDIR)/debian/ubturbo-smap/lib/modules/smap
-	install -d -m 0755 $(CURDIR)/debian/ubturbo-smap/lib/modules/ucache
+	# ---- ubturbo-dkms: stage kernel module SOURCE for DKMS ----
+	# Modules are compiled on target by DKMS. The top-level Makefile
+	# (from debian/ubturbo-dkms.makefile) drives drivers -> tiering -> ucache.
+	install -d -m 0755 $(DKMS_SRC)/drivers
+	install -d -m 0755 $(DKMS_SRC)/tiering
+	install -d -m 0755 $(DKMS_SRC)/ucache
+	cp -a $(CURDIR)/plugins/smap/src/drivers/. $(DKMS_SRC)/drivers/
+	cp -a $(CURDIR)/plugins/smap/src/tiering/. $(DKMS_SRC)/tiering/
+	cp -a $(CURDIR)/plugins/smap/src/ucache/.  $(DKMS_SRC)/ucache/
+	install -m 0644 $(CURDIR)/debian/ubturbo-dkms.makefile $(DKMS_SRC)/Makefile
+	# Drop any stray prebuilt artifacts from the staged source tree.
+	find $(DKMS_SRC) -type f \( -name '*.ko' -o -name '*.o' -o -name '*.mod' \
+		-o -name '*.mod.c' -o -name 'Module.symvers' -o -name 'modules.order' \) -delete
+
+	# ---- ubturbo-smap (userspace only now) ----
 	install -d -m 0755 $(CURDIR)/debian/ubturbo-smap/usr/lib/aarch64-linux-gnu
 	install -d -m 0755 $(CURDIR)/debian/ubturbo-smap/etc/udev/rules.d
-	install -m 0500 $(CURDIR)/plugins/smap/src/drivers/smap_tracking_core.ko \
-		$(CURDIR)/debian/ubturbo-smap/lib/modules/smap/
-	install -m 0500 $(CURDIR)/plugins/smap/src/drivers/smap_access_tracking.ko \
-		$(CURDIR)/debian/ubturbo-smap/lib/modules/smap/
-	install -m 0500 $(CURDIR)/plugins/smap/src/drivers/smap_histogram_tracking.ko \
-		$(CURDIR)/debian/ubturbo-smap/lib/modules/smap/
-	install -m 0500 $(CURDIR)/plugins/smap/src/tiering/smap_tiering.ko \
-		$(CURDIR)/debian/ubturbo-smap/lib/modules/smap/
-	install -m 0500 $(CURDIR)/plugins/smap/src/ucache/ucache.ko \
-		$(CURDIR)/debian/ubturbo-smap/lib/modules/ucache/
 	install -m 0644 $(CURDIR)/plugins/smap/output/smap/lib/libsmap.so \
 		$(CURDIR)/debian/ubturbo-smap/usr/lib/aarch64-linux-gnu/libsmap.so
 	install -m 0640 $(CURDIR)/plugins/smap/99-smap.rules \
