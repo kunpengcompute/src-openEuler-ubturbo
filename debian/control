@@ -20,9 +20,20 @@ Build-Depends: debhelper-compat (= 13),
                libssl-dev,
                libncurses-dev,
                linux-headers-generic [arm64] | linux-headers [arm64],
-               kmod
+               kmod,
+               dkms,
+               dh-sequence-dkms
 Rules-Requires-Root: binary-targets
 Homepage: https://gitee.com/openeuler/ubturbo
+
+Package: ubturbo-dkms
+Architecture: arm64
+Depends: ${misc:Depends}, dkms
+Description: SMAP and ucache kernel modules for ubturbo (DKMS)
+ This package ships the source of the SMAP driver kernel modules
+ (smap_tracking_core, smap_access_tracking, smap_histogram_tracking,
+ smap_tiering) and the ucache kernel module. The modules are built on
+ the target machine via DKMS on install and on every kernel upgrade.
 
 Package: ubturbo-rmrs
 Architecture: arm64
@@ -39,13 +50,12 @@ Description: UB Turbo resource management framework
 
 Package: ubturbo-smap
 Architecture: arm64
-Depends: ${misc:Depends}, ${shlibs:Depends}, kmod
-Description: SMAP driver and tiering kernel modules for ubturbo
- This package contains the SMAP driver kernel modules
- (smap_tracking_core, smap_access_tracking, smap_histogram_tracking,
- smap_tiering) and the ucache kernel module, along with the
- userspace libsmap.so library and the udev rule that governs
- device permissions.
+Depends: ${misc:Depends}, ${shlibs:Depends}, kmod, ubturbo-dkms (= ${binary:Version})
+Description: SMAP userspace library and udev rule for ubturbo
+ This package contains the SMAP userspace library (libsmap.so) and the
+ udev rule that governs device permissions. The kernel modules
+ themselves are provided by ubturbo-dkms and built on the target via
+ DKMS.
 
 Package: ubturbo-ucache
 Architecture: arm64

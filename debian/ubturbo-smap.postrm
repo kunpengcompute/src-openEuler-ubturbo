@@ -1,21 +1,12 @@
 #!/bin/sh
 set -e
 
-# ubturbo-smap postrm -- clean up external module directories and depmod
-# configuration after the package is removed.
-# Mirrors RPM spec %postun smap.
+# ubturbo-smap postrm -- clean up the udev rule it shipped.
+# Kernel modules and their /lib/modules dirs are owned by ubturbo-dkms/DKMS.
 
 case "$1" in
     remove|purge)
-        # Drop the module directories shipped by this package.
-        rm -rf /lib/modules/smap
-        rm -rf /lib/modules/ucache
-        rm -f /etc/depmod.d/smap.conf
-        rm -f /etc/depmod.d/ucache.conf
         rm -f /etc/udev/rules.d/99-smap.rules
-
-        # Refresh module dependencies after removing the external dirs.
-        depmod -a 2>/dev/null || true
 
         if command -v udevadm >/dev/null 2>&1; then
             udevadm control --reload-rules 2>/dev/null || true
