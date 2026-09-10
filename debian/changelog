@@ -1,3 +1,18 @@
+ubturbo (1.0.0-10) unstable; urgency=medium
+
+  * Ship the ub_dma kernel module SOURCE via the existing ubturbo-dkms
+    package (drivers/tiering/ucache + ubdma in one DKMS tree);
+    the module is built on the target machine by DKMS on install and
+    on every kernel upgrade
+  * ub_dma needs ubcore/urma kernel headers, provided by
+    ub-os-component-dkms: declare BUILD_DEPENDS in ubturbo-dkms.dkms,
+    depend on ub-os-component-dkms-dev and resolve the urma include
+    path / Module.symvers via resolve-artifacts (debian patch 0006)
+  * Add dkms / dh-sequence-dkms to Build-Depends and build with
+    "--with dkms"; unload ub_dma along with other modules on removal
+
+ -- openEuler Maintainers <maintainers@openeuler.org>  Thu, 10 Sep 2026 00:00:00 +0800
+
 ubturbo (1.0.0-9) unstable; urgency=medium
 
   * Align Debian packaging with RPM spec 1.0.0-9

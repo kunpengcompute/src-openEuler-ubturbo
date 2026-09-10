@@ -28,12 +28,14 @@ Homepage: https://gitee.com/openeuler/ubturbo
 
 Package: ubturbo-dkms
 Architecture: arm64
-Depends: ${misc:Depends}, dkms
-Description: SMAP and ucache kernel modules for ubturbo (DKMS)
+Depends: ${misc:Depends}, dkms, ub-os-component-dkms-dev
+Description: SMAP, ucache and ub_dma kernel modules for ubturbo (DKMS)
  This package ships the source of the SMAP driver kernel modules
  (smap_tracking_core, smap_access_tracking, smap_histogram_tracking,
- smap_tiering) and the ucache kernel module. The modules are built on
- the target machine via DKMS on install and on every kernel upgrade.
+ smap_tiering), the ucache kernel module and the Huawei UB-DMA kernel
+ module (ub_dma). The modules are built on the target machine via DKMS
+ on install and on every kernel upgrade. The ubcore/urma kernel
+ headers required by ub_dma are provided by ub-os-component-dkms-dev.
 
 Package: ubturbo-rmrs
 Architecture: arm64
