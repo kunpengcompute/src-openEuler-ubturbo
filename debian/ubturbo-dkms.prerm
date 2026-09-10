@@ -3,7 +3,7 @@ set -e
 case "$1" in
     remove|upgrade|deconfigure)
         for mod in smap_tiering smap_histogram_tracking smap_access_tracking \
-                   smap_tracking_core ucache; do
+                   smap_tracking_core ucache ub_dma; do
             modprobe -r "$mod" 2>/dev/null || true
         done
         ;;

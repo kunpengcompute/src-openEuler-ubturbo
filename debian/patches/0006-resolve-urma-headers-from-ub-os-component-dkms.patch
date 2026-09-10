@@ -1,0 +1,32 @@
+Description: Resolve urma headers from ub-os-component-dkms build tree
+ For DKMS builds on the target machine the ubcore/urma kernel headers
+ and Module.symvers are provided by the ub-os-component-dkms build
+ artifacts, located via the resolve-artifacts helper. Fall back to the
+ in-kernel /usr/src/kernels path when that helper is absent, keeping
+ plain openEuler kernel-devel (RPM) builds unchanged.
+Author: Debian Packager
+Last-Update: 2026-09-10
+
+--- a/plugins/ubdma/src/Makefile
++++ b/plugins/ubdma/src/Makefile
+@@ -1,7 +1,20 @@
+ MODULE_NAME = ub_dma
+ KERNELDIR ?= /lib/modules/$(shell uname -r)/build
+ PWD		  := $(shell pwd)
++# urma/ubcore kernel headers and Module.symvers come from the
++# ub-os-component-dkms build artifacts. The resolve-artifacts helper
++# returns the KBUILD build dir of ub-os-component for the kernel being
++# built. When it is absent (e.g. plain openEuler kernel-devel builds
++# for RPM), fall back to the in-kernel urma headers.
++UB_OS_COMPONENT_BUILD_DIR := $(shell /usr/libexec/ub-os-component-dkms/resolve-artifacts $(KERNELRELEASE) 2>/dev/null)
++ifneq ($(strip $(UB_OS_COMPONENT_BUILD_DIR)),)
++UB_OS_COMPONENT_SYMVERS := $(UB_OS_COMPONENT_BUILD_DIR)/Module.symvers
++UB_OS_COMPONENT_INCLUDE := $(UB_OS_COMPONENT_BUILD_DIR)/include
++ccflags-y += -I$(UB_OS_COMPONENT_INCLUDE)/ub/urma
++KBUILD_EXTRA_SYMBOLS += $(UB_OS_COMPONENT_SYMVERS)
++else
+ ccflags-y +=  -I/usr/src/kernels/$(KERNELRELEASE)/include/ub/urma
++endif
+ ccflags-y += -fstack-protector-strong
+ 
+ obj-m := $(MODULE_NAME).o

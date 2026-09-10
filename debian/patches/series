@@ -3,3 +3,4 @@
 0003-find-libboundscheck-via-find-library.patch
 0004-fix-missing-cstdint-include.patch
 0005-load-libsmap-via-system-search-for-deb.patch
+0006-resolve-urma-headers-from-ub-os-component-dkms.patch

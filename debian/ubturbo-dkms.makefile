@@ -11,8 +11,10 @@ modules:
 	cp $(PWD)/drivers/Module.symvers $(PWD)/tiering/depends/
 	$(MAKE) -C $(KERNELDIR) M=$(PWD)/tiering KERNEL_VERSION=velinux modules
 	$(MAKE) -C $(KERNELDIR) M=$(PWD)/ucache modules
+	$(MAKE) -C $(KERNELDIR) M=$(PWD)/ubdma KERNELDIR=$(KERNELDIR) modules
 
 clean:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD)/drivers clean || true
 	$(MAKE) -C $(KERNELDIR) M=$(PWD)/tiering clean || true
 	$(MAKE) -C $(KERNELDIR) M=$(PWD)/ucache clean || true
+	$(MAKE) -C $(KERNELDIR) M=$(PWD)/ubdma clean || true

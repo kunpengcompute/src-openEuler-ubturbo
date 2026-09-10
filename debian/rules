@@ -53,6 +53,10 @@ override_dh_auto_install:
 	cp -a $(CURDIR)/plugins/smap/src/drivers/. $(DKMS_SRC)/drivers/
 	cp -a $(CURDIR)/plugins/smap/src/tiering/. $(DKMS_SRC)/tiering/
 	cp -a $(CURDIR)/plugins/smap/src/ucache/.  $(DKMS_SRC)/ucache/
+	# ub_dma (plugins/ubdma/src) ships in the same DKMS tree; urma
+	# headers come from ub-os-component-dkms via debian patch 0006.
+	install -d -m 0755 $(DKMS_SRC)/ubdma
+	cp -a $(CURDIR)/plugins/ubdma/src/. $(DKMS_SRC)/ubdma/
 	install -m 0644 $(CURDIR)/debian/ubturbo-dkms.makefile $(DKMS_SRC)/Makefile
 	# Drop any stray prebuilt artifacts from the staged source tree.
 	find $(DKMS_SRC) -type f \( -name '*.ko' -o -name '*.o' -o -name '*.mod' \
