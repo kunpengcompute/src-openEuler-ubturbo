@@ -1,0 +1,58 @@
+Description: Point the privileged cat helper at /usr/libexec/ubturbo/cat
+ The Debian package installs the helper script (build/rpm/cat.sh) as
+ /usr/libexec/ubturbo/cat (see debian/rules) and the ubturbo-rmrs
+ postinst grants passwordless sudo for exactly that path. Adapt the
+ smap and rmrs userspace code, which hardcodes the RPM location
+ "sudo /usr/local/bin/cat.sh", to use the Debian path.
+Author: Debian Packager
+Last-Update: 2026-09-14
+
+--- a/plugins/rmrs/src/ubturbo_plugin/export/os_helper/rmrs_os_helper.cpp
++++ b/plugins/rmrs/src/ubturbo_plugin/export/os_helper/rmrs_os_helper.cpp
+@@ -65,7 +65,7 @@ const int HEX_BASE = 16;
+ const int STANDARD_PAGESIZE = 4;
+ constexpr uint64_t HUGE_PAGE_NUM_TO_KB = 2 * 1024;
+ constexpr int CMD_BUFFER_SIZE = 256;
+-constexpr const char *CAT_SCRIPT_CAT_PATH = "sudo /usr/local/bin/cat.sh";
++constexpr const char *CAT_SCRIPT_CAT_PATH = "sudo /usr/libexec/ubturbo/cat";
+ constexpr const char *CAT_SCRIPT_TAIL = "2>&1";
+ constexpr const char *UID_EUID_ZERO = "UID=0, EUID=0";
+ 
+@@ -529,7 +529,7 @@ RmrsResult OsHelper::checkUidEuid(const std::string &fileContent)
+         UBTURBO_LOG_DEBUG(RMRS_MODULE_NAME, RMRS_MODULE_CODE)
+             << "[RmrsResourceExport] [OsHelper] First line= " << firstLine << ".";
+         UBTURBO_LOG_ERROR(RMRS_MODULE_NAME, RMRS_MODULE_CODE)
+-            << "[RmrsResourceExport] [OsHelper] Executing the cat.sh failed due to insufficient permission.";
++            << "[RmrsResourceExport] [OsHelper] Executing the cat helper failed due to insufficient permission.";
+         return RMRS_ERROR;
+     }
+     return RMRS_OK;
+@@ -556,7 +556,7 @@ RmrsResult OsHelper::ReadNumaMap(const std::string &pidStr, std::string &fileCon
+         fileContent = ExecCommand(cmd);
+     } catch (...) {
+         UBTURBO_LOG_DEBUG(RMRS_MODULE_NAME, RMRS_MODULE_CODE)
+-            << "[RmrsResourceExport] [OsHelper] Cannot execute cat.sh for pid=" << pidStr << ".";
++            << "[RmrsResourceExport] [OsHelper] Cannot execute cat helper for pid=" << pidStr << ".";
+         UBTURBO_LOG_ERROR(RMRS_MODULE_NAME, RMRS_MODULE_CODE)
+             << "[RmrsResourceExport] [OsHelper] Failed to read numa_maps file.";
+         return RMRS_ERROR;
+@@ -565,7 +565,7 @@ RmrsResult OsHelper::ReadNumaMap(const std::string &pidStr, std::string &fileCon
+     auto checkRet = checkUidEuid(fileContent);
+     if (checkRet != RMRS_OK) {
+         UBTURBO_LOG_ERROR(RMRS_MODULE_NAME, RMRS_MODULE_CODE)
+-            << "[RmrsResourceExport] [OsHelper] Executing the cat.sh script Failed.";
++            << "[RmrsResourceExport] [OsHelper] Executing the cat helper script Failed.";
+         return RMRS_ERROR;
+     }
+ 
+--- a/plugins/smap/src/user/smap_env.h
++++ b/plugins/smap/src/user/smap_env.h
+@@ -54,7 +54,7 @@
+ 
+ #define MAX_NR_MIGOUT 40
+ 
+-#define CAT_SCRIPT_CAT_PATH "sudo /usr/local/bin/cat.sh"
++#define CAT_SCRIPT_CAT_PATH "sudo /usr/libexec/ubturbo/cat"
+ #define CAT_SCRIPT_TAIL "2>&1"
+ 
+ #ifdef __cplusplus

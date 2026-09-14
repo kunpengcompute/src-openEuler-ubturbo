@@ -3,6 +3,8 @@ set -e
 
 # ubturbo-rmrs preinst -- stop service before upgrade/install.
 # Mirrors RPM spec %pre rmrs.
+# Uses deb-systemd-invoke (init-system-helpers) instead of calling
+# systemctl directly, per Debian policy for maintainer scripts.
 LOG_DIR="/var/log/ubturbo"
 LOG_FILE="$LOG_DIR/ubturbo-install.log"
 
@@ -19,13 +21,11 @@ log_message() {
 case "$1" in
     install|upgrade)
         log_message INFO "pre_install.sh started"
-        # Stop and disable any previously-installed service unit. The service
-        # may not exist on a fresh install, so tolerate that case only.
-        if systemctl list-units --type=service --all 2>/dev/null | grep -q "ubturbo.service"; then
-            systemctl stop ubturbo.service 2>/dev/null || true
-            systemctl disable ubturbo.service 2>/dev/null || true
+        # Stop any running instance before files are replaced. No-op when
+        # the unit or systemd is absent (fresh install, chroot).
+        if [ -d /run/systemd/system ]; then
+            deb-systemd-invoke stop ubturbo.service >/dev/null 2>&1 || true
         fi
-        rm -f /tmp/ubturbo_ipc
         log_message INFO "pre_install.sh ended"
         ;;
 esac

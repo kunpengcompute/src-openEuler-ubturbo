@@ -1,0 +1,39 @@
+Description: Add versioned SONAME to public shared libraries
+ The UB package policy (P1-4) requires public shared libraries to carry
+ a versioned SONAME (libfoo.so.N) instead of a bare libfoo.so. Declare
+ VERSION/SOVERSION on the libsmap and libubturbo_client CMake targets so
+ the build produces lib<name>.so -> lib<name>.so.1 -> lib<name>.so.1.0.0
+ with the SONAME embedded in the ELF. The -dev unversioned symlinks are
+ shipped in ubturbo-dev; dh_makeshlibs generates the shlibs file.
+Author: Debian Packager
+Last-Update: 2026-09-11
+
+diff --git a/plugins/smap/src/user/CMakeLists.txt b/plugins/smap/src/user/CMakeLists.txt
+index 374aee5..9b96fa4 100644
+--- a/plugins/smap/src/user/CMakeLists.txt
++++ b/plugins/smap/src/user/CMakeLists.txt
+@@ -14,6 +14,11 @@ add_subdirectory(user_log)
+ 
+ add_library(smap SHARED ${LIBS_SRCS})
+ 
++# Versioned SONAME (UB package policy): produces libsmap.so -> libsmap.so.1
++set_target_properties(smap PROPERTIES
++    VERSION 1.0.0
++    SOVERSION 1)
++
+ find_library(BOUNDSCHECK_LIBRARY boundscheck)
+ if(BOUNDSCHECK_LIBRARY)
+     target_link_libraries(smap
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 174f6d1..6c2e356 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -22,6 +22,8 @@ add_library(ubturbo_client SHARED
+ set_target_properties(ubturbo_client PROPERTIES
+     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+     POSITION_INDEPENDENT_CODE ON  # 确保生成的共享库支持 PIE
++    VERSION 1.0.0                 # 版本化 SONAME：libubturbo_client.so -> libubturbo_client.so.1
++    SOVERSION 1
+ )
+ 
+ # 为 libubturbo_client.so 设置 include 目录
