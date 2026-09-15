@@ -4,3 +4,7 @@
 0004-fix-missing-cstdint-include.patch
 0005-load-libsmap-via-system-search-for-deb.patch
 0006-resolve-urma-headers-from-ub-os-component-dkms.patch
+0007-fix-ubturbo-service-unit-keys.patch
+0008-add-versioned-soname-to-shared-libraries.patch
+0009-use-fhs-paths-for-conf-and-private-libs.patch
+0010-use-libexec-cat-helper-path.patch

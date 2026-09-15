@@ -1,0 +1,61 @@
+Description: Use FHS paths for configuration, libraries and IPC socket
+ Debian packaging moves the daemon to /usr/bin, configuration to
+ /etc/ubturbo (dpkg conffiles), private plugin libraries to the
+ multiarch private directory /usr/lib/aarch64-linux-gnu/ubturbo
+ (policy: private libs must not go into the public library directory)
+ and the IPC unix socket to /run/ubturbo/ubturbo_ipc (runtime dir
+ created by the unit's RuntimeDirectory=ubturbo). Adapt by redefining the
+ CONFIG_DEFAULT_DIR / LIB_DEFAULT_DIR constants in turbo_common.h to
+ absolute FHS paths: the exeRootDir join in TurboModuleConf::Init() then
+ resolves to the absolute path unchanged, so no upstream logic is
+ rewritten. RPM keeps its own paths because this patch
+ is only applied by dpkg-source in the deb source tree.
+Author: Debian Packager
+Last-Update: 2026-09-14
+
+--- a/src/include/turbo_common.h
++++ b/src/include/turbo_common.h
+@@ -18,8 +18,15 @@ namespace turbo::common {
+ 
+ using RetCode = uint32_t;
+ 
+-constexpr auto CONFIG_DEFAULT_DIR = "conf";
+-constexpr auto LIB_DEFAULT_DIR = "lib";
++// Debian package layout: configuration lives in /etc/ubturbo (dpkg
++// conffiles) and private plugin libraries live in the multiarch private
++// directory /usr/lib/aarch64-linux-gnu/ubturbo (policy: private libs must
++// not go into the public library directory). The upstream relative
++// defaults (<exeRoot>/conf, <exeRoot>/lib) only fit the /opt-based RPM
++// layout. Absolute paths also make the exeRootDir join in
++// TurboModuleConf::Init() a no-op.
++constexpr auto CONFIG_DEFAULT_DIR = "/etc/ubturbo";
++constexpr auto LIB_DEFAULT_DIR = "/usr/lib/aarch64-linux-gnu/ubturbo";
+ 
+ constexpr inline auto MODULE_NAME = "ubturbo";
+ constexpr inline auto MODULE_CODE = 1;
+diff --git a/src/ipc/client/turbo_ipc_client_inner.cpp b/src/ipc/client/turbo_ipc_client_inner.cpp
+index 312a637..1a13370 100644
+--- a/src/ipc/client/turbo_ipc_client_inner.cpp
++++ b/src/ipc/client/turbo_ipc_client_inner.cpp
+@@ -59,7 +59,7 @@ uint32_t IpcClientInner::GetHeader(uint8_t *message)
+     return ntohl(ret);
+ }
+ 
+-const char UDS_FILE_PATH[] = "/opt/ubturbo/ubturbo_ipc";
++const char UDS_FILE_PATH[] = "/run/ubturbo/ubturbo_ipc";
+ static const int BUFFER_LENGTH = 256;
+ static const int HEADER_LENGTH = 8;
+ static const int HEADER_OFFSET_LENGTH = 0;
+diff --git a/src/ipc/server/turbo_ipc_handler.cpp b/src/ipc/server/turbo_ipc_handler.cpp
+index e071658..bb062c4 100644
+--- a/src/ipc/server/turbo_ipc_handler.cpp
++++ b/src/ipc/server/turbo_ipc_handler.cpp
+@@ -25,7 +25,7 @@
+ namespace turbo::ipc::server {
+ 
+ // Uds通信的文件路径
+-const char UDS_FILE_PATH[] = "/opt/ubturbo/ubturbo_ipc";
++const char UDS_FILE_PATH[] = "/run/ubturbo/ubturbo_ipc";
+ // listen的缓冲区大小
+ static const int LISTEN_BUFFER_LENGTH = 10;
+ static const int BUFFER_LENGTH = 256;

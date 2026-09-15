@@ -14,15 +14,12 @@ case "$1" in
             groupdel ubturbo 2>/dev/null || true
         fi
 
-        # Remove runtime directories, sudoers fragment and the client
-        # library installed into the system library path.
-        rm -rf /var/log/ubturbo
+        # Remove runtime state (log dir, sudoers fragment). Also drop
+        # the legacy /opt/ubturbo directory from pre-FHS installs.
+        # Everything under /usr and /etc/ubturbo is owned by dpkg and
+        # removed automatically.
+        rm -rf /var/log/ubturbo /opt/ubturbo
         rm -f /etc/sudoers.d/ubturbo
-        rm -f /usr/lib64/libubturbo_client.so 2>/dev/null || true
-        rm -f /usr/lib/aarch64-linux-gnu/libubturbo_client.so 2>/dev/null || true
-        rm -f /usr/local/bin/cat.sh
-
-        systemctl daemon-reload 2>/dev/null || true
         ;;
 esac
 

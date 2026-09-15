@@ -1,0 +1,23 @@
+Description: Fix systemd unit keys and ExecStart for Debian layout
+ Two adaptations of the upstream unit for the Debian packaging:
+  - StartLimitIntervalSec/StartLimitBurst belong to the [Unit] section;
+    in [Service] they are ignored (and warned about) by systemd 255.
+  - The daemon is installed to /usr/bin/ub_turbo_exec in the Debian
+    package (FHS), not /opt/ubturbo/bin. RPM keeps its own path because
+    this patch is only applied by dpkg-source in the deb source tree.
+Author: Debian Packager
+Last-Update: 2026-09-11
+
+diff --git a/build/rpm/ubturbo.service b/build/rpm/ubturbo.service
+index 8dc1726..bf744d6 100644
+--- a/build/rpm/ubturbo.service
++++ b/build/rpm/ubturbo.service
+@@ -6,7 +6,7 @@ After=network.target
+ Type=simple
+ User=ubturbo
+ Group=ubturbo
+-ExecStart=/opt/ubturbo/bin/ub_turbo_exec
++ExecStart=/usr/bin/ub_turbo_exec
+ Restart=on-failure
+ StartLimitInterval=10s
+ StartLimitBurst=5

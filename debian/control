@@ -2,7 +2,7 @@ Source: ubturbo
 Section: admin
 Priority: optional
 Maintainer: openEuler Maintainers <maintainers@openeuler.org>
-Standards-Version: 4.6.0
+Standards-Version: 4.6.2
 Build-Depends: debhelper-compat (= 13),
                make (>= 4.3),
                gcc (>= 10.3.1),
@@ -22,7 +22,8 @@ Build-Depends: debhelper-compat (= 13),
                linux-headers-generic [arm64] | linux-headers [arm64],
                kmod,
                dkms,
-               dh-sequence-dkms
+               dh-sequence-dkms,
+               bc
 Rules-Requires-Root: binary-targets
 Homepage: https://gitee.com/openeuler/ubturbo
 
@@ -71,7 +72,8 @@ Package: ubturbo-dev
 Section: libdevel
 Architecture: arm64
 Multi-Arch: same
-Depends: ${misc:Depends}, ubturbo-rmrs (= ${binary:Version})
+Depends: ${misc:Depends}, ubturbo-rmrs (= ${binary:Version}),
+         ubturbo-smap (= ${binary:Version})
 Description: Development headers for the UB Turbo framework
  This package contains the C headers required to integrate with
  the UB Turbo SDK, including turbo_conf.h, turbo_def.h,

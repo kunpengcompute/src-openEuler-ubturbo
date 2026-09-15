@@ -63,51 +63,70 @@ override_dh_auto_install:
 		-o -name '*.mod.c' -o -name 'Module.symvers' -o -name 'modules.order' \) -delete
 
 	# ---- ubturbo-smap (userspace only now) ----
+	# Ship the versioned SONAME file (libsmap.so.1); the unversioned dev
+	# symlink (libsmap.so) belongs to ubturbo-dev only. The package keeps
+	# its RPM-parity name; the resulting lintian warning
+	# package-name-doesnt-match-sonames is accepted (see overrides).
+	# The udev rule goes to /usr/lib/udev/rules.d/ -- /etc/udev/rules.d
+	# is reserved for administrator overrides (Debian policy 10.7.4).
 	install -d -m 0755 $(CURDIR)/debian/ubturbo-smap/usr/lib/aarch64-linux-gnu
-	install -d -m 0755 $(CURDIR)/debian/ubturbo-smap/etc/udev/rules.d
-	install -m 0644 $(CURDIR)/plugins/smap/output/smap/lib/libsmap.so \
-		$(CURDIR)/debian/ubturbo-smap/usr/lib/aarch64-linux-gnu/libsmap.so
-	install -m 0640 $(CURDIR)/plugins/smap/99-smap.rules \
-		$(CURDIR)/debian/ubturbo-smap/etc/udev/rules.d/99-smap.rules
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-smap/usr/lib/udev/rules.d
+	install -m 0644 $(CURDIR)/plugins/smap/output/smap/lib/libsmap.so.1 \
+		$(CURDIR)/debian/ubturbo-smap/usr/lib/aarch64-linux-gnu/libsmap.so.1
+	install -m 0644 $(CURDIR)/plugins/smap/99-smap.rules \
+		$(CURDIR)/debian/ubturbo-smap/usr/lib/udev/rules.d/99-smap.rules
 
 	# ---- ubturbo-rmrs ----
-	install -d -m 0755 $(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/bin
-	install -d -m 0755 $(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/lib
-	install -d -m 0755 $(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/conf
-	install -d -m 0755 $(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/scripts
-	install -m 0755 $(CURDIR)/dist/release/bin/ub_turbo_exec \
-		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/bin/ub_turbo_exec
-	install -m 0755 $(CURDIR)/build/rpm/cat.sh \
-		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/bin/cat.sh
-	install -m 0644 $(CURDIR)/dist/release/lib/libubturbo_client.so \
-		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/lib/libubturbo_client.so
-	install -m 0644 $(CURDIR)/dist/release/lib/librmrs_ubturbo_plugin.so \
-		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/lib/librmrs_ubturbo_plugin.so
-	install -m 0644 $(CURDIR)/dist/release/conf/ubturbo_plugin_admission.conf \
-		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/conf/ubturbo_plugin_admission.conf
-	install -m 0644 $(CURDIR)/dist/release/conf/ubturbo.conf \
-		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/conf/ubturbo.conf
-	install -m 0644 $(CURDIR)/dist/release/conf/plugin_rmrs.conf \
-		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/conf/plugin_rmrs.conf
+	# FHS layout: the daemon and its helper go to /usr/bin, the public
+	# (SONAME-versioned) client library to the multiarch directory, the
+	# private plugin library to the multiarch private directory (policy:
+	# private libs must not sit in the public library directory) and the
+	# configuration to /etc/ubturbo (auto-marked as conffiles).
+	# The IPC unix socket lives in /run/ubturbo (created by the unit's
+	# RuntimeDirectory=ubturbo; socket path adapted by debian patch 0009).
+	# The systemd unit (build/rpm/ubturbo.service, adapted by debian
+	# patch 0007) is installed into /usr/lib/systemd/system/;
+	# dh_installsystemd picks it up from the package tree and generates
+	# the enable/start and stop fragments.
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-rmrs/usr/bin
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-rmrs/usr/lib/aarch64-linux-gnu
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-rmrs/usr/lib/aarch64-linux-gnu/ubturbo
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-rmrs/etc/ubturbo
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-rmrs/usr/lib/systemd/system
 	install -m 0644 $(CURDIR)/build/rpm/ubturbo.service \
-		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/scripts/ubturbo.service
+		$(CURDIR)/debian/ubturbo-rmrs/usr/lib/systemd/system/ubturbo.service
+	install -m 0755 $(CURDIR)/dist/release/bin/ub_turbo_exec \
+		$(CURDIR)/debian/ubturbo-rmrs/usr/bin/ub_turbo_exec
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-rmrs/usr/libexec/ubturbo
+	install -m 0755 $(CURDIR)/build/rpm/cat.sh \
+		$(CURDIR)/debian/ubturbo-rmrs/usr/libexec/ubturbo/cat
+	install -m 0644 $(CURDIR)/dist/release/lib/libubturbo_client.so.1 \
+		$(CURDIR)/debian/ubturbo-rmrs/usr/lib/aarch64-linux-gnu/libubturbo_client.so.1
+	install -m 0644 $(CURDIR)/dist/release/lib/librmrs_ubturbo_plugin.so \
+		$(CURDIR)/debian/ubturbo-rmrs/usr/lib/aarch64-linux-gnu/ubturbo/librmrs_ubturbo_plugin.so
+	install -m 0644 $(CURDIR)/dist/release/conf/ubturbo_plugin_admission.conf \
+		$(CURDIR)/debian/ubturbo-rmrs/etc/ubturbo/ubturbo_plugin_admission.conf
+	install -m 0644 $(CURDIR)/dist/release/conf/ubturbo.conf \
+		$(CURDIR)/debian/ubturbo-rmrs/etc/ubturbo/ubturbo.conf
+	install -m 0644 $(CURDIR)/dist/release/conf/plugin_rmrs.conf \
+		$(CURDIR)/debian/ubturbo-rmrs/etc/ubturbo/plugin_rmrs.conf
 
 	# ---- ubturbo-ucache ----
-	install -d -m 0755 $(CURDIR)/debian/ubturbo-ucache/opt/ubturbo/lib
-	install -d -m 0755 $(CURDIR)/debian/ubturbo-ucache/opt/ubturbo/conf
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-ucache/usr/lib/aarch64-linux-gnu/ubturbo
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-ucache/etc/ubturbo
 	install -m 0644 $(CURDIR)/plugins/ucache/cmake-build-release/lib/libucache_os_turbo_plugin.so \
-		$(CURDIR)/debian/ubturbo-ucache/opt/ubturbo/lib/libucache_os_turbo_plugin.so
+		$(CURDIR)/debian/ubturbo-ucache/usr/lib/aarch64-linux-gnu/ubturbo/libucache_os_turbo_plugin.so
 	install -m 0644 $(CURDIR)/plugins/ucache/cmake-build-release/conf/plugin_turbo_ucache.conf \
-		$(CURDIR)/debian/ubturbo-ucache/opt/ubturbo/conf/plugin_turbo_ucache.conf
-
-	# ---- patchelf: set rpath for rmrs binaries/libs (matches spec) ----
-	find $(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/lib -name '*.so' \
-		-exec patchelf --set-rpath '$$ORIGIN/../lib' {} \;
-	patchelf --set-rpath '$$ORIGIN/../lib' \
-		$(CURDIR)/debian/ubturbo-rmrs/opt/ubturbo/bin/ub_turbo_exec || true
+		$(CURDIR)/debian/ubturbo-ucache/etc/ubturbo/plugin_turbo_ucache.conf
 
 	# ---- ubturbo-dev ----
 	install -d -m 0755 $(CURDIR)/debian/ubturbo-dev/usr/include/ubturbo
+	install -d -m 0755 $(CURDIR)/debian/ubturbo-dev/usr/lib/aarch64-linux-gnu
+	ln -sf libsmap.so.1 \
+		$(CURDIR)/debian/ubturbo-dev/usr/lib/aarch64-linux-gnu/libsmap.so
+	# Unversioned dlopen(3)/linker name for the client library: -dev only.
+	ln -sf libubturbo_client.so.1 \
+		$(CURDIR)/debian/ubturbo-dev/usr/lib/aarch64-linux-gnu/libubturbo_client.so
 	for h in turbo_conf.h turbo_def.h turbo_ipc_client.h turbo_ipc_server.h turbo_logger.h; do \
 		install -m 0644 $(CURDIR)/include/$$h \
 			$(CURDIR)/debian/ubturbo-dev/usr/include/ubturbo/ ; \
@@ -123,7 +142,3 @@ override_dh_auto_install:
 
 # No upstream test suite.
 override_dh_auto_test:
-
-# Match RPM spec: %global __strip /bin/true (no stripping)
-override_dh_strip:
-	@echo "Skipping strip per upstream RPM spec"

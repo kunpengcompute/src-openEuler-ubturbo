@@ -1,15 +1,13 @@
 #!/bin/sh
 set -e
 
-# ubturbo-rmrs postinst -- create user/group, install service, set permissions.
+# ubturbo-rmrs postinst -- create user/group, set runtime permissions.
 # Mirrors RPM spec %post rmrs.
+# Service enable/start/stop is handled by dh_installsystemd via the
+# debhelper token at the end of this file (unit ships in
+# /usr/lib/systemd/system/).
 LOG_DIR="/var/log/ubturbo"
 LOG_FILE="$LOG_DIR/ubturbo-install.log"
-PROGRAM_DIR="/opt/ubturbo"
-PROGRAM_CONF_DIR="/opt/ubturbo/conf"
-PROGRAM_LIB_DIR="/opt/ubturbo/lib"
-PROGRAM_BIN_DIR="/opt/ubturbo/bin"
-PROGRAM_LOG_DIR="/var/log/ubturbo"
 SYSTEM_USER="ubturbo"
 SYSTEM_GROUP="ubturbo"
 
@@ -39,65 +37,27 @@ case "$1" in
             log_message INFO "User $SYSTEM_USER created"
         fi
 
-        # Install systemd unit shipped under /opt/ubturbo/scripts/.
-        if [ -f "$PROGRAM_DIR/scripts/ubturbo.service" ]; then
-            install -m 0644 "$PROGRAM_DIR/scripts/ubturbo.service" \
-                /etc/systemd/system/ubturbo.service
-            rm -f "$PROGRAM_DIR/scripts/ubturbo.service"
-            rmdir "$PROGRAM_DIR/scripts" 2>/dev/null || true
-        fi
+        # Runtime directory only: /var/log/ubturbo (not packaged). The
+        # IPC unix socket lives in /run/ubturbo, created and owned by
+        # systemd via the unit's RuntimeDirectory=ubturbo.
+        # Packaged files under /usr and /etc keep the default dpkg
+        # ownership/permissions (root:root, 0755 binaries, 0644
+        # libraries and conffiles, see Debian policy 10.x / spec 7c) --
+        # dh_fixperms already set them, no chown/chmod here.
+        mkdir -p "$LOG_DIR"
+        chown "$SYSTEM_USER:$SYSTEM_GROUP" "$LOG_DIR"
+        chmod 700 "$LOG_DIR"
 
-        # Expose the client library on the multiarch path expected by
-        # consumers. Prefer /usr/lib64 for parity with the RPM, fall back
-        # to the Debian multiarch directory.
-        if [ -f "$PROGRAM_LIB_DIR/libubturbo_client.so" ]; then
-            if [ -d /usr/lib64 ]; then
-                target=/usr/lib64/libubturbo_client.so
-            else
-                target=/usr/lib/aarch64-linux-gnu/libubturbo_client.so
-            fi
-            install -d -m 0755 "$(dirname "$target")"
-            install -m 0755 "$PROGRAM_LIB_DIR/libubturbo_client.so" "$target"
-            chown "$SYSTEM_USER:$SYSTEM_GROUP" "$target" 2>/dev/null || true
-        fi
-
-        # Install the privileged helper and its sudoers fragment. The
-        # sudoers file must be 0440 by Debian policy.
-        if [ -f "$PROGRAM_BIN_DIR/cat.sh" ]; then
-            install -d /usr/local/bin
-            install -m 0755 "$PROGRAM_BIN_DIR/cat.sh" /usr/local/bin/cat.sh
-            chown root:root /usr/local/bin/cat.sh
+        # Privileged helper: sudoers fragment for /usr/libexec/ubturbo/cat
+        # (installed without the .sh extension per Debian conventions; it
+        # is a sudo-gated helper, not an interactive tool). The sudoers
+        # file must be root-owned 0440 by Debian policy.
+        if [ -f /usr/libexec/ubturbo/cat ]; then
             install -d /etc/sudoers.d
-            printf 'ubturbo ALL=(root) NOPASSWD:/usr/local/bin/cat.sh\n' \
+            printf 'ubturbo ALL=(root) NOPASSWD:/usr/libexec/ubturbo/cat\n' \
                 > /etc/sudoers.d/ubturbo
             chmod 0440 /etc/sudoers.d/ubturbo
         fi
-
-        # Reload systemd so the freshly-installed unit is picked up.
-        systemctl daemon-reload || true
-
-        # Ownership and permissions for runtime directories.
-        chown -R "$SYSTEM_USER:$SYSTEM_GROUP" "$PROGRAM_LOG_DIR" 2>/dev/null || true
-        chown -R "$SYSTEM_USER:$SYSTEM_GROUP" "$PROGRAM_DIR" 2>/dev/null || true
-
-        chmod 750 "$PROGRAM_DIR" 2>/dev/null || true
-        chmod 700 "$PROGRAM_CONF_DIR" 2>/dev/null || true
-        chmod 750 "$PROGRAM_LIB_DIR" 2>/dev/null || true
-        chmod 750 "$PROGRAM_BIN_DIR" 2>/dev/null || true
-        chmod 700 "$PROGRAM_LOG_DIR" 2>/dev/null || true
-
-        if ls "$PROGRAM_CONF_DIR"/*.conf >/dev/null 2>&1; then
-            chmod 640 "$PROGRAM_CONF_DIR"/*.conf
-        fi
-        if ls "$PROGRAM_BIN_DIR"/* >/dev/null 2>&1; then
-            chmod 750 "$PROGRAM_BIN_DIR"/*
-        fi
-        if ls "$PROGRAM_LIB_DIR"/* >/dev/null 2>&1; then
-            chmod 640 "$PROGRAM_LIB_DIR"/*
-        fi
-
-        # Enable autostart. Failure here is non-fatal (e.g., in a chroot).
-        systemctl enable ubturbo.service 2>/dev/null || true
 
         log_message INFO "post_install.sh ended"
         ;;

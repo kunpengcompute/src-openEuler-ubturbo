@@ -5,9 +5,12 @@ Description: Load libsmap.so via dynamic linker search instead of hardcoded /usr
  /usr/lib/<triplet>/ (e.g. /usr/lib/aarch64-linux-gnu/), so the hardcoded
  absolute path is missing and dlopen() fails at runtime.
  .
- Pass only the soname "libsmap.so" to dlopen() so the dynamic linker
- searches the standard library search paths (including the multiarch
- directory). Also drop the lstat()/S_ISLNK symlink check in
+ Pass only the versioned SONAME "libsmap.so.1" to dlopen() so the dynamic
+ linker searches the standard library search paths (including the multiarch
+ directory). Patch 0008 adds a versioned SONAME to libsmap, so the runtime
+ file is libsmap.so.1; the unversioned "libsmap.so" linker symlink only
+ exists in ubturbo-dev and must not be required at runtime. Also drop the
+ lstat()/S_ISLNK symlink check in
  SmapModule::Init(), which is meaningless for a bare soname and would
  stat() the wrong (cwd-relative) path.
 Author: Debian Packager
@@ -43,7 +46,7 @@ Last-Update: 2026-08-13
  
  namespace rmrs::smap {
 -const char *const SMAP_LIBSMAPSO_PATH_RMRS = "/usr/lib64/libsmap.so";
-+const char *const SMAP_LIBSMAPSO_PATH_RMRS = "libsmap.so";
++const char *const SMAP_LIBSMAPSO_PATH_RMRS = "libsmap.so.1";
  const int RUN_MODE_RMRS = 1;
  const int SMAP_RATIO_RMRS = 25;
  const int MAX_NR_MIGOUT_RMRS = 40;
@@ -54,7 +57,7 @@ Last-Update: 2026-08-13
  const std::string FILE_NAME = "/dev/shm/ubturbo_page_type.dat";
  
 -constexpr const char *LIB_SMAP_PATH = "/usr/lib64/libsmap.so";
-+constexpr const char *LIB_SMAP_PATH = "libsmap.so";
++constexpr const char *LIB_SMAP_PATH = "libsmap.so.1";
  
  static void *g_smapHandler = nullptr;
  static SmapMigrateOutFunc g_smapMigrateOut = nullptr;
