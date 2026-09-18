@@ -8,3 +8,4 @@
 0008-add-versioned-soname-to-shared-libraries.patch
 0009-use-fhs-paths-for-conf-and-private-libs.patch
 0010-use-libexec-cat-helper-path.patch
+0011-rename-acpi-parse-entries-array.patch

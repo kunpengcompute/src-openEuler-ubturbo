@@ -1,0 +1,89 @@
+Description: Rename driver-local acpi_parse_entries_array to avoid symbol clash
+ The velinux 6.6.151 kernel now declares (and exports) acpi_parse_entries_array
+ via include/linux/fw_table.h with a union fw_table_header signature. The SMAP
+ driver re-implements that function under the legacy struct acpi_table_header
+ signature as a non-static global symbol, which conflicts with the kernel header
+ declaration. Rename both copies (drivers and tiering) to the smap-prefixed name.
+Author: Debian Packager
+Last-Update: 2026-09-14
+
+---
+
+diff --git a/plugins/smap/src/drivers/access_acpi_helper.c b/plugins/smap/src/drivers/access_acpi_helper.c
+index 8d733f5..1fe9a84 100644
+--- a/plugins/smap/src/drivers/access_acpi_helper.c
++++ b/plugins/smap/src/drivers/access_acpi_helper.c
+@@ -47,7 +47,7 @@ static unsigned long acpi_get_entry_length(struct acpi_subtable_entry *entry)
+ 	return 0;
+ }
+ 
+-int acpi_parse_entries_array(char *id, unsigned long table_size,
++int smap_acpi_parse_entries_array(char *id, unsigned long table_size,
+ 			     struct acpi_table_header *header,
+ 			     struct acpi_subtable_proc *proc, int num,
+ 			     unsigned int max_entries)
+diff --git a/plugins/smap/src/drivers/access_acpi_helper.h b/plugins/smap/src/drivers/access_acpi_helper.h
+index a494adb..ca39bd8 100644
+--- a/plugins/smap/src/drivers/access_acpi_helper.h
++++ b/plugins/smap/src/drivers/access_acpi_helper.h
+@@ -21,7 +21,7 @@ struct acpi_subtable_entry {
+ 	enum acpi_sub_type type;
+ };
+ 
+-int acpi_parse_entries_array(char *id, unsigned long table_size,
++int smap_acpi_parse_entries_array(char *id, unsigned long table_size,
+ 			     struct acpi_table_header *table_header,
+ 			     struct acpi_subtable_proc *proc, int proc_num,
+ 			     unsigned int max_entries);
+diff --git a/plugins/smap/src/drivers/access_acpi_mem.c b/plugins/smap/src/drivers/access_acpi_mem.c
+index 2dd12a0..04c7d89 100644
+--- a/plugins/smap/src/drivers/access_acpi_mem.c
++++ b/plugins/smap/src/drivers/access_acpi_mem.c
+@@ -175,7 +175,7 @@ int init_acpi_mem(void)
+ 		return -ENODEV;
+ 	}
+ 
+-	count = acpi_parse_entries_array(ACPI_SIG_SRAT, table_size,
++	count = smap_acpi_parse_entries_array(ACPI_SIG_SRAT, table_size,
+ 					 table_header, proc, ARRAY_SIZE(proc),
+ 					 0);
+ 	if (count < 0) {
+diff --git a/plugins/smap/src/tiering/acpi_helper.c b/plugins/smap/src/tiering/acpi_helper.c
+index 59425a2..f6cdd03 100644
+--- a/plugins/smap/src/tiering/acpi_helper.c
++++ b/plugins/smap/src/tiering/acpi_helper.c
+@@ -51,7 +51,7 @@ static unsigned long acpi_get_entry_length(struct acpi_subtable_entry *entry)
+ 	return 0;
+ }
+ 
+-int acpi_parse_entries_array(char *id, unsigned long table_size,
++int smap_acpi_parse_entries_array(char *id, unsigned long table_size,
+ 			     struct acpi_table_header *header,
+ 			     struct acpi_subtable_proc *proc, int num,
+ 			     unsigned int max_entries)
+diff --git a/plugins/smap/src/tiering/acpi_helper.h b/plugins/smap/src/tiering/acpi_helper.h
+index a494adb..ca39bd8 100644
+--- a/plugins/smap/src/tiering/acpi_helper.h
++++ b/plugins/smap/src/tiering/acpi_helper.h
+@@ -21,7 +21,7 @@ struct acpi_subtable_entry {
+ 	enum acpi_sub_type type;
+ };
+ 
+-int acpi_parse_entries_array(char *id, unsigned long table_size,
++int smap_acpi_parse_entries_array(char *id, unsigned long table_size,
+ 			     struct acpi_table_header *table_header,
+ 			     struct acpi_subtable_proc *proc, int proc_num,
+ 			     unsigned int max_entries);
+diff --git a/plugins/smap/src/tiering/acpi_mem.c b/plugins/smap/src/tiering/acpi_mem.c
+index fcfa552..6005e00 100644
+--- a/plugins/smap/src/tiering/acpi_mem.c
++++ b/plugins/smap/src/tiering/acpi_mem.c
+@@ -262,7 +262,7 @@ int init_acpi_mem(void)
+ 		return -ENODEV;
+ 	}
+ 
+-	count = acpi_parse_entries_array(ACPI_SIG_SRAT, table_size,
++	count = smap_acpi_parse_entries_array(ACPI_SIG_SRAT, table_size,
+ 					 table_header, proc, ARRAY_SIZE(proc),
+ 					 0);
+ 	if (count < 0) {
